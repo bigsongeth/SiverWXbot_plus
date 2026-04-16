@@ -341,10 +341,10 @@ def dashboard():
     # 旧配置迁移：只要旧字段存在就迁移并写回磁盘（无论 api_configs 是否已有）
     if 'api_sdk' in config:
         config['api_configs'] = [
-            {'sdk': config.get('api_sdk', 'DusAPI'), 'key': config.get('api_key', ''),
-             'url': config.get('base_url', 'https://api.dusapi.com'), 'model': config.get('model1', 'gpt-5')},
-            {'sdk': config.get('api_sdk', 'DusAPI'), 'key': config.get('api_key', ''),
-             'url': config.get('base_url', 'https://api.dusapi.com'), 'model': config.get('model2', 'claude-sonnet-4-6')},
+            {'sdk': config.get('api_sdk', 'Custom'), 'key': config.get('api_key', ''),
+             'url': config.get('base_url', 'https://api.your-api-domain.com'), 'model': config.get('model1', 'gpt-5')},
+            {'sdk': config.get('api_sdk', 'Custom'), 'key': config.get('api_key', ''),
+             'url': config.get('base_url', 'https://api.your-api-domain.com'), 'model': config.get('model2', 'claude-sonnet-4-6')},
         ]
         config['api_index'] = 0
         for old_key in ('api_sdk', 'api_key', 'base_url', 'model1', 'model2', 'api_sdk_list'):
@@ -356,8 +356,8 @@ def dashboard():
         except Exception as _e:
             log('ERROR', f'迁移配置写入失败: {_e}')
     config.setdefault('api_configs', [
-        {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "gpt-5"},
-        {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+        {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "gpt-5"},
+        {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
     ])
     config.setdefault('api_index', 0)
 
@@ -1252,8 +1252,8 @@ def main():
         if not os.path.exists(CONFIG_FILE):
             default_config = {
                 "api_configs": [
-                    {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "gpt-5.4"},
-                    {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+                    {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "gpt-5.4"},
+                    {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
                 ],
                 "api_index": 0,
                 "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",

@@ -223,8 +223,8 @@ class WXBotConfig:
             if not os.path.exists(self.CONFIG_FILE):
                 base_config = {
                     "api_configs": [
-                        {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "gpt-5.4"},
-                        {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+                        {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "gpt-5.4"},
+                        {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
                     ],
                     "api_index": 0,
                     "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",
@@ -371,15 +371,15 @@ class WXBotConfig:
         if 'api_configs' not in self.config and 'api_sdk' in self.config:
             self.config['api_configs'] = [
                 {
-                    'sdk':   self.config.get('api_sdk', 'DusAPI'),
+                    'sdk':   self.config.get('api_sdk', 'Custom'),
                     'key':   self.config.get('api_key', ''),
-                    'url':   self.config.get('base_url', 'https://api.dusapi.com'),
+                    'url':   self.config.get('base_url', 'https://api.your-api-domain.com'),
                     'model': self.config.get('model1', 'gpt-5'),
                 },
                 {
-                    'sdk':   self.config.get('api_sdk', 'DusAPI'),
+                    'sdk':   self.config.get('api_sdk', 'Custom'),
                     'key':   self.config.get('api_key', ''),
-                    'url':   self.config.get('base_url', 'https://api.dusapi.com'),
+                    'url':   self.config.get('base_url', 'https://api.your-api-domain.com'),
                     'model': self.config.get('model2', 'claude-sonnet-4-6'),
                 },
             ]
@@ -390,8 +390,8 @@ class WXBotConfig:
             log(message="旧 API 配置已自动迁移为新格式并保存")
 
         self.api_configs = self.config.get('api_configs', [
-            {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "gpt-5"},
-            {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+            {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "gpt-5"},
+            {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
         ])
         self.api_index = self.config.get('api_index', 0)
         if self.api_index >= len(self.api_configs):
@@ -399,7 +399,7 @@ class WXBotConfig:
 
         # 从当前接口配置派生兼容属性（供 AI 接口类使用）
         _cur = self.api_configs[self.api_index] if self.api_configs else {}
-        self.api_sdk  = _cur.get('sdk', 'DusAPI')
+        self.api_sdk  = _cur.get('sdk', 'Custom')
         self.api_key  = _cur.get('key', '')
         self.base_url = _cur.get('url', '')
         self.model1   = _cur.get('model', '')
@@ -1103,9 +1103,9 @@ class CozeAPI:
             return "API返回错误，请稍后再试"
 
 
-class DusAPI:
+class Custom:
     """
-    DusAPI 兼容接口封装类
+    Custom 兼容接口封装类
     根据模型名称自动选择协议：
     - 包含 'claude' → Anthropic 格式（x-api-key + /v1/messages）
     - 包含 'gpt'    → GPT/OpenAI 格式（Bearer + /v1/chat/completions）
@@ -1336,21 +1336,21 @@ class DusAPI:
                         result = self._stream_claude_text(api_endpoint, headers, payload)
                         if result:
                             if attempt > 0:
-                                log(message=f"DusAPI Claude 流式第 {attempt} 次重试成功：{result[:100]}...")
+                                log(message=f"Custom Claude 流式第 {attempt} 次重试成功：{result[:100]}...")
                             else:
-                                log(message=f"DusAPI Claude 流式返回成功：{result[:100]}...")
+                                log(message=f"Custom Claude 流式返回成功：{result[:100]}...")
                             return result
                         else:
-                            raise ValueError("DusAPI Claude 流式响应中未找到文本内容")
+                            raise ValueError("Custom Claude 流式响应中未找到文本内容")
 
                     except Exception as e:
                         last_error = e
                         if attempt < max_retries:
                             delay = retry_delays[attempt]
-                            log(level="WARNING", message=f"DusAPI Claude 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                            log(level="WARNING", message=f"Custom Claude 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                             time.sleep(delay)
                         else:
-                            log(level="ERROR", message=f"DusAPI Claude 流式已重试 {max_retries} 次，最终失败: {last_error}")
+                            log(level="ERROR", message=f"Custom Claude 流式已重试 {max_retries} 次，最终失败: {last_error}")
 
                 return "API返回错误，请稍后再试"
 
@@ -1364,19 +1364,19 @@ class DusAPI:
                     result = response_data['content'][0]['text']
 
                     if attempt > 0:
-                        log(message=f"DusAPI Claude 第 {attempt} 次重试成功：{result[:100]}...")
+                        log(message=f"Custom Claude 第 {attempt} 次重试成功：{result[:100]}...")
                     else:
-                        log(message=f"DusAPI Claude 返回成功：{result[:100]}...")
+                        log(message=f"Custom Claude 返回成功：{result[:100]}...")
                     return result
 
                 except Exception as e:
                     last_error = e
                     if attempt < max_retries:
                         delay = retry_delays[attempt]
-                        log(level="WARNING", message=f"DusAPI Claude 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                        log(level="WARNING", message=f"Custom Claude 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                         time.sleep(delay)
                     else:
-                        log(level="ERROR", message=f"DusAPI Claude 已重试 {max_retries} 次，最终失败: {last_error}")
+                        log(level="ERROR", message=f"Custom Claude 已重试 {max_retries} 次，最终失败: {last_error}")
 
             return "API返回错误，请稍后再试"
 
@@ -1441,21 +1441,21 @@ class DusAPI:
                         result = self._stream_gpt_text(api_endpoint, headers, payload)
                         if result:
                             if attempt > 0:
-                                log(message=f"DusAPI GPT 流式第 {attempt} 次重试成功：{result[:100]}...")
+                                log(message=f"Custom GPT 流式第 {attempt} 次重试成功：{result[:100]}...")
                             else:
-                                log(message=f"DusAPI GPT 流式返回成功：{result[:100]}...")
+                                log(message=f"Custom GPT 流式返回成功：{result[:100]}...")
                             return result
                         else:
-                            raise ValueError("DusAPI GPT 流式响应中未找到文本内容")
+                            raise ValueError("Custom GPT 流式响应中未找到文本内容")
 
                     except Exception as e:
                         last_error = e
                         if attempt < max_retries:
                             delay = retry_delays[attempt]
-                            log(level="WARNING", message=f"DusAPI GPT 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                            log(level="WARNING", message=f"Custom GPT 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                             time.sleep(delay)
                         else:
-                            log(level="ERROR", message=f"DusAPI GPT 流式已重试 {max_retries} 次，最终失败: {last_error}")
+                            log(level="ERROR", message=f"Custom GPT 流式已重试 {max_retries} 次，最终失败: {last_error}")
 
                 return "API返回错误，请稍后再试"
 
@@ -1468,22 +1468,22 @@ class DusAPI:
 
                     result = self._extract_gpt_text(response_data)
                     if result is None:
-                        raise ValueError(f"DusAPI GPT 响应中未找到文本内容：{response_data}")
+                        raise ValueError(f"Custom GPT 响应中未找到文本内容：{response_data}")
 
                     if attempt > 0:
-                        log(message=f"DusAPI GPT 第 {attempt} 次重试成功：{result[:100]}...")
+                        log(message=f"Custom GPT 第 {attempt} 次重试成功：{result[:100]}...")
                     else:
-                        log(message=f"DusAPI GPT 返回成功：{result[:100]}...")
+                        log(message=f"Custom GPT 返回成功：{result[:100]}...")
                     return result
 
                 except Exception as e:
                     last_error = e
                     if attempt < max_retries:
                         delay = retry_delays[attempt]
-                        log(level="WARNING", message=f"DusAPI GPT 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                        log(level="WARNING", message=f"Custom GPT 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                         time.sleep(delay)
                     else:
-                        log(level="ERROR", message=f"DusAPI GPT 已重试 {max_retries} 次，最终失败: {last_error}")
+                        log(level="ERROR", message=f"Custom GPT 已重试 {max_retries} 次，最终失败: {last_error}")
 
             return "API返回错误，请稍后再试"
 
@@ -1540,9 +1540,9 @@ class WXBot:
         elif sdk == "Coze":
             log(message="使用Coze API")
             return CozeAPI(self.config)
-        elif sdk == "DusAPI":
-            log(message="使用DusAPI")
-            return DusAPI(self.config)
+        elif sdk == "Custom":
+            log(message="使用Custom")
+            return Custom(self.config)
         else:
             log(level="ERROR", message="未配置API SDK, 默认使用OpenAI SDK")
             return OpenAIAPI(self.config)
@@ -1557,7 +1557,7 @@ class WXBot:
             log(level="WARNING", message=f"群组接口索引 {idx} 超出范围，回退到默认接口")
             return self.api
         cfg = configs[idx]
-        sdk = cfg.get('sdk', 'DusAPI')
+        sdk = cfg.get('sdk', 'Custom')
 
         # 轻量代理配置：仅覆盖接口相关字段，其余不涉及
         class _ApiProxy:
@@ -1576,8 +1576,8 @@ class WXBot:
             return OpenAIAPI(tmp)
         elif sdk == "Coze":
             return CozeAPI(tmp)
-        elif sdk == "DusAPI":
-            return DusAPI(tmp)
+        elif sdk == "Custom":
+            return Custom(tmp)
         else:
             return OpenAIAPI(tmp)
 
