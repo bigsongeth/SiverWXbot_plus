@@ -1,0 +1,8 @@
+/* Space Grotesk — 标题字体，仅此一个文件 */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('fonts/SpaceGrotesk.woff2') format('woff2');
+}

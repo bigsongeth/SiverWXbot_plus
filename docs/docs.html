@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-QV0TK4X2VR"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-QV0TK4X2VR');
+</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>文档 - SiverWXBot Plus</title>
+<link rel="icon" href="favicon.ico" type="image/x-icon">
+<link href="lib/fonts.css" rel="stylesheet">
+<link href="lib/bootstrap.min.css" rel="stylesheet">
+<link href="lib/icons.css" rel="stylesheet">
+<link href="lib/github.min.css" rel="stylesheet">
+<style>
+:root {
+  --primary: #07C160;
+  --primary-dark: #06AD56;
+  --dark-bg: #2C2C2C;
+  --bg: #F7F7F7;
+  --card: #FFFFFF;
+  --border: #E5E5E5;
+  --text: #191919;
+  --muted: #888888;
+  --sidebar-w: 220px;
+  --toc-w: 200px;
+  --nav-h: 56px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+/* ── Navbar ── */
+.site-nav {
+  background: var(--dark-bg);
+  padding: 0 2rem;
+  height: var(--nav-h);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 1000;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+}
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #fff;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 17px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.nav-brand i { color: var(--primary); font-size: 20px; }
+.nav-actions { display: flex; align-items: center; gap: 10px; }
+.btn-github {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid rgba(255,255,255,0.28);
+  border-radius: 6px;
+  color: rgba(255,255,255,0.82);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: all 0.2s;
+}
+.btn-github:hover { border-color: rgba(255,255,255,0.6); color: #fff; background: rgba(255,255,255,0.06); }
+.btn-docs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  background: var(--primary);
+  border-radius: 6px;
+  color: #fff;
+  font-size: 13.5px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background 0.2s;
+}
+.btn-docs:hover { background: var(--primary-dark); color: #fff; }
+
+/* ── Sidebar ── */
+.sidebar {
+  position: fixed;
+  top: var(--nav-h);
+  left: 0;
+  bottom: 0;
+  width: var(--sidebar-w);
+  background: var(--dark-bg);
+  border-right: 1px solid rgba(255,255,255,0.08);
+  padding: 24px 0;
+  overflow-y: auto;
+  z-index: 100;
+}
+.sidebar-nav { list-style: none; padding: 0 12px; }
+.sidebar-nav li { margin-bottom: 4px; }
+.sidebar-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  color: rgba(255,255,255,0.7);
+  font-size: 14px;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+.sidebar-link i { font-size: 16px; width: 20px; text-align: center; }
+.sidebar-link:hover { background: rgba(255,255,255,0.08); color: #fff; }
+.sidebar-link.active { background: var(--primary); color: #fff; }
+
+/* ── Main Content ── */
+.main-wrapper {
+  margin-left: var(--sidebar-w);
+  margin-right: var(--toc-w);
+  margin-top: var(--nav-h);
+  padding: 32px 40px 80px;
+  min-height: calc(100vh - var(--nav-h));
+}
+.content-card {
+  background: var(--card);
+  border-radius: 8px;
+  padding: 40px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  border: 1px solid var(--border);
+  max-width: 900px;
+}
+.content-card h1, .content-card h2, .content-card h3, .content-card h4 { font-family: 'Space Grotesk', sans-serif; }
+.content-card h1 { font-size: 2rem; font-weight: 700; margin-bottom: 1rem; color: var(--text); }
+.content-card h2 { font-size: 1.6rem; font-weight: 700; margin-top: 2rem; margin-bottom: 1rem; color: var(--text); border-bottom: 2px solid var(--border); padding-bottom: 0.5rem; }
+.content-card h3 { font-size: 1.3rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.8rem; color: var(--text); }
+.content-card h4 { font-size: 1.1rem; font-weight: 600; margin-top: 1.2rem; margin-bottom: 0.6rem; color: var(--text); }
+.content-card p { line-height: 1.7; margin-bottom: 1rem; color: var(--text); }
+.content-card ul, .content-card ol { margin-bottom: 1rem; padding-left: 1.5rem; line-height: 1.7; }
+.content-card li { margin-bottom: 0.5rem; }
+.content-card a { color: var(--primary); text-decoration: none; }
+.content-card a:hover { text-decoration: underline; }
+.content-card code { background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; color: #d73a49; }
+.content-card pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow-x: auto; margin-bottom: 1rem; }
+.content-card pre code { background: none; padding: 0; color: inherit; }
+.content-card table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+.content-card table th, .content-card table td { border: 1px solid var(--border); padding: 10px 12px; text-align: left; }
+.content-card table th { background: var(--bg); font-weight: 600; }
+.content-card img { max-width: 100%; height: auto; border-radius: 6px; margin: 1rem 0; cursor: zoom-in; transition: opacity 0.2s; }
+.content-card img:hover { opacity: 0.88; }
+
+/* ── Lightbox ── */
+.lightbox {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.88);
+  z-index: 2000;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+  backdrop-filter: blur(4px);
+  animation: lb-in 0.2s ease;
+}
+.lightbox.show { display: flex; }
+@keyframes lb-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.lightbox img {
+  max-width: 92vw;
+  max-height: 88vh;
+  border-radius: 8px;
+  box-shadow: 0 8px 48px rgba(0,0,0,0.6);
+  cursor: default;
+  animation: lb-scale 0.22s cubic-bezier(0.34,1.56,0.64,1);
+}
+@keyframes lb-scale {
+  from { transform: scale(0.88); opacity: 0; }
+  to   { transform: scale(1);    opacity: 1; }
+}
+.lightbox-close {
+  position: fixed;
+  top: 16px; right: 20px;
+  width: 36px; height: 36px;
+  background: rgba(255,255,255,0.12);
+  border: none;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+.lightbox-close:hover { background: rgba(255,255,255,0.24); }
+.content-card blockquote { border-left: 4px solid var(--primary); padding-left: 1rem; margin: 1rem 0; color: var(--muted); font-style: italic; }
+
+/* ── TOC Sidebar ── */
+.toc-sidebar {
+  position: fixed;
+  top: var(--nav-h);
+  right: 0;
+  width: var(--toc-w);
+  height: calc(100vh - var(--nav-h));
+  padding: 32px 20px;
+  overflow-y: auto;
+  border-left: 1px solid var(--border);
+  background: var(--card);
+}
+.toc-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+.toc-list { list-style: none; padding: 0; }
+.toc-list li { margin-bottom: 8px; }
+.toc-link {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  text-decoration: none;
+  line-height: 1.4;
+  transition: color 0.2s;
+  padding-left: 0;
+}
+.toc-link:hover { color: var(--primary); }
+.toc-link.active { color: var(--primary); font-weight: 600; }
+.toc-link.level-4 { padding-left: 12px; font-size: 12px; }
+
+/* ── Mobile ── */
+@media (max-width: 992px) {
+  .sidebar { display: none; }
+  .toc-sidebar { display: none; }
+  .main-wrapper { margin-left: 0; margin-right: 0; padding: 16px 16px 80px; }
+  .content-card { padding: 20px; }
+  .site-nav { padding: 0 1rem; }
+  .btn-github span { display: none; }
+}
+
+/* ── Mobile Bottom Bar ── */
+.mobile-bar {
+  display: none;
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  height: 52px;
+  background: var(--dark-bg);
+  border-top: 1px solid rgba(255,255,255,0.1);
+  z-index: 500;
+  align-items: center;
+  justify-content: space-around;
+}
+.mobile-bar-btn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: rgba(255,255,255,0.6);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 6px 0;
+  border: none;
+  background: none;
+  transition: color 0.2s;
+}
+.mobile-bar-btn i { font-size: 18px; }
+.mobile-bar-btn.active, .mobile-bar-btn:active { color: var(--primary); }
+
+/* ── Bottom Drawer ── */
+.drawer-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.45);
+  z-index: 600;
+}
+.drawer-overlay.show { display: block; }
+.drawer {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: var(--dark-bg);
+  border-radius: 16px 16px 0 0;
+  z-index: 700;
+  transform: translateY(100%);
+  transition: transform 0.28s cubic-bezier(0.4, 0, 0.2, 1);
+  max-height: 65vh;
+  display: flex;
+  flex-direction: column;
+}
+.drawer.show { transform: translateY(0); }
+.drawer-handle {
+  width: 36px; height: 4px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 2px;
+  margin: 12px auto 0;
+  flex-shrink: 0;
+}
+.drawer-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: rgba(255,255,255,0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 12px 20px 8px;
+  flex-shrink: 0;
+}
+.drawer-body {
+  overflow-y: auto;
+  padding: 4px 12px 24px;
+  flex: 1;
+}
+
+/* 章节抽屉沿用 sidebar-link 样式 */
+.drawer-body .sidebar-nav { padding: 0; }
+.drawer-body .sidebar-link { font-size: 15px; padding: 12px 12px; }
+
+/* 目录抽屉 */
+.drawer-toc-list { list-style: none; padding: 0; }
+.drawer-toc-list li { margin-bottom: 2px; }
+.drawer-toc-link {
+  display: block;
+  padding: 10px 8px;
+  font-size: 14px;
+  color: rgba(255,255,255,0.65);
+  text-decoration: none;
+  border-radius: 6px;
+  transition: all 0.2s;
+}
+.drawer-toc-link:hover, .drawer-toc-link.active { color: var(--primary); background: rgba(7,193,96,0.1); }
+.drawer-toc-link.level-4 { padding-left: 24px; font-size: 13px; }
+
+@media (max-width: 992px) {
+  .mobile-bar { display: flex; }
+}
+</style>
+</head>
+<body>
+
+<!-- Navbar -->
+<nav class="site-nav">
+  <a href="index.html" class="nav-brand">
+    <i class="bi bi-robot"></i>
+    <span>SiverWXBot</span>
+  </a>
+  <div class="nav-actions">
+    <span id="nav-version" style="font-size:12px;color:rgba(255,255,255,0.35);font-weight:500;letter-spacing:0.03em;"></span>
+    <a href="https://github.com/SiverKing/SiverWXbot_plus" class="btn-github" target="_blank">
+      <i class="bi bi-star"></i>
+      <span>Star</span>
+    </a>
+    <a href="docs.html" class="btn-docs">
+      <i class="bi bi-book"></i>
+      <span>文档</span>
+    </a>
+  </div>
+</nav>
+
+<!-- Sidebar -->
+<aside class="sidebar">
+  <ul class="sidebar-nav" id="sidebar-nav"></ul>
+</aside>
+
+<!-- Main Content -->
+<main class="main-wrapper">
+  <article class="content-card" id="content">
+    <p style="text-align: center; color: var(--muted);">加载中...</p>
+  </article>
+</main>
+
+<!-- TOC Sidebar -->
+<aside class="toc-sidebar">
+  <div class="toc-title">本章目录</div>
+  <ul class="toc-list" id="toc"></ul>
+</aside>
+
+<!-- Mobile Bottom Bar -->
+<div class="mobile-bar">
+  <button class="mobile-bar-btn" id="btn-chapters">
+    <i class="bi bi-list"></i>
+    <span>章节</span>
+  </button>
+  <button class="mobile-bar-btn" id="btn-toc">
+    <i class="bi bi-card-list"></i>
+    <span>本章目录</span>
+  </button>
+</div>
+
+<!-- Drawer Overlay -->
+<div class="drawer-overlay" id="drawer-overlay"></div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox">
+  <button class="lightbox-close" id="lightbox-close">✕</button>
+  <img id="lightbox-img" src="" alt="">
+</div>
+
+<!-- Chapters Drawer -->
+<div class="drawer" id="drawer-chapters">
+  <div class="drawer-handle"></div>
+  <div class="drawer-title">章节</div>
+  <div class="drawer-body">
+    <ul class="sidebar-nav" id="drawer-chapters-nav"></ul>
+  </div>
+</div>
+
+<!-- TOC Drawer -->
+<div class="drawer" id="drawer-toc">
+  <div class="drawer-handle"></div>
+  <div class="drawer-title">本章目录</div>
+  <div class="drawer-body">
+    <ul class="drawer-toc-list" id="drawer-toc-list"></ul>
+  </div>
+</div>
+
+<script src="lib/marked.min.js"></script>
+<script src="lib/highlight.min.js"></script>
+<script>
+const renderer = new marked.Renderer();
+renderer.link = function(href, title, text) {
+  const titleAttr = title ? ` title="${title}"` : '';
+  return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+};
+marked.setOptions({ renderer });
+
+let chapters = [];
+let currentChapter = 0;
+
+// 章节图标映射（新增章节在此添加即可）
+const CHAPTER_ICONS = {
+  '项目简介':    'bi-journal-text',
+  '安装部署':    'bi-box',
+  '管理面板使用': 'bi-display',
+  '注意事项':    'bi-exclamation-triangle',
+  '常见问题':    'bi-question-circle',
+  '交流':        'bi-chat-dots',
+  '用户协议':    'bi-file-text',
+  '隐私政策':    'bi-shield-check',
+};
+
+// ── 标题文本 → URL slug（保留中文/英文/数字，其余转连字符）──
+function slugify(text) {
+  return text
+    .replace(/[^\w\s\u4e00-\u9fa5]/g, ' ')
+    .trim().replace(/\s+/g, '-').toLowerCase()
+    .replace(/-+/g, '-').replace(/^-|-$/g, '');
+}
+function chapterSlug(i) { return slugify(chapters[i].title); }
+
+// ── URL 路由 ──
+// 旧版数字链接兼容映射（原始章节顺序，不含项目简介）
+const LEGACY = ['安装部署', '管理面板使用', '注意事项', '常见问题', '用户协议', '隐私政策'];
+
+function getChapterFromURL() {
+  const c = new URLSearchParams(window.location.search).get('c');
+  if (!c) return 0;
+  const bySlug = chapters.findIndex(ch => slugify(ch.title) === c);
+  if (bySlug >= 0) return bySlug;
+  // 兼容旧版数字索引
+  const n = parseInt(c);
+  if (!isNaN(n) && n >= 0 && n < LEGACY.length) {
+    const li = chapters.findIndex(ch => ch.title === LEGACY[n]);
+    if (li >= 0) return li;
+  }
+  return 0;
+}
+
+function setChapterInURL(index) {
+  const url = new URL(window.location.href);
+  url.searchParams.set('c', chapterSlug(index));
+  url.hash = '';
+  history.replaceState({ chapter: index }, '', url.toString());
+}
+
+// ── 浏览器前进/后退 ──
+window.addEventListener('popstate', e => {
+  const index = e.state?.chapter ?? getChapterFromURL();
+  renderChapter(index, false);
+});
+
+// ── 加载并解析 markdown ──
+fetch('docs.md')
+  .then(r => r.text())
+  .then(markdown => {
+    const parts = markdown.split(/^## (.+)$/gm);
+    for (let i = 1; i < parts.length; i += 2)
+      chapters.push({ title: parts[i].trim(), content: '## ' + parts[i] + '\n\n' + (parts[i + 1] || '') });
+    buildSidebar();
+    renderChapter(Math.min(getChapterFromURL(), chapters.length - 1), false);
+  })
+  .catch(() => {
+    document.getElementById('content').innerHTML = '<p style="color:red;padding:2rem;">加载文档失败，请确保 docs.md 文件存在。</p>';
+  });
+
+// ── 动态生成侧边栏（docs.md 新增章节自动出现）──
+function buildSidebar() {
+  const html = chapters.map((ch, i) =>
+    `<li><a class="sidebar-link" data-chapter="${i}"><i class="bi ${CHAPTER_ICONS[ch.title] || 'bi-file-earmark'}"></i><span>${ch.title}</span></a></li>`
+  ).join('');
+  document.getElementById('sidebar-nav').innerHTML = html;
+  document.getElementById('drawer-chapters-nav').innerHTML = html;
+  document.querySelectorAll('.sidebar-link').forEach(link =>
+    link.addEventListener('click', () => renderChapter(parseInt(link.dataset.chapter)))
+  );
+}
+
+// ── 渲染章节 ──
+function renderChapter(index, pushState = true) {
+  if (index < 0 || index >= chapters.length) return;
+  currentChapter = index;
+  document.getElementById('content').innerHTML = marked.parse(chapters[index].content);
+  document.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+  document.querySelectorAll('#content img').forEach(img =>
+    img.addEventListener('click', () => openLightbox(img.src, img.alt))
+  );
+  // GA 点击追踪：安装部署页的三个关键链接
+  const GA_LINK_MAP = [
+    { pattern: 'github.com/SiverKing/SiverWXbot_plus/releases', event: 'click_down_releases' },
+    { pattern: 'lanzout.com',                                    event: 'click_down_lanzou' },
+    { pattern: 'github.com/SiverKing/SiverWXbot_plus',          event: 'click_down_source' },
+  ];
+  document.querySelectorAll('#content a[href]').forEach(a => {
+    const href = a.getAttribute('href');
+    for (const { pattern, event } of GA_LINK_MAP) {
+      if (href.includes(pattern)) {
+        a.addEventListener('click', () => { gtag('event', event); });
+        break;
+      }
+    }
+  });
+  document.querySelectorAll('.sidebar-link').forEach(link =>
+    link.classList.toggle('active', parseInt(link.dataset.chapter) === index)
+  );
+  // 切换章节时先清 hash 再构建目录，防止 buildTOC 误用旧锚点滚动
+  if (pushState) {
+    setChapterInURL(index);
+    window.scrollTo(0, 0);
+  }
+  buildTOC();
+  closeDrawers();
+}
+
+// ── 构建右侧目录（用标题文本 slug 作为稳定锚点）──
+function buildTOC() {
+  const headings   = document.querySelectorAll('#content h3, #content h4');
+  const tocList    = document.getElementById('toc');
+  const drawerList = document.getElementById('drawer-toc-list');
+  tocList.innerHTML = drawerList.innerHTML = '';
+
+  const seen = {};
+  headings.forEach(h => {
+    const base = slugify(h.textContent);
+    const n    = seen[base] || 0;
+    const id   = n === 0 ? base : base + '-' + n;
+    seen[base] = n + 1;
+    h.id = id;
+
+    const isH4 = h.tagName === 'H4';
+    const href  = '?c=' + chapterSlug(currentChapter) + '#' + id;
+    const cls   = isH4 ? ' level-4' : '';
+
+    const mkLink = (extraCls, onclickFn) => {
+      const a = document.createElement('a');
+      a.href = href; a.className = extraCls; a.textContent = h.textContent;
+      a.onclick = onclickFn;
+      return a;
+    };
+
+    const pushAnchor = e => {
+      e.preventDefault();
+      const url = new URL(window.location.href);
+      url.searchParams.set('c', chapterSlug(currentChapter));
+      url.hash = id;
+      history.pushState({ chapter: currentChapter, anchor: id }, '', url.toString());
+    };
+
+    const li = document.createElement('li');
+    li.appendChild(mkLink('toc-link' + cls, e => { pushAnchor(e); scrollToHeading(h); }));
+    tocList.appendChild(li);
+
+    const dli = document.createElement('li');
+    dli.appendChild(mkLink('drawer-toc-link' + cls, e => { pushAnchor(e); closeDrawers(); scrollToHeading(h); }));
+    drawerList.appendChild(dli);
+  });
+
+  // 处理 URL 中的 hash 锚点滚动（需 decodeURIComponent 处理中文编码）
+  const hash = decodeURIComponent(window.location.hash.slice(1));
+  if (hash) {
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        const t = document.getElementById(hash);
+        if (t) scrollToHeading(t);
+      }, 100);
+    });
+  }
+}
+
+function scrollToHeading(el) {
+  const navH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--nav-h')) || 56;
+  window.scrollTo({ top: el.getBoundingClientRect().top + window.scrollY - navH - 16, behavior: 'smooth' });
+}
+
+// ── 抽屉控制 ──
+const overlay        = document.getElementById('drawer-overlay');
+const drawerChapters = document.getElementById('drawer-chapters');
+const drawerToc      = document.getElementById('drawer-toc');
+
+function openDrawer(d) { overlay.classList.add('show'); d.classList.add('show'); }
+function closeDrawers() {
+  overlay.classList.remove('show');
+  drawerChapters.classList.remove('show');
+  drawerToc.classList.remove('show');
+  document.getElementById('btn-chapters').classList.remove('active');
+  document.getElementById('btn-toc').classList.remove('active');
+}
+
+document.getElementById('btn-chapters').addEventListener('click', () => {
+  if (drawerChapters.classList.contains('show')) { closeDrawers(); return; }
+  closeDrawers(); openDrawer(drawerChapters);
+  document.getElementById('btn-chapters').classList.add('active');
+});
+document.getElementById('btn-toc').addEventListener('click', () => {
+  if (drawerToc.classList.contains('show')) { closeDrawers(); return; }
+  closeDrawers(); openDrawer(drawerToc);
+  document.getElementById('btn-toc').classList.add('active');
+});
+overlay.addEventListener('click', closeDrawers);
+
+// ── Scroll spy ──
+let ticking = false;
+window.addEventListener('scroll', () => {
+  if (!ticking) { window.requestAnimationFrame(() => { updateTOCActive(); ticking = false; }); ticking = true; }
+});
+function updateTOCActive() {
+  const hs = document.querySelectorAll('#content h3, #content h4');
+  const ls = document.querySelectorAll('.toc-link');
+  let ai = -1;
+  hs.forEach((h, i) => { if (h.getBoundingClientRect().top <= 100) ai = i; });
+  ls.forEach((l, i) => l.classList.toggle('active', i === ai));
+}
+
+// ── 灯箱 ──
+const lightbox    = document.getElementById('lightbox');
+const lightboxImg = document.getElementById('lightbox-img');
+function openLightbox(src, alt) { lightboxImg.src = src; lightboxImg.alt = alt || ''; lightbox.classList.add('show'); document.body.style.overflow = 'hidden'; }
+function closeLightbox() { lightbox.classList.remove('show'); document.body.style.overflow = ''; }
+lightbox.addEventListener('click', closeLightbox);
+lightboxImg.addEventListener('click', e => e.stopPropagation());
+document.getElementById('lightbox-close').addEventListener('click', closeLightbox);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLightbox(); });
+
+fetch('version.json').then(r => r.json()).then(d => {
+  const el = document.getElementById('nav-version'); if (el) el.textContent = d.version || '';
+}).catch(() => {});
+</script>
+
+</body>
+</html>
