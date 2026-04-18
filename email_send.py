@@ -17,6 +17,7 @@ from email.header import Header
 import time
 import os
 import sys
+from logger import log
 
 def _base_dir():
     if hasattr(sys, '_MEIPASS'):
@@ -108,10 +109,13 @@ def send_email(receiver=None, subject="默认邮件主题", content="这是来�
     subject: 邮件主题
     content: 邮件内容
     '''
-    cfg = read_config()
-    if receiver is None:
-        receiver = cfg['user']
-    send_qq_email(receiver, subject, content)
+    try:
+        cfg = read_config()
+        if receiver is None:
+            receiver = cfg['user']
+        send_qq_email(receiver, subject, content)
+    except Exception as e:
+        log(level="ERROR", message="报错邮件发送失败，请检查邮件配置是否正确")
 
 # 使用示例
 if __name__ == "__main__":

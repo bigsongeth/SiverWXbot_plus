@@ -42,15 +42,18 @@ def base_dir():
 
 # 初始化 Flask 应用
 app = Flask(__name__, template_folder=resource_path('templates'), static_folder=resource_path('templates/static'))
+app.secret_key = 'your_very_long_and_random_secret_key_here'
 
 # 安全配置
 app.config.update(
-    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    PERMANENT_SESSION_LIFETIME=timedelta(days=15),
-    SECRET_KEY='wxbot-admin-123456-secret-key-2024'
+    PERMANENT_SESSION_LIFETIME=timedelta(days=15)
 )
+
+# 配置参数
+app.secret_key = 'your_secret_key_here'
 PORT = 10001
 CONFIG_FILE = os.path.join(base_dir(), 'config', 'config.json')
 ADMIN_FILE  = os.path.join(base_dir(), 'config', 'admin.json')
@@ -102,9 +105,7 @@ log_messages = []
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        logged_in = session.get('logged_in', False)
-        print(f"[DEBUG] login_required: path={request.path}, logged_in={logged_in}, session_keys={list(session.keys())}")
-        if not logged_in:
+        if not session.get('logged_in'):
             if request.path.startswith('/api/') or request.accept_mimetypes.accept_json:
                 return jsonify({'status': 'error', 'message': '未登录'}), 401
             return redirect(url_for('login', next=request.url))
@@ -285,6 +286,17 @@ def read_config():
         log('ERROR', f'读取配置文件失败: {str(e)}')
         return None
 
+def _parse_hhmm_config(value, field_name):
+    """解析 `HH:MM` 格式的时间字段，非法时返回错误信息而不是抛异常。"""
+    value = str(value or '').strip()
+    if not value:
+        return None, f'{field_name} 为空'
+    try:
+        parsed = datetime.strptime(value, "%H:%M")
+        return (parsed.hour, parsed.minute), None
+    except ValueError:
+        return None, f'{field_name} 格式无效: {value}，应为 HH:MM'
+
 @app.route('/api/check_auth')
 def check_auth():
     return jsonify({'authenticated': session.get('logged_in', False)})
@@ -333,7 +345,6 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    print(f"[DEBUG] dashboard: Accept={request.accept_mimetypes}, path={request.path}")
     config = read_config()
     if not config:
         return render_template('error.html', message='无法读取配置文件')
@@ -341,10 +352,10 @@ def dashboard():
     # 旧配置迁移：只要旧字段存在就迁移并写回磁盘（无论 api_configs 是否已有）
     if 'api_sdk' in config:
         config['api_configs'] = [
-            {'sdk': config.get('api_sdk', 'Custom'), 'key': config.get('api_key', ''),
-             'url': config.get('base_url', 'https://api.your-api-domain.com'), 'model': config.get('model1', 'gpt-5')},
-            {'sdk': config.get('api_sdk', 'Custom'), 'key': config.get('api_key', ''),
-             'url': config.get('base_url', 'https://api.your-api-domain.com'), 'model': config.get('model2', 'claude-sonnet-4-6')},
+            {'sdk': config.get('api_sdk', 'DusAPI'), 'key': config.get('api_key', ''),
+             'url': config.get('base_url', 'https://api.dusapi.com'), 'model': config.get('model1', 'gpt-5')},
+            {'sdk': config.get('api_sdk', 'DusAPI'), 'key': config.get('api_key', ''),
+             'url': config.get('base_url', 'https://api.dusapi.com'), 'model': config.get('model2', 'claude-sonnet-4-6')},
         ]
         config['api_index'] = 0
         for old_key in ('api_sdk', 'api_key', 'base_url', 'model1', 'model2', 'api_sdk_list'):
@@ -356,8 +367,8 @@ def dashboard():
         except Exception as _e:
             log('ERROR', f'迁移配置写入失败: {_e}')
     config.setdefault('api_configs', [
-        {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "gpt-5"},
-        {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
+        {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "gpt-5"},
+        {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
     ])
     config.setdefault('api_index', 0)
 
@@ -1153,16 +1164,40 @@ def time_start_stop():
         now = datetime.now()
         # 比较小时和分钟是否匹配
         return (now.hour == target_hour) and (now.minute == target_minute)
+    def load_time_schedule_config():
+        """读取并校验定时启停配置，非法时间格式时仅跳过调度。"""
+        time_config = read_config() or {}
+        enabled = bool(time_config.get("everyday_start_stop_bot_switch"))
+        if not enabled:
+            return False, None, None
+
+        start_time, start_err = _parse_hhmm_config(
+            time_config.get("everyday_start_bot_time"),
+            "everyday_start_bot_time",
+        )
+        stop_time, stop_err = _parse_hhmm_config(
+            time_config.get("everyday_stop_bot_time"),
+            "everyday_stop_bot_time",
+        )
+
+        errors = [err for err in (start_err, stop_err) if err]
+        if errors:
+            for err in errors:
+                log('ERROR', f'定时启停配置校验失败: {err}')
+            log('WARNING', '定时启停已临时禁用，本轮不会执行，请修正时间格式后重新保存配置')
+            return False, None, None
+
+        return True, start_time, stop_time
     def time_check_thread():
         """定时检查线程"""
         global bot_thread, bot, update_config_status
         # 读取配置文件
-        time_config = read_config()
-        everyday_start_stop_bot_switch = time_config.get("everyday_start_stop_bot_switch")
-        start_hour = datetime.strptime(time_config.get("everyday_start_bot_time"), "%H:%M").hour
-        start_minute = datetime.strptime(time_config.get("everyday_start_bot_time"), "%H:%M").minute
-        stop_hour = datetime.strptime(time_config.get("everyday_stop_bot_time"), "%H:%M").hour
-        stop_minute = datetime.strptime(time_config.get("everyday_stop_bot_time"), "%H:%M").minute
+        start_hour = start_minute = stop_hour = stop_minute = None
+        everyday_start_stop_bot_switch, start_time, stop_time = load_time_schedule_config()
+        if start_time:
+            start_hour, start_minute = start_time
+        if stop_time:
+            stop_hour, stop_minute = stop_time
         if everyday_start_stop_bot_switch:
             log('INFO', f'启动定时启停线程，启动时间：{start_hour}:{start_minute}，停止时间：{stop_hour}:{stop_minute}')
         else:
@@ -1171,12 +1206,12 @@ def time_start_stop():
         while True:
             if update_config_status: # 保存配置后更新定时启停状态
                 update_config_status = False
-                time_config = read_config()
-                everyday_start_stop_bot_switch = time_config.get("everyday_start_stop_bot_switch")
-                start_hour = datetime.strptime(time_config.get("everyday_start_bot_time"), "%H:%M").hour
-                start_minute = datetime.strptime(time_config.get("everyday_start_bot_time"), "%H:%M").minute
-                stop_hour = datetime.strptime(time_config.get("everyday_stop_bot_time"), "%H:%M").hour
-                stop_minute = datetime.strptime(time_config.get("everyday_stop_bot_time"), "%H:%M").minute
+                start_hour = start_minute = stop_hour = stop_minute = None
+                everyday_start_stop_bot_switch, start_time, stop_time = load_time_schedule_config()
+                if start_time:
+                    start_hour, start_minute = start_time
+                if stop_time:
+                    stop_hour, stop_minute = stop_time
                 if everyday_start_stop_bot_switch:
                     log('INFO', f'配置更新，启动定时启停线程，启动时间：{start_hour}:{start_minute}，停止时间：{stop_hour}:{stop_minute}')
                 else:
@@ -1186,7 +1221,8 @@ def time_start_stop():
                     log('INFO', '到达预定启动时间，正在启动机器人')
                     if bot_thread and bot_thread.is_alive():
                         log("WARNING", "状态：机器人已在运行")
-                        email_send.send_email(subject="定时启动机器人", content="机器人已在运行，无需启动")
+                        log(message="定时启动机器人:机器人已在运行，无需启动")
+                        # email_send.send_email(subject="定时启动机器人", content="机器人已在运行，无需启动")
                     else:
                         def run_bot():
                             pythoncom.CoInitialize()  # 防止多线程调用COM组件时出错
@@ -1200,11 +1236,14 @@ def time_start_stop():
                                     log('WARNING', f'清理旧监听时出错（可忽略）: {_e}')
                             bot = WXBot()
                             bot.run()
+                            _restore_sleep()
                             pythoncom.CoUninitialize()  # 释放COM组件
                         try:
                             bot_thread = threading.Thread(target=run_bot, daemon=True)
                             bot_thread.start()
-                            email_send.send_email(subject="定时启动机器人", content="机器人已启动")
+                            _prevent_sleep()
+                            log(level='INFO', message="定时启动机器人:机器人已启动")
+                            # email_send.send_email(subject="定时启动机器人", content="机器人已启动")
                         except Exception as e:
                             log('ERROR', f'启动机器人失败: {str(e)}')
                     time.sleep(60) # 防止一分钟内重复启动
@@ -1215,12 +1254,15 @@ def time_start_stop():
                             log('SUCCESS', '机器人已停止')
                             bot_thread = None
                             bot = None
-                            email_send.send_email(subject="定时停止机器人", content="机器人已停止")
+                            _restore_sleep()
+                            log(message="定时停止机器人:机器人已停止")
+                            # email_send.send_email(subject="定时停止机器人", content="机器人已停止")
                         else:
                             log('ERROR', '停止机器人失败')
                     else:
                         log('WARNING', '状态：机器人未运行')
-                        email_send.send_email(subject="定时停止机器人", content="机器人未运行，无需停止")
+                        log(message="定时停止机器人:机器人未运行，无需停止")
+                        # email_send.send_email(subject="定时停止机器人", content="机器人未运行，无需停止")
                     time.sleep(60) # 防止一分钟内重复停止
             time.sleep(10)
     
@@ -1252,8 +1294,8 @@ def main():
         if not os.path.exists(CONFIG_FILE):
             default_config = {
                 "api_configs": [
-                    {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "gpt-5.4"},
-                    {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
+                    {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "gpt-5.4"},
+                    {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
                 ],
                 "api_index": 0,
                 "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",

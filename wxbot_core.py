@@ -2,8 +2,8 @@
 # Siver微信机器人 siver_wxbot - 面向对象版本 - wxautox4版本
 # 作者：https://www.siver.top
 
-version = "V4.7.13"
-version_log = "V4.7.13 - 适配最新客户端4.1.8.107、优化更新通知、bug修复复"
+version = "V4.7.15"
+version_log = "V4.7.15 - 适配最新客户端、优化拆分回复、优化记忆存储、优化自定义转发"
 
 # ============================================================
 # 标准库导入
@@ -96,6 +96,7 @@ SPLIT_PROMPT_TEMPLATE = """\
 
 若无需拆分则正常回复，不要添加任何分隔符。
 严禁在正文内容中出现 ||SPLIT|| 字样。
+如果你想分条回复，一定一定一定要在每个分条直接加上这个分隔符||SPLIT||，不然程序无法处理分条发送
 【以下是你的角色设定】
 {base_prompt}"""
 
@@ -223,8 +224,8 @@ class WXBotConfig:
             if not os.path.exists(self.CONFIG_FILE):
                 base_config = {
                     "api_configs": [
-                        {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "gpt-5.4"},
-                        {"sdk": "Custom", "key": "your-api-key", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
+                        {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "gpt-5.4"},
+                        {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
                     ],
                     "api_index": 0,
                     "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",
@@ -371,15 +372,15 @@ class WXBotConfig:
         if 'api_configs' not in self.config and 'api_sdk' in self.config:
             self.config['api_configs'] = [
                 {
-                    'sdk':   self.config.get('api_sdk', 'Custom'),
+                    'sdk':   self.config.get('api_sdk', 'DusAPI'),
                     'key':   self.config.get('api_key', ''),
-                    'url':   self.config.get('base_url', 'https://api.your-api-domain.com'),
+                    'url':   self.config.get('base_url', 'https://api.dusapi.com'),
                     'model': self.config.get('model1', 'gpt-5'),
                 },
                 {
-                    'sdk':   self.config.get('api_sdk', 'Custom'),
+                    'sdk':   self.config.get('api_sdk', 'DusAPI'),
                     'key':   self.config.get('api_key', ''),
-                    'url':   self.config.get('base_url', 'https://api.your-api-domain.com'),
+                    'url':   self.config.get('base_url', 'https://api.dusapi.com'),
                     'model': self.config.get('model2', 'claude-sonnet-4-6'),
                 },
             ]
@@ -390,8 +391,8 @@ class WXBotConfig:
             log(message="旧 API 配置已自动迁移为新格式并保存")
 
         self.api_configs = self.config.get('api_configs', [
-            {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "gpt-5"},
-            {"sdk": "Custom", "key": "", "url": "https://api.your-api-domain.com", "model": "claude-sonnet-4-6"},
+            {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "gpt-5"},
+            {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
         ])
         self.api_index = self.config.get('api_index', 0)
         if self.api_index >= len(self.api_configs):
@@ -399,7 +400,7 @@ class WXBotConfig:
 
         # 从当前接口配置派生兼容属性（供 AI 接口类使用）
         _cur = self.api_configs[self.api_index] if self.api_configs else {}
-        self.api_sdk  = _cur.get('sdk', 'Custom')
+        self.api_sdk  = _cur.get('sdk', 'DusAPI')
         self.api_key  = _cur.get('key', '')
         self.base_url = _cur.get('url', '')
         self.model1   = _cur.get('model', '')
@@ -657,11 +658,63 @@ class MemoryManager:
         os.makedirs(dir_path, exist_ok=True)
         return os.path.join(dir_path, f"{chat_name}_memory.json")
 
-    def save_message(self, chat_name, sender, content, msg_type, msg_attr, max_count):
+    @staticmethod
+    def _normalize_message_time(message_time=None):
+        """将外部传入的时间统一转成记忆文件使用的字符串格式。"""
+        if isinstance(message_time, datetime):
+            return message_time.strftime("%Y/%m/%d %H:%M:%S")
+        if isinstance(message_time, str):
+            message_time = message_time.strip()
+            if message_time:
+                return message_time
+        return datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+
+    @staticmethod
+    def _parse_message_time(message_time):
+        """解析记忆时间字符串；解析失败时返回 None，避免影响主流程。"""
+        if not message_time:
+            return None
+        try:
+            return datetime.strptime(str(message_time), "%Y/%m/%d %H:%M:%S")
+        except Exception:
+            return None
+
+    def _append_message_in_order(self, messages, entry, recent_count=5):
+        """在最近 recent_count 条范围内按时间插入，修正回调并发导致的乱序写入。"""
+        current_dt = self._parse_message_time(entry.get("time"))
+        if current_dt is None or not messages:
+            messages.append(entry)
+            return messages
+
+        recent_start = max(0, len(messages) - recent_count)
+        recent_messages = messages[recent_start:]
+        has_later_recent = False
+        for item in recent_messages:
+            item_dt = self._parse_message_time(item.get("time"))
+            if item_dt and item_dt > current_dt:
+                has_later_recent = True
+                break
+
+        if not has_later_recent:
+            messages.append(entry)
+            return messages
+
+        # 只重排尾部最近几条，既能修正本次乱序，也避免每次写入都全量排序。
+        sortable_recent = []
+        for idx, item in enumerate(recent_messages):
+            item_dt = self._parse_message_time(item.get("time")) or datetime.max
+            sortable_recent.append((item_dt, idx, item))
+        sortable_recent.append((current_dt, len(recent_messages), entry))
+        sortable_recent.sort(key=lambda x: (x[0], x[1]))
+        messages[recent_start:] = [item for _, _, item in sortable_recent]
+        return messages
+
+    def save_message(self, chat_name, sender, content, msg_type, msg_attr, max_count, message_time=None):
         """写入一条消息到记忆文件，超出 max_count 时删除最旧的"""
         path  = self._get_memory_path(chat_name)
+        entry_time = self._normalize_message_time(message_time)
         entry = {
-            "time":    datetime.now().strftime("%Y/%m/%d %H:%M:%S"),
+            "time":    entry_time,
             "type":    str(msg_type),
             "attr":    str(msg_attr),
             "sender":  str(sender),
@@ -678,7 +731,7 @@ class MemoryManager:
                     messages = []
             else:
                 messages = []
-            messages.append(entry)
+            messages = self._append_message_in_order(messages, entry, recent_count=5)
             if len(messages) > max_count:
                 messages = messages[-max_count:]
             with open(path, 'w', encoding='utf-8') as f:
@@ -853,48 +906,31 @@ class OpenAIAPI:
 
     def _try_responses_api(self, message, model, stream, prompt):
         """
-        备用方案：使用原始 HTTP 请求调用 Chat Completions API。
-        当 OpenAI SDK 调用失败时自动降级到此方案，兼容 NewAPI/One-API 等代理。
+        备用方案：使用 Responses API 调用。
+        当 Chat Completions API 返回非 JSON 格式时自动降级到此方案。
         注意：备用方案暂不支持流式输出，统一使用非流式模式。
         """
         try:
             if stream:
                 log(level="WARN", message="备用方案不支持流式输出，将使用非流式模式")
 
-            log(message=f"备用方案：使用原始 HTTP 请求 Chat Completions, model={model}")
+            log(message=f"备用方案：使用 Responses API, model={model}")
+            # Responses API 的 input 只接受字符串，将 prompt 拼接到消息中
+            input_text = f"这是prompt，请不要把这个当做用户输入：{prompt}\n\n这是用户消息，你需要参照prompt来回复用户消息：{message}" if prompt and prompt.strip() else message
 
-            headers = {
-                "Authorization": f"Bearer {self.client.api_key}",
-                "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0",
-            }
-
-            messages = []
-            if prompt and prompt.strip():
-                messages.append({"role": "system", "content": prompt})
-            messages.append({"role": "user", "content": message})
-
-            payload = {
-                "model": model,
-                "messages": messages,
-            }
-
-            base_url = str(self.client.base_url).rstrip('/')
-            response = requests.post(
-                f"{base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=600,
+            response = self.client.responses.create(
+                model=model,
+                input=input_text,
+                reasoning={"effort": "none"}
             )
-            response.raise_for_status()
-            data = response.json()
 
-            choices = data.get("choices", [])
-            if choices:
-                content = choices[0].get("message", {}).get("content", "")
-                if content:
-                    log(message=f"备用方案返回成功：{content[:100]}...")
-                    return content
+            # 从 output 中提取文本内容
+            if response.output and len(response.output) > 0:
+                output_item = response.output[0]
+                if hasattr(output_item, 'content') and output_item.content:
+                    text = output_item.content[0].text
+                    log(message=f"备用方案返回成功：{text[:100]}...")
+                    return text
 
             log(level="WARN", message="备用方案响应内容为空")
             return "API返回错误，请稍后再试"
@@ -1103,9 +1139,9 @@ class CozeAPI:
             return "API返回错误，请稍后再试"
 
 
-class Custom:
+class DusAPI:
     """
-    Custom 兼容接口封装类
+    DusAPI 兼容接口封装类
     根据模型名称自动选择协议：
     - 包含 'claude' → Anthropic 格式（x-api-key + /v1/messages）
     - 包含 'gpt'    → GPT/OpenAI 格式（Bearer + /v1/chat/completions）
@@ -1147,7 +1183,7 @@ class Custom:
 
     @staticmethod
     def _build_gpt_image_block(image_path: str = "", image_url: str = "") -> dict:
-        """根据本地路径或 URL 构建 Chat Completions API image content block"""
+        """根据本地路径或 URL 构建 GPT/Responses API image input block"""
         if image_path:
             mime_type, _ = mimetypes.guess_type(image_path)
             if mime_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
@@ -1155,28 +1191,49 @@ class Custom:
             with open(image_path, "rb") as f:
                 image_data = base64.standard_b64encode(f.read()).decode("utf-8")
             return {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime_type};base64,{image_data}"}
+                "type": "input_image",
+                "image_url": f"data:{mime_type};base64,{image_data}"
             }
         elif image_url:
             return {
-                "type": "image_url",
-                "image_url": {"url": image_url}
+                "type": "input_image",
+                "image_url": image_url
             }
         else:
             raise ValueError("image_path 和 image_url 不能同时为空")
 
     @staticmethod
     def _extract_gpt_text(response_data: dict):
-        """提取 Chat Completions API 非流式返回文本"""
+        """提取 GPT/Responses API 非流式返回文本"""
         try:
-            # Chat Completions 标准格式
-            choices = response_data.get("choices", [])
-            if choices and isinstance(choices, list):
-                message = choices[0].get("message", {})
-                content = message.get("content")
-                if isinstance(content, str) and content:
-                    return content
+            output_text = response_data.get("output_text")
+            if isinstance(output_text, str) and output_text:
+                return output_text
+
+            output = response_data.get("output", [])
+            result_parts = []
+
+            if isinstance(output, list):
+                for item in output:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") != "message":
+                        continue
+
+                    content = item.get("content", [])
+                    if not isinstance(content, list):
+                        continue
+
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") in ("output_text", "text"):
+                            text = block.get("text")
+                            if text:
+                                result_parts.append(text)
+
+            if result_parts:
+                return "".join(result_parts)
 
             return None
         except Exception:
@@ -1222,7 +1279,7 @@ class Custom:
         return "".join(result_parts)
 
     def _stream_gpt_text(self, api_endpoint, headers, payload) -> str:
-        """Chat Completions API 流式接收并拼接为完整文本"""
+        """GPT/Responses API 流式接收并拼接为完整文本"""
         response = requests.post(
             api_endpoint,
             headers=headers,
@@ -1257,13 +1314,26 @@ class Custom:
             except Exception:
                 continue
 
-            # Chat Completions 流式格式：choices[0].delta.content
-            choices = data.get("choices", [])
-            if choices:
-                delta = choices[0].get("delta", {})
-                content = delta.get("content")
-                if isinstance(content, str) and content:
-                    result_parts.append(content)
+            event_type = data.get("type")
+
+            # Responses API 常见文本增量事件
+            if event_type in (
+                "response.output_text.delta",
+                "response.refusal.delta",
+            ):
+                delta = data.get("delta")
+                if isinstance(delta, str) and delta:
+                    result_parts.append(delta)
+
+            # 某些兼容层可能直接给 output_text
+            elif event_type == "response.completed":
+                try:
+                    output_text = data.get("response", {}).get("output_text")
+                    if isinstance(output_text, str) and output_text:
+                        if not result_parts:
+                            result_parts.append(output_text)
+                except Exception:
+                    pass
 
         return "".join(result_parts)
 
@@ -1336,21 +1406,21 @@ class Custom:
                         result = self._stream_claude_text(api_endpoint, headers, payload)
                         if result:
                             if attempt > 0:
-                                log(message=f"Custom Claude 流式第 {attempt} 次重试成功：{result[:100]}...")
+                                log(message=f"DusAPI Claude 流式第 {attempt} 次重试成功：{result[:100]}...")
                             else:
-                                log(message=f"Custom Claude 流式返回成功：{result[:100]}...")
+                                log(message=f"DusAPI Claude 流式返回成功：{result[:100]}...")
                             return result
                         else:
-                            raise ValueError("Custom Claude 流式响应中未找到文本内容")
+                            raise ValueError("DusAPI Claude 流式响应中未找到文本内容")
 
                     except Exception as e:
                         last_error = e
                         if attempt < max_retries:
                             delay = retry_delays[attempt]
-                            log(level="WARNING", message=f"Custom Claude 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                            log(level="WARNING", message=f"DusAPI Claude 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                             time.sleep(delay)
                         else:
-                            log(level="ERROR", message=f"Custom Claude 流式已重试 {max_retries} 次，最终失败: {last_error}")
+                            log(level="ERROR", message=f"DusAPI Claude 流式已重试 {max_retries} 次，最终失败: {last_error}")
 
                 return "API返回错误，请稍后再试"
 
@@ -1364,26 +1434,26 @@ class Custom:
                     result = response_data['content'][0]['text']
 
                     if attempt > 0:
-                        log(message=f"Custom Claude 第 {attempt} 次重试成功：{result[:100]}...")
+                        log(message=f"DusAPI Claude 第 {attempt} 次重试成功：{result[:100]}...")
                     else:
-                        log(message=f"Custom Claude 返回成功：{result[:100]}...")
+                        log(message=f"DusAPI Claude 返回成功：{result[:100]}...")
                     return result
 
                 except Exception as e:
                     last_error = e
                     if attempt < max_retries:
                         delay = retry_delays[attempt]
-                        log(level="WARNING", message=f"Custom Claude 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                        log(level="WARNING", message=f"DusAPI Claude 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                         time.sleep(delay)
                     else:
-                        log(level="ERROR", message=f"Custom Claude 已重试 {max_retries} 次，最终失败: {last_error}")
+                        log(level="ERROR", message=f"DusAPI Claude 已重试 {max_retries} 次，最终失败: {last_error}")
 
             return "API返回错误，请稍后再试"
 
         # =========================
-        # Chat Completions 分支（适用于所有非 Claude 模型，包括 GPT、Grok、DeepSeek 等）
+        # GPT / OpenAI 分支
         # =========================
-        else:
+        elif 'gpt' in model.lower():
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "content-type": "application/json",
@@ -1415,7 +1485,7 @@ class Custom:
 
             if image_path or image_url:
                 user_content = [
-                    {"type": "text", "text": message},
+                    {"type": "input_text", "text": message},
                     self._build_gpt_image_block(image_path, image_url),
                 ]
             else:
@@ -1428,10 +1498,11 @@ class Custom:
 
             payload = {
                 "model": model,
-                "messages": input_items,
+                "input": input_items,
+                "max_output_tokens": 200000,
             }
 
-            api_endpoint = f"{self.base_url}/v1/chat/completions"
+            api_endpoint = f"{self.base_url}/v1/responses"
 
             if stream:
                 payload["stream"] = True
@@ -1441,21 +1512,21 @@ class Custom:
                         result = self._stream_gpt_text(api_endpoint, headers, payload)
                         if result:
                             if attempt > 0:
-                                log(message=f"Custom GPT 流式第 {attempt} 次重试成功：{result[:100]}...")
+                                log(message=f"DusAPI GPT 流式第 {attempt} 次重试成功：{result[:100]}...")
                             else:
-                                log(message=f"Custom GPT 流式返回成功：{result[:100]}...")
+                                log(message=f"DusAPI GPT 流式返回成功：{result[:100]}...")
                             return result
                         else:
-                            raise ValueError("Custom GPT 流式响应中未找到文本内容")
+                            raise ValueError("DusAPI GPT 流式响应中未找到文本内容")
 
                     except Exception as e:
                         last_error = e
                         if attempt < max_retries:
                             delay = retry_delays[attempt]
-                            log(level="WARNING", message=f"Custom GPT 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                            log(level="WARNING", message=f"DusAPI GPT 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                             time.sleep(delay)
                         else:
-                            log(level="ERROR", message=f"Custom GPT 流式已重试 {max_retries} 次，最终失败: {last_error}")
+                            log(level="ERROR", message=f"DusAPI GPT 流式已重试 {max_retries} 次，最终失败: {last_error}")
 
                 return "API返回错误，请稍后再试"
 
@@ -1468,26 +1539,28 @@ class Custom:
 
                     result = self._extract_gpt_text(response_data)
                     if result is None:
-                        raise ValueError(f"Custom GPT 响应中未找到文本内容：{response_data}")
+                        raise ValueError(f"DusAPI GPT 响应中未找到文本内容：{response_data}")
 
                     if attempt > 0:
-                        log(message=f"Custom GPT 第 {attempt} 次重试成功：{result[:100]}...")
+                        log(message=f"DusAPI GPT 第 {attempt} 次重试成功：{result[:100]}...")
                     else:
-                        log(message=f"Custom GPT 返回成功：{result[:100]}...")
+                        log(message=f"DusAPI GPT 返回成功：{result[:100]}...")
                     return result
 
                 except Exception as e:
                     last_error = e
                     if attempt < max_retries:
                         delay = retry_delays[attempt]
-                        log(level="WARNING", message=f"Custom GPT 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                        log(level="WARNING", message=f"DusAPI GPT 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
                         time.sleep(delay)
                     else:
-                        log(level="ERROR", message=f"Custom GPT 已重试 {max_retries} 次，最终失败: {last_error}")
+                        log(level="ERROR", message=f"DusAPI GPT 已重试 {max_retries} 次，最终失败: {last_error}")
 
             return "API返回错误，请稍后再试"
 
-
+        else:
+            log(level="WARNING", message=f"DusAPI 未识别的模型名称：{model}，无法路由到对应协议")
+            return "API返回错误，请稍后再试"
 
 
 # ============================================================
@@ -1540,9 +1613,9 @@ class WXBot:
         elif sdk == "Coze":
             log(message="使用Coze API")
             return CozeAPI(self.config)
-        elif sdk == "Custom":
-            log(message="使用Custom")
-            return Custom(self.config)
+        elif sdk == "DusAPI":
+            log(message="使用DusAPI")
+            return DusAPI(self.config)
         else:
             log(level="ERROR", message="未配置API SDK, 默认使用OpenAI SDK")
             return OpenAIAPI(self.config)
@@ -1557,7 +1630,7 @@ class WXBot:
             log(level="WARNING", message=f"群组接口索引 {idx} 超出范围，回退到默认接口")
             return self.api
         cfg = configs[idx]
-        sdk = cfg.get('sdk', 'Custom')
+        sdk = cfg.get('sdk', 'DusAPI')
 
         # 轻量代理配置：仅覆盖接口相关字段，其余不涉及
         class _ApiProxy:
@@ -1576,8 +1649,8 @@ class WXBot:
             return OpenAIAPI(tmp)
         elif sdk == "Coze":
             return CozeAPI(tmp)
-        elif sdk == "Custom":
-            return Custom(tmp)
+        elif sdk == "DusAPI":
+            return DusAPI(tmp)
         else:
             return OpenAIAPI(tmp)
 
@@ -2228,8 +2301,9 @@ class WXBot:
         """
         try:
             # 记录原始消息日志
+            message_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
             text = (
-                datetime.now().strftime("%Y/%m/%d %H:%M:%S ")
+                message_time + " "
                 + f'类型：{msg.type} 属性：{msg.attr} 窗口：{chat.who}'
                 + f' 发送人：{msg.sender} - 消息：{msg.content}'
             )
@@ -2332,6 +2406,7 @@ class WXBot:
                         msg_type=msg.type,
                         msg_attr=msg.attr,
                         max_count=self.config.memory_max_count,
+                        message_time=message_time,
                     )
                 except Exception as e:
                     log(level="WARNING", message=f"写入记忆失败: {e}")
@@ -2581,9 +2656,15 @@ class WXBot:
                     if target:
                         time.sleep(1)
                         if src_msg:
-                            message.forward(target, message=src_msg)
+                            if message.type in ['image', 'video', 'file', 'location', 'link', 'emotion', 'merge', 'personal_card', 'note']:
+                                message.forward(target, message=src_msg)
+                            else:
+                                self.wx.SendMsg(who=target, msg=message.content+"\n"+src_msg)
                         else:
-                            message.forward(target)
+                            if message.type in ['image', 'video', 'file', 'location', 'link', 'emotion', 'merge', 'personal_card', 'note']:
+                                message.forward(target)
+                            else:
+                                self.wx.SendMsg(who=target, msg=message.content)
                         log(message=f"[自定义转发] {chat.who} → {target}（规则类型：{rule_type}，附带来源：{forward_with_source}）")
 
     def wx_send_ai(self, chat, message):
