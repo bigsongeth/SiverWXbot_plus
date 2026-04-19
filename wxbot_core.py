@@ -906,38 +906,37 @@ class OpenAIAPI:
 
     def _try_responses_api(self, message, model, stream, prompt):
         """
-        备用方案：使用 Responses API 调用。
-        当 Chat Completions API 返回非 JSON 格式时自动降级到此方案。
-        注意：备用方案暂不支持流式输出，统一使用非流式模式。
+        SDK 失败时的备用方案：使用标准 Chat Completions API 协议直接请求
         """
         try:
             if stream:
                 log(level="WARN", message="备用方案不支持流式输出，将使用非流式模式")
 
-            log(message=f"备用方案：使用 Responses API, model={model}")
-            # Responses API 的 input 只接受字符串，将 prompt 拼接到消息中
-            input_text = f"这是prompt，请不要把这个当做用户输入：{prompt}\n\n这是用户消息，你需要参照prompt来回复用户消息：{message}" if prompt and prompt.strip() else message
+            log(message=f"备用方案：使用通用 Request 进行 Chat Completions, model={model}")
+            
+            messages = []
+            if prompt:
+                messages.append({"role": "system", "content": prompt})
+            messages.append({"role": "user", "content": message})
+            
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": False
+            }
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            url = f"{self.base_url}/v1/chat/completions"
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            
+            if response.status_code != 200:
+                return f"备用接口请求失败: {response.status_code} {response.text}"
 
-            response = self.client.responses.create(
-                model=model,
-                input=input_text,
-                reasoning={"effort": "none"}
-            )
-
-            # 从 output 中提取文本内容
-            if response.output and len(response.output) > 0:
-                output_item = response.output[0]
-                if hasattr(output_item, 'content') and output_item.content:
-                    text = output_item.content[0].text
-                    log(message=f"备用方案返回成功：{text[:100]}...")
-                    return text
-
-            log(level="WARN", message="备用方案响应内容为空")
-            return "API返回错误，请稍后再试"
-
+            return response.json()['choices'][0]['message']['content']
         except Exception as e:
-            log(level="ERROR", message=f"备用方案也失败 [{type(e).__name__}]: {str(e)}")
-            return "API返回错误，请稍后再试"
+            return f"备用接口调用异常: {str(e)}"
 
 
 class DifyAPI:
@@ -1183,7 +1182,7 @@ class DusAPI:
 
     @staticmethod
     def _build_gpt_image_block(image_path: str = "", image_url: str = "") -> dict:
-        """根据本地路径或 URL 构建 GPT/Responses API image input block"""
+        """根据本地路径或 URL 构建标准 Chat Completions 图像块"""
         if image_path:
             mime_type, _ = mimetypes.guess_type(image_path)
             if mime_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
@@ -1191,51 +1190,22 @@ class DusAPI:
             with open(image_path, "rb") as f:
                 image_data = base64.standard_b64encode(f.read()).decode("utf-8")
             return {
-                "type": "input_image",
-                "image_url": f"data:{mime_type};base64,{image_data}"
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{image_data}"}
             }
         elif image_url:
             return {
-                "type": "input_image",
-                "image_url": image_url
+                "type": "image_url",
+                "image_url": {"url": image_url}
             }
         else:
             raise ValueError("image_path 和 image_url 不能同时为空")
 
     @staticmethod
     def _extract_gpt_text(response_data: dict):
-        """提取 GPT/Responses API 非流式返回文本"""
+        """从标准 Chat Completions 响应中提取文本"""
         try:
-            output_text = response_data.get("output_text")
-            if isinstance(output_text, str) and output_text:
-                return output_text
-
-            output = response_data.get("output", [])
-            result_parts = []
-
-            if isinstance(output, list):
-                for item in output:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") != "message":
-                        continue
-
-                    content = item.get("content", [])
-                    if not isinstance(content, list):
-                        continue
-
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        if block.get("type") in ("output_text", "text"):
-                            text = block.get("text")
-                            if text:
-                                result_parts.append(text)
-
-            if result_parts:
-                return "".join(result_parts)
-
-            return None
+            return response_data['choices'][0]['message']['content']
         except Exception:
             return None
 
@@ -1485,7 +1455,7 @@ class DusAPI:
 
             if image_path or image_url:
                 user_content = [
-                    {"type": "input_text", "text": message},
+                    {"type": "text", "text": message},
                     self._build_gpt_image_block(image_path, image_url),
                 ]
             else:
@@ -1498,11 +1468,10 @@ class DusAPI:
 
             payload = {
                 "model": model,
-                "input": input_items,
-                "max_output_tokens": 200000,
+                "messages": input_items,
             }
 
-            api_endpoint = f"{self.base_url}/v1/responses"
+            api_endpoint = f"{self.base_url}/v1/chat/completions"
 
             if stream:
                 payload["stream"] = True
