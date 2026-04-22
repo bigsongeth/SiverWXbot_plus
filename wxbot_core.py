@@ -1241,9 +1241,18 @@ class DusAPI:
 
     @staticmethod
     def _extract_gpt_text(response_data: dict):
-        """从标准 Chat Completions 响应中提取文本"""
+        """从标准 Chat Completions 响应中提取文本，content 为空时兜底取 reasoning_content"""
         try:
-            return response_data['choices'][0]['message']['content']
+            msg = response_data['choices'][0]['message']
+            content = msg.get('content') or ''
+            if content.strip():
+                return content
+            # 兜底：reasoning 模型（如 grok-reasoning）可能只填 reasoning_content
+            reasoning = msg.get('reasoning_content') or ''
+            if reasoning.strip():
+                log(message="DusAPI GPT: content 为空，已从 reasoning_content 取回复")
+                return reasoning
+            return None
         except Exception:
             return None
 
@@ -1324,7 +1333,7 @@ class DusAPI:
 
             event_type = data.get("type")
 
-            # Responses API 常见文本增量事件
+            # ① Responses API 格式（OpenAI 新接口）
             if event_type in (
                 "response.output_text.delta",
                 "response.refusal.delta",
@@ -1333,7 +1342,6 @@ class DusAPI:
                 if isinstance(delta, str) and delta:
                     result_parts.append(delta)
 
-            # 某些兼容层可能直接给 output_text
             elif event_type == "response.completed":
                 try:
                     output_text = data.get("response", {}).get("output_text")
@@ -1342,6 +1350,16 @@ class DusAPI:
                             result_parts.append(output_text)
                 except Exception:
                     pass
+
+            # ② 标准 Chat Completions 流式格式（grok / gemini / 大多数兼容层）
+            elif event_type is None and 'choices' in data:
+                choices = data.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    # 优先取 content，其次取 reasoning_content（reasoning 模型兜底）
+                    text = delta.get("content") or delta.get("reasoning_content") or ""
+                    if text:
+                        result_parts.append(text)
 
         return "".join(result_parts)
 
@@ -1459,9 +1477,9 @@ class DusAPI:
             return "API返回错误，请稍后再试"
 
         # =========================
-        # GPT / OpenAI 分支
+        # OpenAI 兼容分支（gpt / grok / gemini 等所有兼容 Chat Completions 协议的模型）
         # =========================
-        elif 'gpt' in model.lower():
+        else:
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "content-type": "application/json",
@@ -1563,10 +1581,6 @@ class DusAPI:
                     else:
                         log(level="ERROR", message=f"DusAPI GPT 已重试 {max_retries} 次，最终失败: {last_error}")
 
-            return "API返回错误，请稍后再试"
-
-        else:
-            log(level="WARNING", message=f"DusAPI 未识别的模型名称：{model}，无法路由到对应协议")
             return "API返回错误，请稍后再试"
 
 
