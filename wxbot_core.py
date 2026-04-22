@@ -801,11 +801,14 @@ class OpenAIAPI:
 
     def __init__(self, config):
         self.config = config
+        # 【修复】显式提取 api_key，防止备用接口调用时找不到属性
+        self.api_key = getattr(config, 'api_key', '') or ''
+        self.base_url = getattr(config, 'base_url', '') or ''
         self.DS_NOW_MOD = config.model1  # 当前使用的模型，默认为 model1
         # 添加更详细的日志配置和自定义 headers（用于备用方案）
         self.client = OpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
+            api_key=self.api_key,
+            base_url=self.base_url,
             timeout=30.0,  # 设置超时时间
             max_retries=2,  # 设置重试次数
             default_headers={
@@ -898,20 +901,26 @@ class OpenAIAPI:
                 if response.choices and len(response.choices) > 0:
                     message_obj = response.choices[0].message
 
-                    # 检查是否有 content 属性
+                    # 优先取 content，为空时兜底取 reasoning_content（适配 grok-reasoning 等模型）
+                    output = ""
                     if hasattr(message_obj, 'content') and message_obj.content:
-                        output = message_obj.content
+                        output = str(message_obj.content).strip()
+                    if not output and hasattr(message_obj, 'reasoning_content') and message_obj.reasoning_content:
+                        output = str(message_obj.reasoning_content).strip()
+                        log(message="content 为空，已从 reasoning_content 取回复")
+
+                    if output:
                         log(message=f"API 非流式返回成功：{output[:100]}...")
                         return output
-                    else:
-                        log(level="WARN", message="非流式响应内容为空，尝试备用方案")
-                        return self._try_responses_api(message, model, stream, prompt)
+
+                    log(level="WARN", message=f"非流式响应内容为空或无效: {message_obj}")
+                    return self._try_responses_api(message, model, stream, prompt)
                 else:
-                    log(level="WARN", message="响应中没有 choices，尝试备用方案")
+                    log(level="WARN", message=f"响应中没有 choices 或为空: {response}")
                     return self._try_responses_api(message, model, stream, prompt)
         except Exception as e:
             error_type = type(e).__name__
-            log(level="WARN", message=f"解析 API 响应出错 [{error_type}]: {str(e)}，尝试备用方案")
+            log(level="WARN", message=f"解析 API 响应出错 [{error_type}]: {str(e)}")
             return self._try_responses_api(message, model, stream, prompt)
 
     def _try_responses_api(self, message, model, stream, prompt):
@@ -942,10 +951,29 @@ class OpenAIAPI:
             response = requests.post(url, headers=headers, json=payload, timeout=60)
             
             if response.status_code != 200:
-                return f"备用接口请求失败: {response.status_code} {response.text}"
+                error_detail = response.text[:500]
+                log(level="ERROR", message=f"备用接口 HTTP 错误 {response.status_code}: {error_detail}")
+                return f"备用接口请求失败: {response.status_code}"
 
-            return response.json()['choices'][0]['message']['content']
+            data = response.json()
+            # 【加固】检查返回结构是否合法
+            if 'choices' in data and len(data['choices']) > 0:
+                choice = data['choices'][0]
+                msg = choice.get('message', {})
+                # 优先取 content，为空时兜底取 reasoning_content（适配 grok-reasoning 等模型）
+                content = msg.get('content', '') or ''
+                if not content.strip():
+                    content = msg.get('reasoning_content', '') or ''
+                    if content.strip():
+                        log(message="备用接口 content 为空，已从 reasoning_content 取回复")
+                if content.strip():
+                    log(message=f"备用接口返回成功：{content[:100]}...")
+                    return content.strip()
+
+            log(level="ERROR", message=f"备用接口返回数据结构异常: {str(data)[:500]}")
+            return "备用接口返回数据格式错误"
         except Exception as e:
+            log(level="ERROR", message=f"备用接口调用异常: {str(e)}")
             return f"备用接口调用异常: {str(e)}"
 
 
