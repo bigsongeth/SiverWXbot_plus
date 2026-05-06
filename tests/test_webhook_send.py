@@ -30,6 +30,18 @@ class WebhookSendTests(unittest.TestCase):
             self.assertEqual(cfg["url"], "https://example.com/hook")
             self.assertEqual(cfg["method"], "POST")
 
+    def test_save_config_rejects_invalid_json_body_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "webhook.json")
+            with self.assertRaises(ValueError):
+                webhook_send.save_config({
+                    "enabled": True,
+                    "url": "https://example.com/hook",
+                    "content_type": "application/json",
+                    "body": '{"msg":"unterminated}',
+                }, path)
+            self.assertFalse(os.path.exists(path))
+
     @patch("webhook_send.requests.request")
     def test_send_webhook_posts_rendered_json_body_and_headers(self, request_mock):
         response = Mock(status_code=200, text="ok")
@@ -94,6 +106,23 @@ class WebhookSendTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("19024", message)
         self.assertIn("Key Words Not Found", message)
+
+    @patch("webhook_send.requests.request")
+    def test_send_webhook_json_escapes_multiline_content_before_parsing(self, request_mock):
+        request_mock.return_value = Mock(status_code=200, text='{"code":0,"msg":"ok"}')
+        cfg = {
+            "enabled": True,
+            "url": "https://example.com/hook",
+            "content_type": "application/json",
+            "body": '{"msg_type":"text","content":{"text":"$title\\n\\n$content"}}',
+        }
+        content = '错误信息：\nTraceback (most recent call last):\n  File "wxbot_core.py", line 1\nerr信息：\nFind Control Timeout'
+
+        ok, message = webhook_send.send_webhook("机器人告警", content, cfg)
+
+        self.assertTrue(ok, message)
+        sent_json = request_mock.call_args.kwargs["json"]
+        self.assertEqual(sent_json["content"]["text"], "机器人告警\n\n" + content)
 
 
 if __name__ == "__main__":

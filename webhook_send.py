@@ -19,7 +19,7 @@ def default_config() -> Dict[str, Any]:
         "method": "POST",
         "content_type": "application/json",
         "headers": {},
-        "body": '{"msg_type":"text","content":{"text":"$title\n\n$content"}}',
+        "body": '{"msg_type":"text","content":{"text":"$title\\n\\n$content"}}',
         "timeout": 5,
     }
 
@@ -53,6 +53,10 @@ def load_config(path: str = CONFIG_PATH) -> Dict[str, Any]:
 
 def save_config(config: Dict[str, Any], path: str = CONFIG_PATH) -> Dict[str, Any]:
     merged = _merge_with_defaults(config)
+    if merged["content_type"].lower().startswith("application/json") and merged.get("body"):
+        # Validate the JSON template itself before saving. Placeholders are
+        # rendered after parsing, so runtime content cannot break valid JSON.
+        json.loads(merged["body"])
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
@@ -82,15 +86,19 @@ def send_webhook(title: str, content: str, config: Optional[Dict[str, Any]] = No
     content_type = cfg.get("content_type") or "application/json"
     headers.setdefault("Content-Type", content_type)
     headers = _render(headers, title, content)
-    body = _render(cfg.get("body", ""), title, content)
 
     kwargs: Dict[str, Any] = {"headers": headers, "timeout": cfg["timeout"]}
     if content_type.lower().startswith("application/json"):
         try:
-            kwargs["json"] = json.loads(body) if body else {}
+            # Parse the JSON template before rendering placeholders. Runtime error
+            # content often contains newlines, quotes, and traceback snippets; if we
+            # render first, those characters can break the JSON string itself.
+            body_json = json.loads(cfg.get("body", "")) if cfg.get("body", "") else {}
+            kwargs["json"] = _render(body_json, title, content)
         except json.JSONDecodeError:
             return False, "Webhook JSON body is invalid"
     else:
+        body = _render(cfg.get("body", ""), title, content)
         kwargs["data"] = body
 
     try:
