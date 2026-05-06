@@ -2,8 +2,8 @@
 # Siver微信机器人 siver_wxbot - 面向对象版本 - wxautox4版本
 # 作者：https://www.siver.top
 
-version = "V4.7.16"
-version_log = "V4.7.16 - 适配最新客户端、优化图片识别分析、优化面板图片识别提示、优化掉线检测、优化拆分回复"
+version = "V4.7.23"
+version_log = "V4.7.23 - 提供远程访问服务(免服务器免穿透，官方直连服务)、修复自定义转发无法转发小程序的bug、优化远程访问服务重连"
 
 # ============================================================
 # 标准库导入
@@ -301,6 +301,19 @@ class WXBotConfig:
                     "group_split_reply_switch": False,
                     "group_split_max_chars": 100,
                     "group_split_max_count": 4,
+                    "siver_panel_enabled": False,
+                    "siver_panel_activation_code": "",
+                    "siver_panel_slug": "",
+                    "siver_panel_install_id": "",
+                    "siver_panel_machine_fingerprint": "",
+                    "siver_panel_device_id": "",
+                    "siver_panel_device_secret": "",
+                    "siver_panel_base_url": "https://panel.siver.top",
+                    "siver_panel_ws_url": "wss://panel.siver.top/relay/ws",
+                    "siver_panel_panel_url": "",
+                    "siver_panel_service_expire_at": "",
+                    "siver_panel_last_error_code": "",
+                    "siver_panel_last_error_message": "",
                 }
                 with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                     json.dump(base_config, f, ensure_ascii=False, indent=4)
@@ -543,6 +556,33 @@ class WXBotConfig:
         self.group_split_reply_switch = bool(self.config.get('group_split_reply_switch', False))
         self.group_split_max_chars    = max(1, int(self.config.get('group_split_max_chars', 100)))
         self.group_split_max_count    = max(1, int(self.config.get('group_split_max_count', 4)))
+        _siver_panel_defaults = {
+            'siver_panel_enabled': False,
+            'siver_panel_activation_code': '',
+            'siver_panel_slug': '',
+            'siver_panel_install_id': '',
+            'siver_panel_machine_fingerprint': '',
+            'siver_panel_device_id': '',
+            'siver_panel_device_secret': '',
+            'siver_panel_base_url': 'https://panel.siver.top',
+            'siver_panel_ws_url': 'wss://panel.siver.top/relay/ws',
+            'siver_panel_panel_url': '',
+            'siver_panel_service_expire_at': '',
+            'siver_panel_last_error_code': '',
+            'siver_panel_last_error_message': '',
+        }
+        _siver_panel_needs_save = any(k not in self.config for k in _siver_panel_defaults)
+        if self.config.get('siver_panel_base_url') == 'https://wxbot-panel.siverking.online':
+            self.config['siver_panel_base_url'] = 'https://panel.siver.top'
+            _siver_panel_needs_save = True
+        if self.config.get('siver_panel_ws_url') == 'wss://wxbot-panel.siverking.online/relay/ws':
+            self.config['siver_panel_ws_url'] = 'wss://panel.siver.top/relay/ws'
+            _siver_panel_needs_save = True
+        for k, v in _siver_panel_defaults.items():
+            self.config.setdefault(k, v)
+        if _siver_panel_needs_save:
+            self.save_config()
+            log(message='已自动补充 SiverPanel 远程访问配置默认值')
 
         log(message="全局配置更新完成")
 
@@ -1756,7 +1796,14 @@ class WXBot:
         # 若尚未实例化微信客户端则进行初始化
         if not self.wx:
             log(message="本次未获取客户端，正在初始化微信客户端...")
-            self.wx = WeChat()
+            try:
+                self.wx = WeChat(version='微信')
+            except Exception:
+                try:
+                    log(level='WARNING', message="初始化出错，尝试国际版")
+                    self.wx = WeChat(version='WeChat')
+                except Exception:
+                    raise   # 第二次也失败，抛出异常，由外层 try 接住
             # self.wx.Show()  # 首次强制弹出主窗口以获取焦点
 
         # 绑定 @ 标识（格式："@机器人昵称"）
@@ -1781,6 +1828,7 @@ class WXBot:
         self.wx.StartListening()
 
         # 添加管理员账号监听（管理员始终监听，不受白名单模式限制）
+        time.sleep(0.5)
         result = self.wx.AddListenChat(nickname=self.config.cmd, callback=self.message_handle_callback)
         if result:
             log(message=f"添加管理员 {self.config.cmd} 监听完成")
@@ -1791,6 +1839,7 @@ class WXBot:
         if not self.config.AllListen_switch:
             log(message="白名单模式开启")
             for user in self.config.listen_list:
+                time.sleep(0.5)
                 result = self.wx.AddListenChat(nickname=user, callback=self.message_handle_callback)
                 if result:
                     log(message=f"添加用户 {user} 监听完成")
@@ -1800,6 +1849,7 @@ class WXBot:
         # 若群机器人开关开启，则添加群聊监听
         if self.config.group_switch:
             for user in self.config.group:
+                time.sleep(0.5)
                 result = self.wx.AddListenChat(nickname=user, callback=self.message_handle_callback)
                 if result:
                     log(message=f"添加群组 {user} 监听完成")
@@ -1820,6 +1870,7 @@ class WXBot:
                         _fwd_sources.add(_src)
             for _source in _fwd_sources:
                 if _source and _source not in _already_listened:
+                    time.sleep(0.5)
                     _res = self.wx.AddListenChat(nickname=_source, callback=self.message_handle_callback)
                     if _res:
                         log(message=f"添加自定义转发监听源 {_source} 完成")
@@ -2677,12 +2728,12 @@ class WXBot:
                     if target:
                         time.sleep(1)
                         if src_msg:
-                            if message.type in ['image', 'video', 'file', 'location', 'link', 'emotion', 'merge', 'personal_card', 'note']:
+                            if message.type in ['image', 'video', 'file', 'location', 'link', 'emotion', 'merge', 'personal_card', 'note', 'miniapp']:
                                 message.forward(target, message=src_msg)
                             else:
                                 self.wx.SendMsg(who=target, msg=message.content+"\n"+src_msg)
                         else:
-                            if message.type in ['image', 'video', 'file', 'location', 'link', 'emotion', 'merge', 'personal_card', 'note']:
+                            if message.type in ['image', 'video', 'file', 'location', 'link', 'emotion', 'merge', 'personal_card', 'note', 'miniapp']:
                                 message.forward(target)
                             else:
                                 self.wx.SendMsg(who=target, msg=message.content)
@@ -3906,9 +3957,9 @@ class WXBot:
             log(level="ERROR", message=str(e) + "\n 初始化微信监听器失败，请检查微信是否启动登录正确，微信主窗口是否开着")
             log(level="ERROR", message=str(e) + "\n 请尝试退出wx再重新登录后再启动")
             log(level="ERROR", message=str(e) + "\n 请尝试退出wx再重新登录后再启动")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.8.107")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.8.107")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.8.107")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.30")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.30")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.30")
             self.run_flag = False
 
         # 主循环
