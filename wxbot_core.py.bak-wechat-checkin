@@ -2753,19 +2753,6 @@ class WXBot:
         if self._pause_chat_reply:
             return True
         try:
-            # wechat_checkin plugin hook: keep business logic outside wxbot_core.py.
-            try:
-                from plugins.wechat_checkin import handle_checkin
-                handled, checkin_reply = handle_checkin(chat, message)
-                if handled:
-                    if checkin_reply:
-                        result = chat.SendMsg(checkin_reply)
-                        self.msg_replied_count += 1
-                        return result
-                    return True
-            except Exception as plugin_error:
-                log(level="ERROR", message=f"wechat_checkin plugin error: {plugin_error}")
-
             is_keyword = False
             # 私聊关键词优先匹配
             if self.config.chat_keyword_switch:

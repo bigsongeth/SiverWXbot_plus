@@ -1,0 +1,35 @@
+{
+  "batch_date": "2026-05-07",
+  "name": "wechat-checkin-2026-05-07",
+  "expires_at": 1778198400,
+  "generated_at": "2026-05-06T19:36:12+08:00",
+  "codes": [
+    {
+      "batch_date": "2026-05-07",
+      "batch_no": 193612,
+      "code": "10fca4ec8d8dae2f81d1032ad6fcffc6",
+      "quota": 25500000,
+      "display_amount": "51",
+      "display_unit": "🪙 BTC",
+      "expires_at": 1778198400
+    },
+    {
+      "batch_date": "2026-05-07",
+      "batch_no": 193612,
+      "code": "37eaf73588e808f4658f7eb209eabc23",
+      "quota": 88500000,
+      "display_amount": "177",
+      "display_unit": "🪙 BTC",
+      "expires_at": 1778198400
+    },
+    {
+      "batch_date": "2026-05-07",
+      "batch_no": 193612,
+      "code": "ab2b37185bf71cf1013bc936d6f73f14",
+      "quota": 18500000,
+      "display_amount": "37",
+      "display_unit": "🪙 BTC",
+      "expires_at": 1778198400
+    }
+  ]
+}
