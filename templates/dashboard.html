@@ -192,6 +192,10 @@ body { background: var(--bg); font-family: -apple-system, BlinkMacSystemFont, "S
 .form-control:focus, .form-select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(7,193,96,.12); background: #fff; color: var(--card-fg); outline: none; }
 .form-check-input:checked { background-color: var(--primary); border-color: var(--primary); }
 .form-check-label { font-size: 13.5px; color: var(--card-fg); }
+.inline-check-field { display: flex; align-items: stretch; width: 100%; }
+.inline-check-field .form-control { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.inline-check-suffix { display: inline-flex; align-items: center; gap: 8px; min-height: 38px; padding: 0 14px; border: 1px solid var(--border); border-left: 0; border-radius: 0 6px 6px 0; background: #fff; color: var(--card-fg); font-size: 13.5px; font-weight: 500; white-space: nowrap; cursor: pointer; }
+.inline-check-suffix .form-check-input { margin: 0; width: 16px; height: 16px; flex-shrink: 0; }
 
 /* ===== List Items ===== */
 .list-item { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -445,6 +449,19 @@ body.mobile-nav-open { overflow: hidden; }
   .cfg-card-header .desc {
     width: 100%;
     margin-left: 0;
+  }
+  .inline-check-field {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .inline-check-field .form-control {
+    flex-basis: 100%;
+    border-radius: 6px;
+  }
+  .inline-check-suffix {
+    min-height: 36px;
+    border-left: 1px solid var(--border);
+    border-radius: 6px;
   }
 
   .list-item,
@@ -765,7 +782,7 @@ body.mobile-nav-open { overflow: hidden; }
   <div class="action-bar">
     <button id="btnStart" class="btn btn-start"><i class="bi bi-play-fill"></i> 启动机器人</button>
     <button id="btnStop" class="btn btn-stop"><i class="bi bi-stop-fill"></i> 停止机器人</button>
-    <button id="btnRestart" class="btn btn-restart" style="display:none;"><i class="bi bi-arrow-repeat"></i> 重启载入新配置</button>
+    <button id="btnRestart" class="btn btn-restart"><i class="bi bi-arrow-repeat"></i> 重启载入新配置</button>
     <div style="flex:1"></div>
     <button id="btnLoad" class="btn btn-load"><i class="bi bi-arrow-down-circle"></i> 加载配置</button>
     <button id="btnSave" class="btn btn-save"><i class="bi bi-save"></i> 保存配置</button>
@@ -903,7 +920,7 @@ body.mobile-nav-open { overflow: hidden; }
       <!-- 统计卡片网格 -->
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px;margin-bottom:20px;">
         <div class="stat-card" id="sc-received">
-          <div class="stat-icon"><i class="bi bi-envelope-arrow-down"></i></div>
+          <div class="stat-icon"><i class="bi bi-chat-left-text"></i></div>
           <div class="stat-val" id="sv-received">-</div>
           <div class="stat-label">收到消息</div>
         </div>
@@ -938,7 +955,7 @@ body.mobile-nav-open { overflow: hidden; }
           <div class="stat-label">关键词回复</div>
         </div>
         <div class="stat-card" id="sc-memory">
-          <div class="stat-icon"><i class="bi bi-brain"></i></div>
+          <div class="stat-icon"><i class="bi bi-database"></i></div>
           <div class="stat-val" id="sv-memory">-</div>
           <div class="stat-label">对话记忆</div>
         </div>
@@ -946,6 +963,11 @@ body.mobile-nav-open { overflow: hidden; }
           <div class="stat-icon"><i class="bi bi-hourglass-split"></i></div>
           <div class="stat-val" id="sv-delay">-</div>
           <div class="stat-label">回复延迟</div>
+        </div>
+        <div class="stat-card" id="sc-max-round">
+          <div class="stat-icon"><i class="bi bi-shield-check"></i></div>
+          <div class="stat-val" id="sv-max-round">-</div>
+          <div class="stat-label">轮数限制</div>
         </div>
       </div>
       <!-- 详情行 -->
@@ -1247,7 +1269,7 @@ body.mobile-nav-open { overflow: hidden; }
       <div id="global-filter-mute-row" style="display:{% if config.AllListen_switch %}flex{% else %}none{% endif %};align-items:center;gap:10px;margin-bottom:12px;padding:10px 14px;background:#fef3c7;border:1px solid #fde68a;border-radius:6px;">
         <input class="form-check-input" type="checkbox" id="AllListen_filter_mute" name="AllListen_filter_mute" {% if config.AllListen_filter_mute %}checked{% endif %} style="margin:0;">
         <label for="AllListen_filter_mute" style="margin:0;font-size:13px;font-weight:500;color:#78350f;cursor:pointer;">过滤免打扰消息</label>
-        <span class="cfg-hint" style="margin:0;color:#92400e;">开启后将忽略设置了免打扰的会话消息</span>
+        <span class="cfg-hint" style="margin:0;color:#92400e;">开启后将忽略设置了免打扰的会话消息，若开了过滤免打扰后发现全局不接收消息了，请把Windows屏幕缩放设为100%后再重启微信和面板重试</span>
       </div>
       <!-- 模式提示条 -->
       <div id="listenModeHint" class="d-flex align-items-center gap-2 px-3 py-2 rounded mb-3" style="font-size:13px;font-weight:600;{% if config.AllListen_switch %}background:#FEF2F2;color:#DC2626;border:1px solid #FECACA{% else %}background:#F0FDF4;color:#16A34A;border:1px solid #BBF7D0{% endif %}">
@@ -1255,7 +1277,7 @@ body.mobile-nav-open { overflow: hidden; }
         <span id="listenModeText">{% if config.AllListen_switch %}当前为黑名单模式 — 以下用户的消息将被忽略{% else %}当前为白名单模式 — 仅监听以下用户的消息{% endif %}</span>
       </div>
       <div class="mb-2">
-        <label class="cfg-label" id="listenListLabel">{% if config.AllListen_switch %}黑名单列表{% else %}监听列表 <span style="font-size:11px;color:var(--muted);font-weight:400;">（白名单模式：可为每个用户设置专属 Prompt 和接口）</span>{% endif %}</label>
+        <label class="cfg-label" id="listenListLabel">{% if config.AllListen_switch %}黑名单列表{% else %}监听列表 <span style="font-size:11px;color:var(--muted);font-weight:400;">（白名单模式：可为每个用户设置专属 Prompt、接口和回复上限）</span>{% endif %}</label>
       </div>
       <div id="listen_container">
         {% for item in config.listen_list %}
@@ -1274,6 +1296,9 @@ body.mobile-nav-open { overflow: hidden; }
               <option value="{{ loop.index0 }}" {% if config.chat_api_map.get(item) == loop.index0 %}selected{% endif %}>接口{{ loop.index }}: {{ cfg.model }}</option>
               {% endfor %}
             </select>
+            <input type="number" class="form-control chat-max-round-input" min="1" max="99999"
+                   value="{{ config.get('chat_max_round_map', {}).get(item, '') }}"
+                   placeholder="全局上限" title="专属回复上限（留空=全局）" style="width:120px;flex-shrink:0;">
           </div>
           <button type="button" class="btn-rm btn-remove-item"><i class="bi bi-x-lg"></i></button>
         </div>
@@ -1501,14 +1526,36 @@ body.mobile-nav-open { overflow: hidden; }
       </div>
       <div class="row g-2 mb-3">
         <div class="col-12"><label class="cfg-label">通过后自动设置备注</label></div>
-        <div class="col-auto d-flex align-items-center gap-2 flex-wrap">
-          <span style="font-size:13px;color:var(--muted);">前缀</span>
-          <input type="text" class="form-control" id="new_friend_remark_prefix" name="new_friend_remark_prefix" placeholder="（留空）" value="{{ config.new_friend_remark_prefix|default('') }}" style="width:130px;">
-          <span style="font-size:13px;color:var(--muted);">+ 微信昵称 +</span>
-          <span style="font-size:13px;color:var(--muted);">后缀</span>
-          <input type="text" class="form-control" id="new_friend_remark_suffix" name="new_friend_remark_suffix" placeholder="_机器人备注" value="{{ config.new_friend_remark_suffix|default('_机器人备注') }}" style="width:130px;">
+        <div class="col-12 d-flex align-items-center gap-3 flex-wrap" style="padding:10px 12px;border:1px solid var(--border);border-radius:6px;background:var(--muted-bg);">
+          <label class="d-inline-flex align-items-center gap-2" for="new_friend_remark_use_nickname" style="font-size:13px;color:var(--card-fg);font-weight:600;margin:0;cursor:pointer;">
+            <input class="form-check-input" type="checkbox" id="new_friend_remark_use_nickname" name="new_friend_remark_use_nickname" {% if config.get('new_friend_remark_use_nickname', True) %}checked{% endif %}>
+            采用新好友昵称
+          </label>
+          <span style="font-size:12px;color:var(--muted);">关闭后仅使用前缀、后缀和时间戳生成备注</span>
         </div>
-        <div class="col-12"><div class="cfg-hint">备注格式：前缀 + 微信昵称 + 后缀，前后缀均可留空</div></div>
+        <div class="col-12 d-flex align-items-end gap-2 flex-wrap">
+          <div style="min-width:190px;flex:1 1 220px;">
+            <label class="cfg-label" for="new_friend_remark_prefix">前缀</label>
+            <div class="inline-check-field">
+              <input type="text" class="form-control" id="new_friend_remark_prefix" name="new_friend_remark_prefix" placeholder="（留空）" value="{{ config.new_friend_remark_prefix|default('') }}">
+              <label class="inline-check-suffix" for="new_friend_remark_prefix_timestamp">
+                <input class="form-check-input" type="checkbox" id="new_friend_remark_prefix_timestamp" name="new_friend_remark_prefix_timestamp" {% if config.get('new_friend_remark_prefix_timestamp', False) %}checked{% endif %}>
+                加时间戳
+              </label>
+            </div>
+          </div>
+          <div style="min-width:190px;flex:1 1 220px;">
+            <label class="cfg-label" for="new_friend_remark_suffix">后缀</label>
+            <div class="inline-check-field">
+              <input type="text" class="form-control" id="new_friend_remark_suffix" name="new_friend_remark_suffix" placeholder="_机器人备注" value="{{ config.new_friend_remark_suffix|default('_机器人备注') }}">
+              <label class="inline-check-suffix" for="new_friend_remark_suffix_timestamp">
+                <input class="form-check-input" type="checkbox" id="new_friend_remark_suffix_timestamp" name="new_friend_remark_suffix_timestamp" {% if config.get('new_friend_remark_suffix_timestamp', False) %}checked{% endif %}>
+                加时间戳
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="col-12"><div class="cfg-hint">备注格式：前缀时间戳 + 前缀 + 新好友昵称 + 后缀 + 后缀时间戳。微信备注最长约 32 个单位，超出会自动裁剪，中文约占 2 个单位。</div></div>
       </div>
       <div class="row g-2 mb-3">
         <div class="col-12"><label class="cfg-label">通过后自动设置标签</label><span class="cfg-hint" style="margin-left:8px;">⚠️ 只能填写微信中已存在的标签，填写不存在的标签将无效</span></div>
@@ -2087,13 +2134,57 @@ body.mobile-nav-open { overflow: hidden; }
         </div>
         <div class="cfg-hint" style="margin-top:8px;">实际延迟为最小值到最大值之间的随机整数秒 · 若最小值大于最大值则自动互换</div>
       </div>
-      <hr style="margin:18px 0 14px;">
       <div class="mb-2">
         <label class="cfg-label" for="api_error_reply" style="font-weight:600;">接口调用失败固定回复</label>
-        <input type="text" class="form-control" id="api_error_reply"
-               value="{{ config.get('api_error_reply', '在忙，我稍后回复您') }}"
-               placeholder="在忙，我稍后回复您">
+        <div class="inline-check-field">
+          <input type="text" class="form-control" id="api_error_reply"
+                 value="{{ config.get('api_error_reply', '在忙，我稍后回复您') }}"
+                 placeholder="在忙，我稍后回复您">
+          <label class="inline-check-suffix" for="api_error_reply_once">
+            <input class="form-check-input" type="checkbox" id="api_error_reply_once" {% if config.get('api_error_reply_once', False) %}checked{% endif %}>
+            只回复一次
+          </label>
+        </div>
         <div class="cfg-hint" style="margin-top:6px;">当调用 AI / 模型接口失败时，机器人将发送此固定回复，而非原始报错提示。</div>
+      </div>
+      <div class="switch-row">
+        <input class="form-check-input" type="checkbox" id="chat_max_round_switch" {% if config.get('chat_max_round_switch', False) %}checked{% endif %}>
+        <label for="chat_max_round_switch">启用回复次数限制（单个好友）</label>
+        <span class="switch-desc">超出设定次数后不再调用 AI 自动回复</span>
+      </div>
+      <div id="chat-max-round-settings" style="{% if not config.get('chat_max_round_switch', False) %}display:none;{% endif %}">
+        <div class="row g-3" style="margin-top:4px;">
+          <div class="col-6">
+            <label class="cfg-label" for="chat_max_round_default">单个好友最多回复次数</label>
+            <input type="number" class="form-control" id="chat_max_round_default" min="1" max="99999"
+              value="{{ config.get('chat_max_round_default', 99) }}" placeholder="99">
+            <div class="cfg-hint">此设置全局生效</div>
+          </div>
+          <div class="col-6">
+            <label class="cfg-label" for="chat_max_round_reset_days">计数重置周期（天）</label>
+            <input type="number" class="form-control" id="chat_max_round_reset_days" min="0" max="365"
+              value="{{ config.get('chat_max_round_reset_days', 0) }}" placeholder="0">
+            <div class="cfg-hint">0=永久累计，1=每天重置，7=每周重置，以此类推</div>
+          </div>
+        </div>
+        <div class="mb-2" style="margin-top:12px;">
+          <label class="cfg-label" for="chat_max_round_reply">超出次数限制固定回复</label>
+          <div class="inline-check-field">
+            <input type="text" class="form-control" id="chat_max_round_reply"
+                   value="{{ config.get('chat_max_round_reply', '') }}"
+                   placeholder="不填写则不回复">
+            <label class="inline-check-suffix" for="chat_max_round_reply_once">
+              <input class="form-check-input" type="checkbox" id="chat_max_round_reply_once" {% if config.get('chat_max_round_reply_once', False) %}checked{% endif %}>
+              只回复一次
+            </label>
+          </div>
+          <div class="cfg-hint">当单个用户回复次数超限时，机器人将发送此固定回复，留空则不回复。</div>
+        </div>
+      </div>
+      <div class="switch-row">
+        <input class="form-check-input" type="checkbox" id="clean_ai_reply_switch" {% if config.get('clean_ai_reply_switch', True) %}checked{% endif %}>
+        <label for="clean_ai_reply_switch">屏蔽模型思考过程</label>
+        <span class="switch-desc">自动移除模型返回的思考标签，避免将推理过程发送给用户</span>
       </div>
     </div>
   </div>
@@ -2644,6 +2735,67 @@ $(function(){
     renumberApiConfigs();
   });
 
+  // ===== 接口配置：测试当前选中接口 =====
+  $('#btn-test-api-config').click(function(){
+    var $btn = $(this);
+    var $item = $('.api-config-item').has('.api-radio:checked').first();
+    if(!$item.length){
+      svModal.error('请先选择一个接口配置');
+      return;
+    }
+    var apiConfig = getApiConfigFromItem($item);
+    if(!apiConfig.key || !apiConfig.url || !apiConfig.model){
+      svModal.error('请先填写当前选中接口的 API Key、Base URL 和模型名称');
+      return;
+    }
+    var idx = $('.api-config-item').index($item) + 1;
+    $btn.prop('disabled', true).html('<i class="bi bi-hourglass-split"></i> 测试中...');
+    $.ajax({
+      url: '/test_api_config',
+      method: 'POST',
+      contentType: 'application/json',
+      dataType: 'json',
+      timeout: 140000,
+      data: JSON.stringify({api_config: apiConfig}),
+      success: function(res){
+        if(res.status === 'success'){
+          var d = res.data || {};
+          var cleanedHint = d.cleaned ? '<br><br>检测到思考标签，已按当前清洗规则处理测试返回。' : '';
+          var img = d.image_test || {};
+          var imageHtml = '<br>图片：';
+          if(img.status === 'success'){
+            imageHtml += '<span style="color:#07C160;font-weight:600;">可用</span>';
+            if(img.cleaned) imageHtml += '（已清洗测试返回）';
+          } else if(img.status === 'skipped'){
+            imageHtml += '<span style="color:#888;">未测试</span>：' + $('<div>').text(img.message || '').html();
+          } else {
+            imageHtml += '<span style="color:#FA5151;font-weight:600;">失败</span>：' + $('<div>').text(img.message || '').html();
+          }
+          svModal.success(
+            '接口 ' + idx + ' 可用<br>' +
+            '耗时：' + (d.elapsed_ms || '-') + ' ms<br>' +
+            '文本：<span style="color:#07C160;font-weight:600;">可用</span>' +
+            imageHtml + '<br>' +
+            '返回：<code>' + $('<div>').text(d.reply || '').html() + '</code>' +
+            cleanedHint,
+            '测试成功'
+          );
+        } else {
+          svModal.error(res.message || '接口测试失败', '测试失败');
+        }
+      },
+      error: function(xhr){
+        var msg = '接口测试请求失败';
+        if(xhr.responseJSON && xhr.responseJSON.message) msg = xhr.responseJSON.message;
+        else if(xhr.status) msg += '：HTTP ' + xhr.status;
+        svModal.error(msg, '测试失败');
+      },
+      complete: function(){
+        $btn.prop('disabled', false).html('<i class="bi bi-activity"></i> 测试可用性');
+      }
+    });
+  });
+
   // ===== 接口配置：添加 =====
   $('#btn-add-api-config').click(function(){
     var html=
@@ -2804,6 +2956,11 @@ $(function(){
     $('#reply-delay-settings').toggle(this.checked);
   });
 
+  // ===== 回复轮数限制开关联动 =====
+  $('#chat_max_round_switch').on('change', function(){
+    $('#chat-max-round-settings').toggle(this.checked);
+  });
+
   // ===== Remove List Item =====
   $(document).on('click','.btn-remove-item',function(){
     $(this).closest('.list-item, .keyword-item, .scheduled-msg-item, .scheduled-moments-item, .random-moments-item, .random-msg-item, .custom-forward-item').remove();
@@ -2960,7 +3117,7 @@ $(function(){
       $('#global-prompt-row').hide();
       $('#global-filter-mute-row').hide();
       $('.listen-extra').show();
-      $('#listenListLabel').html('监听列表 <span style="font-size:11px;color:var(--muted);font-weight:400;">（白名单模式：可为每个用户设置专属 Prompt 和接口）</span>');
+      $('#listenListLabel').html('监听列表 <span style="font-size:11px;color:var(--muted);font-weight:400;">（白名单模式：可为每个用户设置专属 Prompt、接口和回复上限）</span>');
     }
     $('#listenAddText').text(isGlobal ? '添加黑名单' : '添加监听');
   }
@@ -2974,6 +3131,7 @@ $(function(){
       '<div class="listen-extra" style="display:flex;gap:6px;flex-wrap:wrap;">'+
         '<select class="form-select chat-prompt-select" style="width:145px;flex-shrink:0;" title="专属Prompt">'+buildPromptOpts('')+'</select>'+
         '<select class="form-select chat-api-select" style="width:160px;flex-shrink:0;" title="专属接口">'+buildChatApiOpts(-1)+'</select>'+
+        '<input type="number" class="form-control chat-max-round-input" min="1" max="99999" placeholder="全局上限" title="专属回复上限（留空=全局）" style="width:120px;flex-shrink:0;">'+
       '</div>';
     $('#listen_container').append(
       '<div class="list-item listen-item" style="flex-wrap:wrap;gap:6px;">'+
@@ -3498,8 +3656,11 @@ $(function(){
       new_friend_reply_switch:$('#new_friend_reply_switch').is(':checked'),
       new_friend_check_min:parseInt($('#new_friend_check_min').val())||60,
       new_friend_check_max:parseInt($('#new_friend_check_max').val())||300,
+      new_friend_remark_use_nickname:$('#new_friend_remark_use_nickname').is(':checked'),
       new_friend_remark_prefix:$('#new_friend_remark_prefix').val(),
+      new_friend_remark_prefix_timestamp:$('#new_friend_remark_prefix_timestamp').is(':checked'),
       new_friend_remark_suffix:$('#new_friend_remark_suffix').val(),
+      new_friend_remark_suffix_timestamp:$('#new_friend_remark_suffix_timestamp').is(':checked'),
       new_friend_tags:$('[name="new_friend_tags"]').map(function(){return $(this).val();}).get().filter(s=>s.trim()!==''),
       chat_keyword_switch:$('#chat_keyword_switch').is(':checked'),
       group_keyword_switch:$('#group_keyword_switch').is(':checked'),
@@ -3508,7 +3669,7 @@ $(function(){
       group_welcome_msg:$('#group_welcome_msg').summernote('code'),
       default_prompt:$('#default_prompt_select').val()||'默认',
       listen_list:[], group:[], group_api_map:{}, group_prompt_map:{}, new_friend_msg:[],
-      chat_prompt_map:{}, chat_api_map:{},
+      chat_prompt_map:{}, chat_api_map:{}, chat_max_round_map:{},
       group_welcome_random:parseFloat($('#group_welcome_random').val()),
       keyword_dict:{},
       scheduled_msg_switch:$('#scheduled_msg_switch').is(':checked'),
@@ -3536,6 +3697,13 @@ $(function(){
       group_image_recognition_switch:$('#group_image_recognition_switch').is(':checked'),
       group_image_recognition_api:parseInt($('#group_image_recognition_api').val())||0,
       api_error_reply:$('#api_error_reply').val().trim()||'在忙，我稍后回复您',
+      api_error_reply_once:$('#api_error_reply_once').is(':checked'),
+      clean_ai_reply_switch:$('#clean_ai_reply_switch').is(':checked'),
+      chat_max_round_switch:$('#chat_max_round_switch').is(':checked'),
+      chat_max_round_default:Math.max(1,Math.min(99999,parseInt($('#chat_max_round_default').val())||99)),
+      chat_max_round_reset_days:Math.max(0,Math.min(365,parseInt($('#chat_max_round_reset_days').val())||0)),
+      chat_max_round_reply:$('#chat_max_round_reply').val().trim(),
+      chat_max_round_reply_once:$('#chat_max_round_reply_once').is(':checked'),
       chat_split_reply_switch:$('#chat_split_reply_switch').is(':checked'),
       chat_split_max_chars:Math.max(1,parseInt($('#chat_split_max_chars').val())||100),
       chat_split_max_count:Math.max(1,parseInt($('#chat_split_max_count').val())||4),
@@ -3558,6 +3726,8 @@ $(function(){
         if (pv) configData.chat_prompt_map[uname] = pv;
         var av = parseInt($(this).find('.chat-api-select').val());
         if (!isNaN(av) && av >= 0) configData.chat_api_map[uname] = av;
+        var rv = parseInt($(this).find('.chat-max-round-input').val());
+        if (!isNaN(rv) && rv >= 1) configData.chat_max_round_map[uname] = Math.min(99999, rv);
       }
     });
     // 群组：收集名称列表 + 专属接口映射 + 专属 prompt 映射
@@ -3762,12 +3932,16 @@ $(function(){
 
   $('#btnRestart').click(function(){
     var $btn = $(this);
-    saveConfig(function(){
-      $btn.prop('disabled', true).html('<i class="bi bi-stop-fill"></i> 正在停止...');
+    var defaultHtml = '<i class="bi bi-arrow-repeat"></i> 重启载入新配置';
+    function resetButton(){
+      $btn.prop('disabled', false).html(defaultHtml);
+    }
+    function restartRunningBot(){
+      $btn.html('<i class="bi bi-stop-fill"></i> 正在停止...');
       $.post('/stop_bot', function(res){
         if(res.status !== 'success'){
           svModal.error(res.message||'停止失败，重启中断');
-          $btn.prop('disabled', false).html('<i class="bi bi-arrow-repeat"></i> 重启载入新配置');
+          resetButton();
           return;
         }
         $btn.html('<i class="bi bi-hourglass-split"></i> 等待中(4s)...');
@@ -3778,12 +3952,27 @@ $(function(){
             else svModal.error(res2.message||'启动失败');
           }).fail(function(xhr){ svModal.error('启动失败: '+xhr.responseText); })
             .always(function(){
-              $btn.prop('disabled', false).html('<i class="bi bi-arrow-repeat"></i> 重启载入新配置');
+              resetButton();
             });
         }, 4000);
       }).fail(function(xhr){
         svModal.error('停止失败: '+xhr.responseText);
-        $btn.prop('disabled', false).html('<i class="bi bi-arrow-repeat"></i> 重启载入新配置');
+        resetButton();
+      });
+    }
+    saveConfig(function(){
+      $btn.prop('disabled', true).html('<i class="bi bi-search"></i> 检查状态...');
+      $.getJSON('/get_status', function(res){
+        var isRunning = res && res.status === 'success' && res.data && res.data.bot_running;
+        if(!isRunning){
+          svModal.alert('配置已保存。机器人当前未运行，无需重启；如需载入新配置，请点击“启动机器人”。', '机器人未运行');
+          resetButton();
+          return;
+        }
+        restartRunningBot();
+      }).fail(function(xhr){
+        svModal.error('检查运行状态失败: '+xhr.responseText);
+        resetButton();
       });
     });
   });
@@ -3988,7 +4177,6 @@ $(function(){
       if(!res || res.status !== 'success') return;
       var d = res.data;
       if(d.bot_running){
-        $('#btnRestart').show();
         $('#topbar-notice').show();
         $('#status-dot').css('background', d.callback_is_die ? '#FA5151' : '#07C160');
         $('#status-text').text(d.callback_is_die ? '运行异常（回调出错）' : '运行中');
@@ -4020,11 +4208,17 @@ $(function(){
         $('#sv-memory').text(d.memory_switch ? ('上下文' + (d.memory_context_count||'-') + '条') : '未启用');
         // 回复延迟卡片
         $('#sv-delay').text(d.reply_delay_switch ? ((d.reply_delay_min||'-') + '~' + (d.reply_delay_max||'-') + 's') : '未启用');
+        // 回复轮数限制卡片
+        if (d.chat_max_round_switch) {
+          var resetText = d.chat_max_round_reset_days ? ('/' + d.chat_max_round_reset_days + '天') : '';
+          $('#sv-max-round').text('上限' + (d.chat_max_round_default||'-') + '轮' + resetText);
+        } else {
+          $('#sv-max-round').text('未启用');
+        }
         // 详情行
         $('#dv-kw-at').text(d.group_keyword_switch ? (d.group_keyword_at_only ? '仅@触发' : '全部触发') : '-');
         $('#dv-mem-ctx').text(d.memory_switch ? ((d.memory_context_count||'-') + ' 条') : '已关闭');
       } else {
-        $('#btnRestart').hide();
         $('#topbar-notice').hide();
         $('#status-dot').css('background', '#ccc');
         // 只在首次加载（数据还是初始 "-"）时才显示"未运行"占位，否则保留上次数据

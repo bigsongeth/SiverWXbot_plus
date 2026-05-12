@@ -2,8 +2,8 @@
 # Siver微信机器人 siver_wxbot - 面向对象版本 - wxautox4版本
 # 作者：https://www.siver.top
 
-version = "V4.7.23"
-version_log = "V4.7.23 - 提供远程访问服务(免服务器免穿透，官方直连服务)、修复自定义转发无法转发小程序的bug、优化远程访问服务重连"
+version = "V4.7.25"
+version_log = "V4.7.25 - 适配最新4.1.9.35客户端、优化自动通过好友备注设置、优化面板重启载入新按钮状态刷新"
 
 # ============================================================
 # 标准库导入
@@ -112,6 +112,36 @@ SPLIT_PROMPT_TEMPLATE = """\
 {base_prompt}"""
 
 # ============================================================
+# 思考清洗常量
+# ============================================================
+THINK_BLOCK_RE = re.compile(r'<think\b[^>]*>.*?</think>', re.IGNORECASE | re.DOTALL)
+LEADING_THINK_RE = re.compile(r'^\s*<think\b[^>]*>', re.IGNORECASE)
+
+def clean_ai_reply_text(text):
+    """清理模型回复中的思考标签，避免把推理过程发送给用户。"""
+    if text is None:
+        return ""
+    text = str(text)
+    cleaned = THINK_BLOCK_RE.sub("", text)
+    removed_think = cleaned != text
+
+    # 未闭合的开头 <think> 视为不安全输出：只保留空行后的正文。
+    # 不处理中间出现的未闭合示例，降低误伤普通文本的概率。
+    if LEADING_THINK_RE.search(cleaned):
+        tail_match = re.search(r'\n\s*\n', cleaned)
+        if tail_match:
+            cleaned = cleaned[tail_match.end():]
+        else:
+            cleaned = ""
+
+    lines = [line.rstrip() for line in cleaned.splitlines()]
+    cleaned = "\n".join(lines).strip()
+    if removed_think:
+        cleaned = re.sub(r'\n\s*\n+', '\n', cleaned)
+    return cleaned
+
+
+# ============================================================
 # 配置管理类
 # ============================================================
 class WXBotConfig:
@@ -158,6 +188,9 @@ class WXBotConfig:
         self.new_frined_switch = False        # 自动通过新好友开关
         self.new_frien_reply_switch = False   # 新好友自动回复开关
         self.new_frien_msg = []               # 通过后自动发送的打招呼消息列表
+        self.new_friend_remark_use_nickname = True
+        self.new_friend_remark_prefix_timestamp = False
+        self.new_friend_remark_suffix_timestamp = False
 
         # ---------- 关键词回复配置 ----------
         self.chat_keyword_switch = False    # 私聊关键词回复开关
@@ -173,6 +206,7 @@ class WXBotConfig:
         self.default_prompt   = "默认"      # 全局/fallback prompt 文件名（不含 .md）
         self.chat_prompt_map  = {}          # 私聊白名单用户 -> prompt 名称
         self.chat_api_map     = {}          # 私聊白名单用户 -> API 接口索引
+        self.chat_max_round_map = {}        # 私聊白名单用户 -> 专属回复轮数上限
         self.group_prompt_map = {}          # 群组名称 -> prompt 名称
 
         # ---------- 定时消息配置 ----------
@@ -205,6 +239,7 @@ class WXBotConfig:
         self.reply_delay_switch = True  # 模拟人工操作延迟开关（默认开启）
         self.reply_delay_min    = 1     # 最小延迟秒数
         self.reply_delay_max    = 5     # 最大延迟秒数
+        self.clean_ai_reply_switch = True  # AI 回复清洗开关
 
         # 初始化时自动加载配置并同步到属性
         self.load_config()
@@ -258,8 +293,11 @@ class WXBotConfig:
                     "new_friend_msg": [],
                     "new_friend_check_min": 60,
                     "new_friend_check_max": 300,
+                    "new_friend_remark_use_nickname": True,
                     "new_friend_remark_prefix": "",
+                    "new_friend_remark_prefix_timestamp": False,
                     "new_friend_remark_suffix": "_机器人备注",
+                    "new_friend_remark_suffix_timestamp": False,
                     "new_friend_tags": [],
                     "chat_keyword_switch": False,
                     "group_keyword_switch": False,
@@ -270,6 +308,7 @@ class WXBotConfig:
                     "default_prompt": "默认",
                     "chat_prompt_map": {},
                     "chat_api_map": {},
+                    "chat_max_round_map": {},
                     "group_prompt_map": {},
                     "scheduled_msg_switch": False,
                     "scheduled_msg_list": [],
@@ -291,11 +330,18 @@ class WXBotConfig:
                     "reply_delay_switch": True,
                     "reply_delay_min": 1,
                     "reply_delay_max": 5,
+                    "clean_ai_reply_switch": True,
                     "chat_image_recognition_switch": False,
                     "chat_image_recognition_api": 0,
                     "group_image_recognition_switch": False,
                     "group_image_recognition_api": 0,
                     "api_error_reply": "在忙，我稍后回复您",
+                    "api_error_reply_once": False,
+                    "chat_max_round_switch": False,
+                    "chat_max_round_default": 99,
+                    "chat_max_round_reset_days": 0,
+                    "chat_max_round_reply": "",
+                    "chat_max_round_reply_once": False,
                     "chat_split_reply_switch": False,
                     "chat_split_max_chars": 100,
                     "chat_split_max_count": 4,
@@ -304,6 +350,8 @@ class WXBotConfig:
                     "group_split_max_count": 4,
                     "siver_panel_enabled": False,
                     "siver_panel_activation_code": "",
+                    "siver_panel_activation_code_applied_hash": "",
+                    "siver_panel_activation_code_failed_hash": "",
                     "siver_panel_slug": "",
                     "siver_panel_install_id": "",
                     "siver_panel_machine_fingerprint": "",
@@ -453,8 +501,11 @@ class WXBotConfig:
         self.new_frien_msg           = self.config.get('new_friend_msg', [])
         self.new_friend_check_min    = max(60, int(self.config.get('new_friend_check_min', 60)))
         self.new_friend_check_max    = min(3600, max(self.new_friend_check_min, int(self.config.get('new_friend_check_max', 300))))
+        self.new_friend_remark_use_nickname = bool(self.config.get('new_friend_remark_use_nickname', True))
         self.new_friend_remark_prefix = self.config.get('new_friend_remark_prefix', '')
+        self.new_friend_remark_prefix_timestamp = bool(self.config.get('new_friend_remark_prefix_timestamp', False))
         self.new_friend_remark_suffix = self.config.get('new_friend_remark_suffix', '_机器人备注')
+        self.new_friend_remark_suffix_timestamp = bool(self.config.get('new_friend_remark_suffix_timestamp', False))
         self.new_friend_tags         = self.config.get('new_friend_tags', [])
 
         # 关键词配置
@@ -529,6 +580,7 @@ class WXBotConfig:
         self.reply_delay_switch = bool(self.config.get('reply_delay_switch', True))
         self.reply_delay_min    = max(1, int(self.config.get('reply_delay_min', 1)))
         self.reply_delay_max    = max(1, int(self.config.get('reply_delay_max', 5)))
+        self.clean_ai_reply_switch = bool(self.config.get('clean_ai_reply_switch', True))
 
         # 图片识别配置
         self.chat_image_recognition_switch  = bool(self.config.get('chat_image_recognition_switch', False))
@@ -544,11 +596,22 @@ class WXBotConfig:
         self.default_prompt   = self.config.get('default_prompt', '默认')
         self.chat_prompt_map  = self.config.get('chat_prompt_map', {})
         self.chat_api_map     = self.config.get('chat_api_map', {})
+        self.chat_max_round_map = self._normalize_chat_max_round_map(
+            self.config.get('chat_max_round_map', {})
+        )
         self.group_prompt_map = self.config.get('group_prompt_map', {})
         self.init_prompt_dir()
 
         # 接口调用失败时的固定回复
         self.api_error_reply = self.config.get('api_error_reply', '在忙，我稍后回复您')
+        self.api_error_reply_once = bool(self.config.get('api_error_reply_once', False))
+
+        # 单用户最大回复轮数限制配置
+        self.chat_max_round_switch = bool(self.config.get('chat_max_round_switch', False))
+        self.chat_max_round_default = self._coerce_int_range(self.config.get('chat_max_round_default', 99), 99, 1, 99999)
+        self.chat_max_round_reset_days = self._coerce_int_range(self.config.get('chat_max_round_reset_days', 0), 0, 0, 365)
+        self.chat_max_round_reply = self.config.get('chat_max_round_reply', '')
+        self.chat_max_round_reply_once = bool(self.config.get('chat_max_round_reply_once', False))
 
         # 拆分多条回复配置
         self.chat_split_reply_switch  = bool(self.config.get('chat_split_reply_switch', False))
@@ -663,6 +726,32 @@ class WXBotConfig:
     def split_long_text(text, chunk_size=2000):
         """将超长文本按指定长度切分为列表，用于分段发送"""
         return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    @staticmethod
+    def _normalize_chat_max_round_map(raw_map):
+        """清洗私聊白名单用户的专属回复轮数上限配置"""
+        if not isinstance(raw_map, dict):
+            return {}
+        clean = {}
+        for name, value in raw_map.items():
+            name = str(name).strip()
+            if not name:
+                continue
+            try:
+                value = int(value)
+            except Exception:
+                continue
+            clean[name] = max(1, min(99999, value))
+        return clean
+
+    @staticmethod
+    def _coerce_int_range(value, default, min_value, max_value):
+        """将配置值转为指定范围内的整数"""
+        try:
+            value = int(value)
+        except Exception:
+            value = default
+        return max(min_value, min(max_value, value))
 
     def human_delay(self):
         """模拟人工操作随机延迟。reply_delay_switch 关闭时直接跳过。"""
@@ -831,6 +920,179 @@ class MemoryManager:
 
 
 # ============================================================
+# 回复计数器管理类
+# ============================================================
+
+class ReplyCountStore:
+    """
+    私聊回复计数器管理类。
+    负责持久化每个用户的 AI 回复次数、超限通知状态和 API 错误通知状态。
+    """
+
+    DEFAULT_DATA = {"meta": {"last_reset_date": ""}, "users": {}}
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self._lock = threading.RLock()
+        self.data = self._load()
+
+    @classmethod
+    def _empty_data(cls):
+        return {"meta": {"last_reset_date": ""}, "users": {}}
+
+    @classmethod
+    def _normalize_user_data(cls, user_data):
+        if not isinstance(user_data, dict):
+            user_data = {}
+        try:
+            ai_count = int(user_data.get("ai_count", 0))
+        except Exception:
+            ai_count = 0
+        return {
+            "ai_count": max(0, ai_count),
+            "api_err_notified": bool(user_data.get("api_err_notified", False)),
+            "limit_notified": bool(user_data.get("limit_notified", False)),
+        }
+
+    @classmethod
+    def _normalize_data(cls, raw_data):
+        if not isinstance(raw_data, dict):
+            return cls._empty_data()
+        meta = raw_data.get("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        users = raw_data.get("users", {})
+        if not isinstance(users, dict):
+            users = {}
+        normalized_users = {}
+        for user, user_data in users.items():
+            user = str(user).strip()
+            if user:
+                normalized_users[user] = cls._normalize_user_data(user_data)
+        return {
+            "meta": {"last_reset_date": str(meta.get("last_reset_date", "") or "")},
+            "users": normalized_users,
+        }
+
+    def _load(self):
+        if not os.path.exists(self.file_path):
+            return self._empty_data()
+        try:
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                return self._normalize_data(json.load(f))
+        except Exception as e:
+            log(level="WARNING", message=f"加载 reply_count.json 失败: {e}")
+            return self._empty_data()
+
+    def _save_locked(self):
+        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        tmp_path = self.file_path + ".tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, self.file_path)
+
+    def save(self):
+        with self._lock:
+            self._save_locked()
+
+    def get_user(self, user_key):
+        user_key = str(user_key).strip()
+        with self._lock:
+            users = self.data.setdefault("users", {})
+            if user_key not in users:
+                users[user_key] = self._normalize_user_data({})
+            else:
+                users[user_key] = self._normalize_user_data(users[user_key])
+            return users[user_key]
+
+    def maybe_reset(self, reset_days, now=None):
+        try:
+            reset_days = int(reset_days)
+        except Exception:
+            reset_days = 0
+        if reset_days <= 0:
+            return False
+        now = now or datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        with self._lock:
+            meta = self.data.setdefault("meta", {})
+            last = str(meta.get("last_reset_date", "") or "")
+            if not last:
+                meta["last_reset_date"] = today
+                self._save_locked()
+                return False
+            try:
+                last_dt = datetime.strptime(last, "%Y-%m-%d")
+            except Exception:
+                meta["last_reset_date"] = today
+                self._save_locked()
+                return False
+            delta = (now - last_dt).days
+            if delta >= reset_days:
+                self.data["users"] = {}
+                meta["last_reset_date"] = today
+                self._save_locked()
+                log(message=f"回复计数器已重置（周期 {reset_days} 天）")
+                return True
+        return False
+
+    def increment_ai_count(self, user_key):
+        with self._lock:
+            user_data = self.get_user(user_key)
+            user_data["ai_count"] = user_data.get("ai_count", 0) + 1
+            self._save_locked()
+            return user_data["ai_count"]
+
+    def mark_limit_notified(self, user_key):
+        with self._lock:
+            user_data = self.get_user(user_key)
+            if user_data.get("limit_notified"):
+                return False
+            user_data["limit_notified"] = True
+            self._save_locked()
+            return True
+
+    def mark_api_err_notified(self, user_key):
+        with self._lock:
+            user_data = self.get_user(user_key)
+            if user_data.get("api_err_notified"):
+                return False
+            user_data["api_err_notified"] = True
+            self._save_locked()
+            return True
+
+    def clear_user(self, user_key):
+        user_key = str(user_key).strip()
+        with self._lock:
+            users = self.data.setdefault("users", {})
+            if user_key not in users:
+                return False
+            del users[user_key]
+            self._save_locked()
+            return True
+
+    @staticmethod
+    def was_send_success(result):
+        if result is True:
+            return True
+        if result is False or result is None:
+            return False
+        if isinstance(result, dict):
+            status = str(result.get("status", "")).lower()
+            if status in ("success", "ok", "true"):
+                return True
+            if status in ("error", "fail", "failed", "false"):
+                return False
+            if result.get("code") == 0:
+                return True
+            if result.get("success") is True:
+                return True
+            if result.get("success") is False:
+                return False
+        return bool(result)
+
+
+# ============================================================
 # AI 接口类
 # ============================================================
 
@@ -858,7 +1120,35 @@ class OpenAIAPI:
             }
         )
 
-    def chat(self, message, model=None, stream=False, prompt=None, history=None):
+    @staticmethod
+    def _image_to_data_url(image_path: str = "", image_url: str = "") -> str:
+        if image_path:
+            mime_type, _ = mimetypes.guess_type(image_path)
+            if mime_type not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+                mime_type = "image/jpeg"
+            with open(image_path, "rb") as f:
+                image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+            return f"data:{mime_type};base64,{image_data}"
+        if image_url:
+            return image_url
+        raise ValueError("image_path 和 image_url 不能同时为空")
+
+    @classmethod
+    def _build_chat_image_block(cls, image_path: str = "", image_url: str = "") -> dict:
+        return {
+            "type": "image_url",
+            "image_url": {"url": cls._image_to_data_url(image_path, image_url)}
+        }
+
+    @classmethod
+    def _build_responses_image_block(cls, image_path: str = "", image_url: str = "") -> dict:
+        return {
+            "type": "input_image",
+            "image_url": cls._image_to_data_url(image_path, image_url)
+        }
+
+    def chat(self, message, model=None, stream=False, prompt=None, history=None,
+             image_path: str = "", image_url: str = ""):
         """
         调用 OpenAI 兼容接口获取 AI 回复。
 
@@ -867,6 +1157,8 @@ class OpenAIAPI:
         :param stream:  是否使用流式输出
         :param prompt:  系统提示词，为 None 时使用配置中的 prompt
         :param history: 历史消息列表（MemoryManager.get_messages 返回值）
+        :param image_path: 本地图片路径，优先于 image_url
+        :param image_url:  图片 URL，image_path 为空时使用
         :return:        AI 回复的文本字符串
         """
         if model is None:
@@ -886,7 +1178,14 @@ class OpenAIAPI:
                 else:
                     content = f"[{t}] {raw}" if t else raw
                 messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": message})
+        if image_path or image_url:
+            user_content = [
+                {"type": "text", "text": message},
+                self._build_chat_image_block(image_path, image_url),
+            ]
+        else:
+            user_content = message
+        messages.append({"role": "user", "content": user_content})
 
         try:
             response = self.client.chat.completions.create(
@@ -899,7 +1198,7 @@ class OpenAIAPI:
             error_type = type(e).__name__
             log(level="WARN", message=f"Chat Completions API 调用失败 [{error_type}]: {error_msg}")
             log(level="INFO", message="尝试备用方案（Responses API）")
-            return self._try_responses_api(message, model, stream, prompt)
+            return self._try_responses_api(message, model, stream, prompt, image_path, image_url)
 
         try:
             if stream:
@@ -936,7 +1235,7 @@ class OpenAIAPI:
                     return result
                 else:
                     log(level="WARN", message=f"流式响应为空（收到 {chunk_count} 个块），尝试备用方案")
-                    return self._try_responses_api(message, model, stream, prompt)
+                    return self._try_responses_api(message, model, stream, prompt, image_path, image_url)
             else:
                 # 非流式模式：直接取 choices[0] 的消息内容
                 if response.choices and len(response.choices) > 0:
@@ -964,44 +1263,58 @@ class OpenAIAPI:
             log(level="WARN", message=f"解析 API 响应出错 [{error_type}]: {str(e)}")
             return self._try_responses_api(message, model, stream, prompt)
 
-    def _try_responses_api(self, message, model, stream, prompt):
+    def _try_responses_api(self, message, model, stream, prompt, image_path="", image_url=""):
         """
-        SDK 失败时的备用方案：使用标准 Chat Completions API 协议直接请求
+        SDK 失败时的备用方案：优先保留本地 Chat Completions 兼容直连；带图片时使用 Responses API。
         """
         try:
             if stream:
                 log(level="WARN", message="备用方案不支持流式输出，将使用非流式模式")
 
+            if image_path or image_url:
+                log(message=f"备用方案：使用 Responses API, model={model}")
+                input_text = f"这是prompt，请不要把这个当做用户输入：{prompt}\n\n这是用户消息，你需要参照prompt来回复用户消息：{message}" if prompt and prompt.strip() else message
+                input_payload = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": input_text},
+                        self._build_responses_image_block(image_path, image_url),
+                    ],
+                }]
+                response = self.client.responses.create(
+                    model=model,
+                    input=input_payload,
+                    reasoning={"effort": "none"}
+                )
+                if response.output and len(response.output) > 0:
+                    output_item = response.output[0]
+                    if hasattr(output_item, 'content') and output_item.content:
+                        text = output_item.content[0].text
+                        log(message=f"备用方案返回成功：{text[:100]}...")
+                        return text
+                log(level="WARN", message="备用方案响应内容为空")
+                return "API返回错误，请稍后再试"
+
             log(message=f"备用方案：使用通用 Request 进行 Chat Completions, model={model}")
-            
             messages = []
             if prompt:
                 messages.append({"role": "system", "content": prompt})
             messages.append({"role": "user", "content": message})
-            
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": False
-            }
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
+
+            payload = {"model": model, "messages": messages, "stream": False}
+            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             url = f"{self.base_url}/v1/chat/completions"
             response = requests.post(url, headers=headers, json=payload, timeout=60)
-            
+
             if response.status_code != 200:
                 error_detail = response.text[:500]
                 log(level="ERROR", message=f"备用接口 HTTP 错误 {response.status_code}: {error_detail}")
                 return f"备用接口请求失败: {response.status_code}"
 
             data = response.json()
-            # 【加固】检查返回结构是否合法
             if 'choices' in data and len(data['choices']) > 0:
                 choice = data['choices'][0]
                 msg = choice.get('message', {})
-                # 优先取 content，为空时兜底取 reasoning_content（适配 grok-reasoning 等模型）
                 content = msg.get('content', '') or ''
                 if not content.strip():
                     content = msg.get('reasoning_content', '') or ''
@@ -1662,6 +1975,10 @@ class WXBot:
         self.msg_replied_count   = 0            # 已回复消息数
         self.last_msg_time       = None         # 最近一条消息的时间字符串
         self.last_msg_sender     = None         # 最近一条消息的发送者
+
+        # 私聊回复轮数计数器
+        _base = os.path.dirname(sys.executable) if hasattr(sys, '_MEIPASS') else os.path.abspath(".")
+        self.reply_count_store = ReplyCountStore(os.path.join(_base, 'config', 'reply_count.json'))
 
     def _init_api(self):
         """根据配置中的 api_sdk 字段实例化对应的 AI 接口对象（默认接口）"""
@@ -2610,6 +2927,8 @@ class WXBot:
                 # 接口调用失败时替换为配置的固定回复
                 if reply == "API返回错误，请稍后再试":
                     reply = self.config.api_error_reply
+                else:
+                    reply = self._clean_reply_for_send(reply)
 
                 # 拆分多条回复：首条 @ 发言人，后续条不 @
                 if self.config.group_split_reply_switch:
@@ -2695,6 +3014,50 @@ class WXBot:
         parts = [p.strip() for p in reply.split(SPLIT_SEPARATOR) if p.strip()]
         return parts[:max_count] if parts else [reply]
 
+    def _clean_reply_for_send(self, reply):
+        """按配置清洗即将发送给用户的 AI 回复。"""
+        if not self.config.clean_ai_reply_switch:
+            return reply
+        cleaned = clean_ai_reply_text(reply)
+        if cleaned:
+            return cleaned
+        log(level="WARNING", message="AI 回复清洗后为空，已使用接口失败固定回复兜底")
+        return self.config.api_error_reply
+
+    def _get_reply_count_key(self, chat, message=None):
+        """获取回复计数器 key；当前 wxautox4 可用稳定字段有限，先集中使用 chat.who。"""
+        return str(getattr(chat, 'who', '') or '').strip()
+
+    def _get_chat_max_round(self, user_name):
+        """获取私聊用户的回复轮数上限；白名单模式优先用户专属上限。"""
+        if not self.config.AllListen_switch:
+            custom_value = self.config.chat_max_round_map.get(user_name)
+            if custom_value:
+                return custom_value
+        return self.config.chat_max_round_default
+
+    def _check_chat_max_round_limit(self, chat, user_key):
+        """检查并处理私聊回复轮数超限；返回 (是否已处理, 发送结果)。"""
+        if not self.config.chat_max_round_switch or not user_key:
+            return False, True
+        self.reply_count_store.maybe_reset(self.config.chat_max_round_reset_days)
+        user_data = self.reply_count_store.get_user(user_key)
+        max_round = self._get_chat_max_round(user_key)
+        if user_data.get("ai_count", 0) < max_round:
+            return False, True
+
+        if self.config.chat_max_round_reply_once and user_data.get("limit_notified"):
+            return True, True
+        if not self.config.chat_max_round_reply:
+            return True, True
+
+        result = chat.SendMsg(self.config.chat_max_round_reply)
+        if ReplyCountStore.was_send_success(result):
+            self.msg_replied_count += 1
+            if self.config.chat_max_round_reply_once:
+                self.reply_count_store.mark_limit_notified(user_key)
+        return True, result
+
     def _is_custom_forward_source(self, chat_who):
         """判断某个会话是否是任意自定义转发规则的监听来源"""
         for rule in self.config.custom_forward_list:
@@ -2760,6 +3123,14 @@ class WXBot:
         # log(level="DEBUG", message=f"[DEBUG] 私聊暂停标志：{self._pause_chat_reply}，来源：{chat.who}")
         if self._pause_chat_reply:
             return True
+        result = True
+        user_key = self._get_reply_count_key(chat, message)
+        limit_handled, limit_result = self._check_chat_max_round_limit(chat, user_key)
+        if limit_handled:
+            return limit_result
+
+        api_error_reply = False
+        api_error_should_mark = False
         try:
             # wechat_checkin plugin hook: keep business logic outside wxbot_core.py.
             try:
@@ -2830,11 +3201,25 @@ class WXBot:
         except Exception as e:
             print(traceback.format_exc())
             log(level="ERROR", message=str(e) + "\nAPI返回错误，请稍后再试")
-            reply = "API返回错误，请稍后再试"
+            api_error_reply = True
+            if self.config.api_error_reply_once and user_key:
+                user_data = self.reply_count_store.get_user(user_key)
+                if user_data.get("api_err_notified"):
+                    return True
+                api_error_should_mark = True
+            reply = self.config.api_error_reply
 
         # 接口调用失败时替换为配置的固定回复
         if reply == "API返回错误，请稍后再试":
+            if self.config.api_error_reply_once and user_key:
+                user_data = self.reply_count_store.get_user(user_key)
+                if user_data.get("api_err_notified"):
+                    return True
+                api_error_should_mark = True
             reply = self.config.api_error_reply
+            api_error_reply = True
+        else:
+            reply = self._clean_reply_for_send(reply)
 
         # 拆分多条回复：仅在开关开启且回复包含分隔符时生效
         if self.config.chat_split_reply_switch:
@@ -2842,13 +3227,22 @@ class WXBot:
         else:
             parts = [reply]
 
+        send_success = False
         for part in parts:
             self.config.human_delay()   # 每条发送前都延迟（含第一条，与原逻辑等效）
             if len(part) >= 2000:
                 for segment in self.config.split_long_text(part):
                     result = chat.SendMsg(segment)
+                    send_success = send_success or ReplyCountStore.was_send_success(result)
             else:
                 result = chat.SendMsg(part)
+                send_success = send_success or ReplyCountStore.was_send_success(result)
+
+        if send_success and api_error_should_mark:
+            self.reply_count_store.mark_api_err_notified(user_key)
+
+        if send_success and self.config.chat_max_round_switch and user_key and not api_error_reply:
+            self.reply_count_store.increment_ai_count(user_key)
 
         self.msg_replied_count += 1
         return result
@@ -3014,6 +3408,22 @@ class WXBot:
                 '[/查看错误回复] 查看接口失败固定回复\n'
                 '[/设置错误回复 ***] 修改接口失败固定回复'
             )
+        elif content == "/计数器指令":
+            _round_sw = "开启" if self.config.chat_max_round_switch else "关闭"
+            _round_reset = self.config.chat_max_round_reset_days
+            _reset_desc = "不重置" if _round_reset == 0 else f"{_round_reset}天"
+            _reply_desc = self.config.chat_max_round_reply or "（空，超限后静默）"
+            result = chat.SendMsg(
+                '--- 回复计数器 ---\n'
+                f'轮数限制开关：{_round_sw}\n'
+                f'默认上限：{self.config.chat_max_round_default} 轮\n'
+                f'白名单专属上限：{len(self.config.chat_max_round_map)} 个\n'
+                f'重置周期：{_reset_desc}\n'
+                f'超限话术：{_reply_desc}\n'
+                f'超限只回复一次：{"是" if self.config.chat_max_round_reply_once else "否"}\n'
+                f'接口失败只回复一次：{"是" if self.config.api_error_reply_once else "否"}\n'
+                '[/清除计数 昵称] 清除指定用户的回复计数与通知状态'
+            )
         elif content == "/状态":
             result = self._build_status_msg(chat, message)
         elif content == "/关键词状态":
@@ -3145,6 +3555,15 @@ class WXBot:
                 result = chat.SendMsg(f"接口失败固定回复已更新：{new_err}")
             else:
                 result = chat.SendMsg("请提供回复内容，如：/设置错误回复 在忙，我稍后回复您")
+        # --- 回复计数器清零 ---
+        elif content.startswith("/清除计数"):
+            target = re.sub("/清除计数", "", content).strip()
+            if not target:
+                result = chat.SendMsg("请提供用户昵称，如：/清除计数 张三")
+            elif self.reply_count_store.clear_user(target):
+                result = chat.SendMsg(f"已清除 {target} 的回复计数与通知状态")
+            else:
+                result = chat.SendMsg(f"未找到 {target} 的计数记录（可能尚未触发过回复）")
         else:
             # 未匹配到任何指令
             # self 消息（文件传输助手场景下机器人自身回复的同步）不调用 AI，避免误触发关键词或 AI 回复
@@ -3473,11 +3892,17 @@ class WXBot:
         """处理 /新好友状态 指令：返回新好友自动通过和自动回复配置"""
         accept = "开启" if self.config.new_frined_switch      else "关闭"
         reply  = "开启" if self.config.new_frien_reply_switch else "关闭"
+        use_name = "是" if self.config.new_friend_remark_use_nickname else "否"
+        prefix_time = "是" if self.config.new_friend_remark_prefix_timestamp else "否"
+        suffix_time = "是" if self.config.new_friend_remark_suffix_timestamp else "否"
         msgs   = self.config.new_frien_msg if self.config.new_frien_msg else ["（无）"]
         lines  = [
             "--- 新好友状态 ---",
             f"自动通过好友申请：{accept}",
             f"自动回复新好友：{reply}",
+            f"备注采用昵称：{use_name}",
+            f"备注前缀：{self.config.new_friend_remark_prefix or '（空）'}  前缀加时间戳：{prefix_time}",
+            f"备注后缀：{self.config.new_friend_remark_suffix or '（空）'}  后缀加时间戳：{suffix_time}",
             "自动回复消息：",
         ] + [f"  · {m}" for m in msgs]
         return chat.SendMsg('\n'.join(lines))
@@ -3498,6 +3923,7 @@ class WXBot:
             '/拆分回复指令\n'
             '/新好友指令\n'
             '/接口指令\n'
+            '/计数器指令\n'
             '作者:https://www.siver.top'
         )
         return chat.SendMsg(commands)
@@ -3575,6 +4001,61 @@ class WXBot:
         )
         return bool(pattern.match(s))
 
+    @staticmethod
+    def _remark_unit_len(text):
+        """按微信备注近似限制计算长度：ASCII 算 1，中文和特殊字符算 2。"""
+        total = 0
+        for ch in str(text or ""):
+            try:
+                total += len(ch.encode("gbk"))
+            except UnicodeEncodeError:
+                total += 2
+        return total
+
+    @classmethod
+    def _truncate_remark_units(cls, text, max_units):
+        """按备注长度单位裁剪，不截断字符。"""
+        if max_units <= 0:
+            return ""
+        result = []
+        used = 0
+        for ch in str(text or ""):
+            try:
+                unit = len(ch.encode("gbk"))
+            except UnicodeEncodeError:
+                unit = 2
+            if used + unit > max_units:
+                break
+            result.append(ch)
+            used += unit
+        return "".join(result)
+
+    def build_new_friend_remark(self, nickname):
+        """根据面板配置生成新好友备注，并裁剪到微信备注长度限制内。"""
+        max_units = 32
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        leading = timestamp if self.config.new_friend_remark_prefix_timestamp else ""
+        prefix = str(self.config.new_friend_remark_prefix or "")
+        name = str(nickname or "") if self.config.new_friend_remark_use_nickname else ""
+        suffix = str(self.config.new_friend_remark_suffix or "")
+        trailing = timestamp if self.config.new_friend_remark_suffix_timestamp else ""
+
+        fixed_left = leading + prefix
+        fixed_right = suffix + trailing
+        fixed_units = self._remark_unit_len(fixed_left) + self._remark_unit_len(fixed_right)
+        if fixed_units <= max_units:
+            name_units = max_units - fixed_units
+            remark = fixed_left + self._truncate_remark_units(name, name_units) + fixed_right
+        else:
+            trailing_units = self._remark_unit_len(trailing)
+            available_main_units = max(0, max_units - trailing_units)
+            main = self._truncate_remark_units(fixed_left + suffix, available_main_units)
+            remark = main + trailing
+        if not remark:
+            fallback = str(nickname or "新好友") if self.config.new_friend_remark_use_nickname else "新好友"
+            remark = self._truncate_remark_units(fallback, max_units)
+        return remark
+
     def Pass_New_Friends(self):
         """
         检测并批量通过新好友请求，通过后按需自动发送打招呼消息。
@@ -3587,7 +4068,7 @@ class WXBot:
         if len(NewFriends) != 0:
             log(message="以下是新朋友：\n" + str(NewFriends))
             for new in NewFriends:
-                new_name = self.config.new_friend_remark_prefix + new.name + self.config.new_friend_remark_suffix
+                new_name = self.build_new_friend_remark(new.name)
                 tags = self.config.new_friend_tags if self.config.new_friend_tags else None
                 new.accept(remark=new_name, tags=tags)  # 接受好友请求并设置备注和标签
                 log(message="已通过" + new_name + "的好友请求")
@@ -3923,6 +4404,9 @@ class WXBot:
             "reply_delay_switch":    self.config.reply_delay_switch,
             "reply_delay_min":       self.config.reply_delay_min,
             "reply_delay_max":       self.config.reply_delay_max,
+            "chat_max_round_switch": self.config.chat_max_round_switch,
+            "chat_max_round_default": self.config.chat_max_round_default,
+            "chat_max_round_reset_days": self.config.chat_max_round_reset_days,
             "pause_chat_reply":      self._pause_chat_reply,
             "pause_group_reply":     self._pause_group_reply,
         }
@@ -3978,9 +4462,9 @@ class WXBot:
             log(level="ERROR", message=str(e) + "\n 初始化微信监听器失败，请检查微信是否启动登录正确，微信主窗口是否开着")
             log(level="ERROR", message=str(e) + "\n 请尝试退出wx再重新登录后再启动")
             log(level="ERROR", message=str(e) + "\n 请尝试退出wx再重新登录后再启动")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.30")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.30")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.30")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.35")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.35")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.35")
             self.run_flag = False
 
         # 主循环

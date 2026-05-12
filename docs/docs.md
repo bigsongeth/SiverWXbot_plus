@@ -1,6 +1,6 @@
 # 🤖 Siver WX机器人 (wxbot_plus)
 
-[![Version](https://img.shields.io/badge/version-V4.7.23-blue.svg)](https://github.com/SiverKing/SiverWXbot_plus)
+[![Version](https://img.shields.io/badge/version-V4.7.25-blue.svg)](https://github.com/SiverKing/SiverWXbot_plus)
 [![Python](https://img.shields.io/badge/python-3.8+-green.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
@@ -27,7 +27,7 @@
 
 **环境要求：**
 - Windows 操作系统
-- Windows wx PC 版（`4.1.7` ~ `4.1.9.30` 版本）
+- Windows wx PC 版（`4.1.7` ~ `4.1.9.35` 版本）
 
 **下载地址（二选一）：**
 
@@ -44,7 +44,7 @@
 **环境要求：**
 - Python `3.9` - `3.13`
 - Windows 操作系统
-- Windows wx PC 版（`4.1.7` ~ `4.1.9.30` 版本）
+- Windows wx PC 版（`4.1.7` ~ `4.1.9.35` 版本）
 - wxautox4内核库 设备授权（需购买，购买地址：https://www.siverking.online/static/img/siver_wx.jpg ）
 
 **安装步骤：**
@@ -318,11 +318,72 @@ AI 将自主决定是否将回复拆分为多条消息逐条发送，模拟真�
 
 当调用 AI / 模型接口失败时，机器人将发送此固定回复，而非原始报错提示。
 
+可勾选“只回复一次”。开启后，同一个好友首次接口失败时会收到固定回复，后续再次失败将不再重复发送，避免接口异常时频繁打扰用户。
+
+#### 回复次数限制
+
+开启“回复次数限制（单个好友）”后，可以限制每个好友最多自动回复多少次。超过次数后，机器人不再继续回复该好友。
+
+- 单个好友最多回复次数：设置每个好友的全局回复上限。
+- 计数重置周期：`0` 表示永久累计，`1` 表示每天重置，`7` 表示每 7 天重置一次。
+- 超出次数限制固定回复：超过上限后发送的提示语；不填写则超限后静默。
+- 只回复一次：开启后，超限提示语对同一个好友只发送一次。
+
+白名单模式下，可在监听列表中为单个好友单独设置回复上限。留空则使用全局上限。
+
+管理员可发送 `/计数器指令` 查看计数器相关命令，也可使用 `/清除计数 昵称` 清除指定好友的回复计数与通知状态。
+
+#### 屏蔽模型思考过程
+
+开启后，机器人会在发送前自动清理模型返回内容中的 `<think>...</think>` 思考标签，避免把模型推理过程发送给用户。
+
+若模型只返回了思考内容，清洗后为空，机器人会使用“接口调用失败固定回复”作为兜底回复。
+
 ---
 
 ### 报错邮箱
 
 提供报错邮件和 wx 离线邮件提醒，按照页面提示配置邮箱即可。
+
+---
+
+### Webhook 通知
+
+Webhook 通知用于在机器人出现报错时，通过 HTTP Webhook 向飞书、钉钉、企业微信、Discord 等平台发送告警。
+
+#### 基础配置
+
+- 启用 Webhook 通知：开启后，机器人报错时会发送 Webhook 告警。
+- Webhook URL：填写第三方平台提供的 Webhook 地址。
+- 请求方法：一般使用 `POST`。
+- Content-Type：一般使用 `application/json`。
+- 超时时间：Webhook 请求的等待时间，单位为秒。
+
+#### 请求头和请求体
+
+请求头需要填写合法 JSON，例如：
+
+```json
+{
+  "Authorization": "Bearer your-token"
+}
+```
+
+请求体同样按平台要求填写。请求头和请求体中都支持以下占位符：
+
+- `$title`：告警标题
+- `$content`：告警内容
+
+例如通用 JSON 请求体：
+
+```json
+{
+  "title": "$title",
+  "content": "$content"
+}
+```
+
+配置完成后，可点击“测试 Webhook”验证是否能正常发送；点击“保存 Webhook 配置”后立即生效。
 
 ---
 
@@ -427,7 +488,7 @@ AI 将自主决定是否将回复拆分为多条消息逐条发送，模拟真�
 2. 电脑自动休眠 黑屏都设为**从不**（一般情况程序会自动阻止不用手动调整）。
 3. 如需离线邮件提醒，请在配置面板修改设置邮件。
 4. 关闭wx自动更新。
-5. 适配 Windows wx `4.1.7` - `4.1.9.30`。
+5. 适配 Windows wx `4.1.7` - `4.1.9.35`。
 6. 程序接管wx运行时，请勿手动干预，避免影响自动化操作。
 7. **各 SDK 接口填写说明：**
    - **DusAPI**：填写 Key 和模型 ID，模型 ID 可从 https://docs.dusapi.com 查看

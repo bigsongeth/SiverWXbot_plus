@@ -10,6 +10,8 @@ from flask import Flask, render_template, request, jsonify, session, redirect, u
 import json
 import os
 import shutil
+import base64
+import tempfile
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -17,7 +19,7 @@ from datetime import datetime, timedelta
 import logging
 from functools import wraps
 import threading
-from wxbot_core import WXBot, version as BOT_VERSION
+from wxbot_core import CozeAPI, DifyAPI, DusAPI, OpenAIAPI, WXBot, clean_ai_reply_text, version as BOT_VERSION
 from logger import log
 import logger
 import pythoncom
@@ -114,7 +116,7 @@ def verify_password(password, password_hash):
 
 
 def load_siver_panel_manager_class():
-    module_path = resource_path('siver-panel.py')
+    module_path = resource_path('siver_panel.py')
     if not os.path.exists(module_path):
         log('WARNING', f'SiverPanel 客户端模块不存在: {module_path}')
         return None
@@ -669,6 +671,10 @@ def dashboard():
     config.setdefault('reply_delay_switch', True)
     config.setdefault('reply_delay_min', 1)
     config.setdefault('reply_delay_max', 5)
+    config.setdefault('clean_ai_reply_switch', True)
+    config.setdefault('new_friend_remark_use_nickname', True)
+    config.setdefault('new_friend_remark_prefix_timestamp', False)
+    config.setdefault('new_friend_remark_suffix_timestamp', False)
     config.setdefault('chat_image_recognition_switch', False)   # 私聊图片识别开关
     config.setdefault('chat_image_recognition_api',    0)        # 私聊识别接口索引
     config.setdefault('group_image_recognition_switch', False)  # 群组图片识别开关
@@ -709,8 +715,15 @@ def dashboard():
     config.setdefault('default_prompt', '默认')
     config.setdefault('chat_prompt_map', {})
     config.setdefault('chat_api_map', {})
+    config.setdefault('chat_max_round_map', {})
     config.setdefault('group_prompt_map', {})
     config.setdefault('api_error_reply', '在忙，我稍后回复您')   # 接口调用失败时的固定回复
+    config.setdefault('api_error_reply_once', False)       # 接口失败固定回复是否同一用户只发一次
+    config.setdefault('chat_max_round_switch', False)      # 单用户最大回复轮数限制开关
+    config.setdefault('chat_max_round_default', 99)        # 默认最多回复次数
+    config.setdefault('chat_max_round_reset_days', 0)      # 计数重置周期，0=不重置
+    config.setdefault('chat_max_round_reply', '')          # 超限后固定话术
+    config.setdefault('chat_max_round_reply_once', False)  # 超限话术是否同一用户只发一次
     config.setdefault('chat_split_reply_switch', False)   # 私聊拆分多条回复开关
     config.setdefault('chat_split_max_chars', 100)        # 私聊单条最大字数
     config.setdefault('chat_split_max_count', 4)          # 私聊最多条数
@@ -753,6 +766,9 @@ def _coerce_bool_fields(merged_config):
         'group_welcome',
         'new_friend_switch',
         'new_friend_reply_switch',
+        'new_friend_remark_use_nickname',
+        'new_friend_remark_prefix_timestamp',
+        'new_friend_remark_suffix_timestamp',
         # —— 新增布尔字段 ——
         'chat_keyword_switch',
         'group_keyword_switch',
@@ -765,12 +781,16 @@ def _coerce_bool_fields(merged_config):
         'everyday_start_stop_bot_switch',   # 新增
         'memory_switch',                    # 记忆开关
         'reply_delay_switch',               # 发送延迟开关
+        'clean_ai_reply_switch',            # AI 回复清洗开关
         'chat_image_recognition_switch',    # 私聊图片识别开关
         'group_image_recognition_switch',   # 群组图片识别开关
         'custom_forward_switch',            # 自定义转发总开关
         'chat_split_reply_switch',          # 私聊拆分多条回复开关
         'group_split_reply_switch',         # 群聊拆分多条回复开关
         'siver_panel_enabled',
+        'api_error_reply_once',             # API错误只回复一次
+        'chat_max_round_switch',            # 单用户最大回复轮数限制开关
+        'chat_max_round_reply_once',        # 超限后只回复一次
     ]
     for field in boolean_fields:
         if field in merged_config:
@@ -808,6 +828,8 @@ def _coerce_int_range_fields(merged_config):
     int_range_fields = {
         'new_friend_check_min': (60, 3600, 60),
         'new_friend_check_max': (60, 3600, 300),
+        'chat_max_round_default': (1, 99999, 99),
+        'chat_max_round_reset_days': (0, 365, 0),
     }
     for field, (lo, hi, default) in int_range_fields.items():
         if field in merged_config:
@@ -826,13 +848,13 @@ def _coerce_dict_fields(merged_config):
     if 'keyword_dict' in merged_config:
         kd = merged_config['keyword_dict']
         if isinstance(kd, dict):
-            return
+            pass
         if isinstance(kd, str):
             try:
                 obj = json.loads(kd)
                 if isinstance(obj, dict):
                     merged_config['keyword_dict'] = obj
-                    return
+                    kd = obj
             except Exception:
                 pass
         if isinstance(kd, list):
@@ -844,9 +866,10 @@ def _coerce_dict_fields(merged_config):
                     if key:
                         out[key] = val
             merged_config['keyword_dict'] = out
-            return
+            kd = out
         # 其他情况回退空 dict
-        merged_config['keyword_dict'] = {}
+        if not isinstance(kd, dict):
+            merged_config['keyword_dict'] = {}
 
     # group_api_map: 值必须为 int 接口索引，非法值自动过滤
     if 'group_api_map' in merged_config:
@@ -881,6 +904,23 @@ def _coerce_dict_fields(merged_config):
             merged_config['chat_api_map'] = clean
         else:
             merged_config['chat_api_map'] = {}
+
+    # chat_max_round_map: 白名单模式下私聊用户专属回复次数上限，范围 1~99999
+    if 'chat_max_round_map' in merged_config:
+        cmrm = merged_config['chat_max_round_map']
+        if isinstance(cmrm, dict):
+            clean = {}
+            for k, v in cmrm.items():
+                k = str(k).strip()
+                try:
+                    vi = int(v)
+                    if k:
+                        clean[k] = max(1, min(99999, vi))
+                except (ValueError, TypeError):
+                    pass
+            merged_config['chat_max_round_map'] = clean
+        else:
+            merged_config['chat_max_round_map'] = {}
 
     # chat_prompt_map: 值为非空字符串（prompt 文件名）
     if 'chat_prompt_map' in merged_config:
@@ -969,6 +1009,133 @@ def save_config_route():
     except Exception as e:
         log('ERROR', f'保存配置出错: {str(e)}')
         return jsonify({'status': 'error', 'message': str(e)})
+
+
+class _TempAPIConfig:
+    """用于测试单个接口配置的轻量配置对象，不读写 config.json。"""
+
+    def __init__(self, cfg):
+        self.api_sdk = str(cfg.get('sdk', '')).strip()
+        self.api_key = str(cfg.get('key', '')).strip()
+        self.base_url = str(cfg.get('url', '')).strip().rstrip('/')
+        self.model1 = str(cfg.get('model', '')).strip()
+        self.prompt = "你是接口连通性测试助手。请只回复 OK。"
+
+
+def _build_test_api_client(tmp_config):
+    sdk = tmp_config.api_sdk
+    if sdk == "OpenAI SDK":
+        return OpenAIAPI(tmp_config)
+    if sdk == "Dify":
+        return DifyAPI(tmp_config)
+    if sdk == "Coze":
+        return CozeAPI(tmp_config)
+    return DusAPI(tmp_config)
+
+_TINY_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+def _run_api_image_test(api, sdk):
+    """用内置极小 PNG 测试当前接口是否支持图片输入。"""
+    if sdk not in ("OpenAI SDK", "DusAPI"):
+        return {
+            'status': 'skipped',
+            'message': '当前接口类型暂不支持通用图片测试'
+        }
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as f:
+            f.write(base64.b64decode(_TINY_PNG_BASE64))
+            tmp_path = f.name
+        reply = api.chat(
+            "请只回复 OK",
+            stream=False,
+            prompt="你是图片识别连通性测试助手。请确认你能读取图片，并只回复 OK。",
+            history=[],
+            image_path=tmp_path,
+        )
+        raw_reply = str(reply or "")
+        cleaned_reply = clean_ai_reply_text(raw_reply)
+        if not raw_reply or raw_reply == "API返回错误，请稍后再试":
+            return {
+                'status': 'error',
+                'message': '图片测试未返回有效文本，请确认模型支持视觉输入'
+            }
+        return {
+            'status': 'success',
+            'reply': cleaned_reply or '（清洗后为空）',
+            'raw_length': len(raw_reply),
+            'cleaned': cleaned_reply != raw_reply,
+        }
+    except TypeError as e:
+        return {
+            'status': 'skipped',
+            'message': f'当前接口类暂不支持图片参数：{e}'
+        }
+    except Exception as e:
+        msg = str(e)
+        if len(msg) > 500:
+            msg = msg[:500] + '...'
+        return {
+            'status': 'error',
+            'message': f'图片测试失败：{msg}'
+        }
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+@app.route('/test_api_config', methods=['POST'])
+@login_required
+def test_api_config_route():
+    started = time.time()
+    try:
+        data = request.get_json() or {}
+        cfg = data.get('api_config') or {}
+        if not isinstance(cfg, dict):
+            return jsonify({'status': 'error', 'message': '接口配置格式无效'})
+
+        tmp_config = _TempAPIConfig(cfg)
+        if not tmp_config.api_key:
+            return jsonify({'status': 'error', 'message': 'API Key 不能为空'})
+        if not tmp_config.base_url:
+            return jsonify({'status': 'error', 'message': 'Base URL 不能为空'})
+        if not tmp_config.model1:
+            return jsonify({'status': 'error', 'message': '模型名称不能为空'})
+
+        api = _build_test_api_client(tmp_config)
+        reply = api.chat("请只回复 OK", stream=False, prompt=tmp_config.prompt, history=[])
+        raw_reply = str(reply or "")
+        cleaned_reply = clean_ai_reply_text(raw_reply)
+        cleaned = cleaned_reply != raw_reply
+
+        if not raw_reply or raw_reply == "API返回错误，请稍后再试":
+            return jsonify({
+                'status': 'error',
+                'message': '接口有响应，但未返回有效文本，请检查模型名称、接口地址或服务商兼容性'
+            })
+
+        image_test = _run_api_image_test(api, tmp_config.api_sdk)
+        elapsed_ms = int((time.time() - started) * 1000)
+        return jsonify({
+            'status': 'success',
+            'data': {
+                'reply': cleaned_reply or '（清洗后为空：接口可能只返回了思考内容）',
+                'raw_length': len(raw_reply),
+                'cleaned': cleaned,
+                'elapsed_ms': elapsed_ms,
+                'image_test': image_test,
+            }
+        })
+    except Exception as e:
+        msg = str(e)
+        if len(msg) > 800:
+            msg = msg[:800] + '...'
+        return jsonify({'status': 'error', 'message': f'接口测试失败：{msg}'})
 
 # ----------------------------------------------------------
 # Prompt 文件管理路由
@@ -1685,8 +1852,11 @@ def main():
                 "new_friend_msg": [],
                 "new_friend_check_min": 60,
                 "new_friend_check_max": 300,
+                "new_friend_remark_use_nickname": True,
                 "new_friend_remark_prefix": "",
+                "new_friend_remark_prefix_timestamp": False,
                 "new_friend_remark_suffix": "_机器人备注",
+                "new_friend_remark_suffix_timestamp": False,
                 "new_friend_tags": [],
                 "chat_keyword_switch": False,
                 "group_keyword_switch": False,
@@ -1698,6 +1868,9 @@ def main():
                 "random_msg_list": [],
                 "scheduled_moments_switch": False,
                 "scheduled_moments_list": [],
+                "moments_like_switch": False,
+                "moments_like_min": 60,
+                "moments_like_max": 120,
                 "random_moments_switch": False,
                 "random_moments_list": [],
                 "everyday_start_stop_bot_switch": False,
@@ -1709,6 +1882,7 @@ def main():
                 "reply_delay_switch": True,
                 "reply_delay_min": 1,
                 "reply_delay_max": 5,
+                "clean_ai_reply_switch": True,
                 "chat_image_recognition_switch": False,
                 "chat_image_recognition_api": 0,
                 "group_image_recognition_switch": False,
@@ -1718,8 +1892,15 @@ def main():
                 "default_prompt": "默认",
                 "chat_prompt_map": {},
                 "chat_api_map": {},
+                "chat_max_round_map": {},
                 "group_prompt_map": {},
                 "api_error_reply": "在忙，我稍后回复您",
+                "api_error_reply_once": False,
+                "chat_max_round_switch": False,
+                "chat_max_round_default": 99,
+                "chat_max_round_reset_days": 0,
+                "chat_max_round_reply": "",
+                "chat_max_round_reply_once": False,
                 "chat_split_reply_switch": False,
                 "chat_split_max_chars": 100,
                 "chat_split_max_count": 4,
