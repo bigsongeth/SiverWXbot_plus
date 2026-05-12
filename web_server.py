@@ -1808,7 +1808,7 @@ def find_free_port(start_port=10001, max_port=11000):
     for port in range(start_port, max_port):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
-                s.bind(("127.0.0.1", port))
+                s.bind(("0.0.0.0", port))
                 return port
             except OSError:
                 continue
@@ -1945,7 +1945,7 @@ def main():
             siver_panel_manager.set_local_port_provider(get_panel_server_port)
             siver_panel_manager.start()
         # 启动服务器
-        app.run(host='127.0.0.1', port=free_port, debug=False, threaded=True)
+        app.run(host='0.0.0.0', port=free_port, debug=False, threaded=True)
     except Exception as e:
         log('ERROR', f'服务器启动失败: {str(e)}')
     finally:
