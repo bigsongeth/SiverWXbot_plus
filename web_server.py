@@ -10,8 +10,8 @@ from flask import Flask, render_template, request, jsonify, session, redirect, u
 import json
 import os
 import shutil
-import base64
-import tempfile
+import hashlib
+import re
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -56,7 +56,7 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_host=1, x_proto=1, x_prefix=1)
 # 安全配置
 app.config.update(
     SESSION_COOKIE_SECURE=False,
-    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_HTTPONLY=False,
     SESSION_COOKIE_SAMESITE='Lax',
     PERMANENT_SESSION_LIFETIME=timedelta(days=1)
 )
@@ -595,10 +595,10 @@ def dashboard():
     # 旧配置迁移：只要旧字段存在就迁移并写回磁盘（无论 api_configs 是否已有）
     if 'api_sdk' in config:
         config['api_configs'] = [
-            {'sdk': config.get('api_sdk', 'DusAPI'), 'key': config.get('api_key', ''),
-             'url': config.get('base_url', 'https://api.dusapi.com'), 'model': config.get('model1', 'gpt-5')},
-            {'sdk': config.get('api_sdk', 'DusAPI'), 'key': config.get('api_key', ''),
-             'url': config.get('base_url', 'https://api.dusapi.com'), 'model': config.get('model2', 'claude-sonnet-4-6')},
+            {'sdk': config.get('api_sdk', ''), 'key': config.get('api_key', ''),
+             'url': config.get('base_url', ''), 'model': config.get('model1', '')},
+            {'sdk': config.get('api_sdk', ''), 'key': config.get('api_key', ''),
+             'url': config.get('base_url', ''), 'model': config.get('model2', '')},
         ]
         config['api_index'] = 0
         for old_key in ('api_sdk', 'api_key', 'base_url', 'model1', 'model2', 'api_sdk_list'):
@@ -610,14 +610,16 @@ def dashboard():
         except Exception as _e:
             log('ERROR', f'迁移配置写入失败: {_e}')
     config.setdefault('api_configs', [
-        {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "gpt-5"},
-        {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+        {"sdk": "", "key": "", "url": "", "model": ""},
+        {"sdk": "", "key": "", "url": "", "model": ""},
     ])
     config.setdefault('api_index', 0)
 
     # —— 新增字段默认值（关键）——
     config.setdefault('group_api_map', {})                   # 群组专属接口映射
     config.setdefault('group_welcome_random', 1.0)          # 新人欢迎概率
+    config.setdefault('chat_listen_only', False)             # 私聊只监听不 AI 回复
+    config.setdefault('group_listen_only', False)            # 群聊只监听不 AI 回复
     config.setdefault('chat_keyword_switch', False)          # 私聊关键词开关
     config.setdefault('group_keyword_switch', False)         # 群组关键词开关
     config.setdefault('group_keyword_at_only', False)        # 群聊关键词仅@时回复
@@ -759,7 +761,9 @@ def _coerce_bool_fields(merged_config):
     boolean_fields = [
         'AllListen_switch',
         'AllListen_filter_mute',
+        'chat_listen_only',
         'group_switch',
+        'group_listen_only',
         'group_reply_at',
         'group_reply_at_msg',
         'group_reply_quote',
@@ -1030,63 +1034,9 @@ def _build_test_api_client(tmp_config):
         return DifyAPI(tmp_config)
     if sdk == "Coze":
         return CozeAPI(tmp_config)
-    return DusAPI(tmp_config)
-
-_TINY_PNG_BASE64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-)
-
-def _run_api_image_test(api, sdk):
-    """用内置极小 PNG 测试当前接口是否支持图片输入。"""
-    if sdk not in ("OpenAI SDK", "DusAPI"):
-        return {
-            'status': 'skipped',
-            'message': '当前接口类型暂不支持通用图片测试'
-        }
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as f:
-            f.write(base64.b64decode(_TINY_PNG_BASE64))
-            tmp_path = f.name
-        reply = api.chat(
-            "请只回复 OK",
-            stream=False,
-            prompt="你是图片识别连通性测试助手。请确认你能读取图片，并只回复 OK。",
-            history=[],
-            image_path=tmp_path,
-        )
-        raw_reply = str(reply or "")
-        cleaned_reply = clean_ai_reply_text(raw_reply)
-        if not raw_reply or raw_reply == "API返回错误，请稍后再试":
-            return {
-                'status': 'error',
-                'message': '图片测试未返回有效文本，请确认模型支持视觉输入'
-            }
-        return {
-            'status': 'success',
-            'reply': cleaned_reply or '（清洗后为空）',
-            'raw_length': len(raw_reply),
-            'cleaned': cleaned_reply != raw_reply,
-        }
-    except TypeError as e:
-        return {
-            'status': 'skipped',
-            'message': f'当前接口类暂不支持图片参数：{e}'
-        }
-    except Exception as e:
-        msg = str(e)
-        if len(msg) > 500:
-            msg = msg[:500] + '...'
-        return {
-            'status': 'error',
-            'message': f'图片测试失败：{msg}'
-        }
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+    if sdk == "DusAPI":
+        return DusAPI(tmp_config)
+    raise ValueError("不支持的 SDK 类型")
 
 
 @app.route('/test_api_config', methods=['POST'])
@@ -1100,6 +1050,8 @@ def test_api_config_route():
             return jsonify({'status': 'error', 'message': '接口配置格式无效'})
 
         tmp_config = _TempAPIConfig(cfg)
+        if tmp_config.api_sdk not in ("DusAPI", "OpenAI SDK", "Dify", "Coze"):
+            return jsonify({'status': 'error', 'message': '请选择有效的 SDK'})
         if not tmp_config.api_key:
             return jsonify({'status': 'error', 'message': 'API Key 不能为空'})
         if not tmp_config.base_url:
@@ -1119,7 +1071,6 @@ def test_api_config_route():
                 'message': '接口有响应，但未返回有效文本，请检查模型名称、接口地址或服务商兼容性'
             })
 
-        image_test = _run_api_image_test(api, tmp_config.api_sdk)
         elapsed_ms = int((time.time() - started) * 1000)
         return jsonify({
             'status': 'success',
@@ -1128,7 +1079,6 @@ def test_api_config_route():
                 'raw_length': len(raw_reply),
                 'cleaned': cleaned,
                 'elapsed_ms': elapsed_ms,
-                'image_test': image_test,
             }
         })
     except Exception as e:
@@ -1576,6 +1526,58 @@ def pick_image_file():
         return jsonify({'status': 'error', 'message': str(e)})
 
 MEMORY_BASE = os.path.join(base_dir(), 'memory')
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+}
+INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+def _memory_is_windows_reserved_name(name):
+    stem = name.split('.', 1)[0].upper()
+    return stem in WINDOWS_RESERVED_NAMES
+
+def _memory_hash_storage_name(name):
+    raw_name = str(name)
+    return "hash" + hashlib.sha256(raw_name.encode('utf-8')).hexdigest()
+
+def _memory_resolve_storage_name(chat_name):
+    raw_name = str(chat_name)
+    storage_name = INVALID_FILENAME_CHARS_RE.sub('', raw_name)
+    storage_name = storage_name.strip().rstrip('. ')
+    if (
+        not storage_name
+        or storage_name in ('.', '..')
+        or _memory_is_windows_reserved_name(storage_name)
+        or len(storage_name) > 120
+    ):
+        return _memory_hash_storage_name(raw_name)
+    return storage_name
+
+def _memory_read_original_name(chat_path, fallback):
+    name_path = os.path.join(chat_path, 'name.json')
+    if not os.path.exists(name_path):
+        return fallback
+    try:
+        with open(name_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        name = data.get('name') if isinstance(data, dict) else None
+        return str(name) if name else fallback
+    except Exception:
+        return fallback
+
+def _memory_find_chat_dir(wx_path, chat_name):
+    storage_name = _memory_resolve_storage_name(chat_name)
+    direct_path = os.path.join(wx_path, storage_name)
+    if os.path.isdir(direct_path):
+        return storage_name, direct_path
+    if not os.path.isdir(wx_path):
+        return storage_name, direct_path
+    for item in os.listdir(wx_path):
+        item_path = os.path.join(wx_path, item)
+        if os.path.isdir(item_path) and _memory_read_original_name(item_path, item) == chat_name:
+            return item, item_path
+    return storage_name, direct_path
 
 @app.route('/api/backup_now', methods=['POST'])
 @login_required
@@ -1624,7 +1626,13 @@ def memory_chats(wx_id):
         if not os.path.exists(wx_path):
             return jsonify({'status': 'success', 'chats': []})
         wx_abs = os.path.abspath(wx_path)
-        chats = [d for d in os.listdir(wx_path) if _safe_is_dir(wx_abs, d)]
+        chats = []
+        for d in os.listdir(wx_path):
+            if not _safe_is_dir(wx_abs, d):
+                continue
+            chat_path = os.path.join(wx_path, d)
+            display_name = _memory_read_original_name(chat_path, d)
+            chats.append({'name': display_name, 'storage_name': d})
         return jsonify({'status': 'success', 'chats': chats})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
@@ -1635,10 +1643,11 @@ def memory_data(wx_id, chat_name):
     """返回指定窗口的记忆数据（JSON 列表）"""
     try:
         dir_abs = os.path.abspath(os.path.join(MEMORY_BASE, wx_id))
+        _, chat_dir_normal = _memory_find_chat_dir(dir_abs, chat_name)
         if os.name == 'nt':
-            chat_dir = '\\\\?\\' + dir_abs + '\\' + chat_name
+            chat_dir = '\\\\?\\' + chat_dir_normal
         else:
-            chat_dir = os.path.join(dir_abs, chat_name)
+            chat_dir = chat_dir_normal
         if not os.path.exists(chat_dir):
             return jsonify({'status': 'success', 'messages': []})
         # 扫目录找实际的 *_memory.json 文件（Windows 可能截断目录名导致文件名与目录名不一致）
@@ -1646,7 +1655,7 @@ def memory_data(wx_id, chat_name):
         if not mem_files:
             return jsonify({'status': 'success', 'messages': []})
         if os.name == 'nt':
-            file_path = '\\\\?\\' + dir_abs + '\\' + chat_name + '\\' + mem_files[0]
+            file_path = '\\\\?\\' + chat_dir_normal + '\\' + mem_files[0]
         else:
             file_path = os.path.join(chat_dir, mem_files[0])
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -1677,10 +1686,11 @@ def memory_delete_chat(wx_id, chat_name):
     """删除指定窗口的记忆文件"""
     try:
         parent_abs = os.path.abspath(os.path.join(MEMORY_BASE, wx_id))
+        _, chat_path_normal = _memory_find_chat_dir(parent_abs, chat_name)
         if os.name == 'nt':
-            chat_path = '\\\\?\\' + parent_abs + '\\' + chat_name
+            chat_path = '\\\\?\\' + chat_path_normal
         else:
-            chat_path = os.path.join(parent_abs, chat_name)
+            chat_path = chat_path_normal
         if os.path.exists(chat_path):
             shutil.rmtree(chat_path)
         log('SUCCESS', f'已删除 {wx_id}/{chat_name} 的记忆')
@@ -1829,18 +1839,20 @@ def main():
         if not os.path.exists(CONFIG_FILE):
             default_config = {
                 "api_configs": [
-                    {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "gpt-5.4"},
-                    {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+                    {"sdk": "", "key": "", "url": "", "model": ""},
+                    {"sdk": "", "key": "", "url": "", "model": ""},
                 ],
                 "api_index": 0,
                 "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",
                 "admin": "文件传输助手",
                 "AllListen_switch": False,
                 "AllListen_filter_mute": True,
+                "chat_listen_only": False,
                 "listen_list": [],
                 "group": [],
                 "group_api_map": {},
                 "group_switch": False,
+                "group_listen_only": False,
                 "group_reply_at": False,
                 "group_reply_at_msg": True,
                 "group_reply_quote": False,

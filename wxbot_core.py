@@ -2,8 +2,8 @@
 # Siver微信机器人 siver_wxbot - 面向对象版本 - wxautox4版本
 # 作者：https://www.siver.top
 
-version = "V4.7.25"
-version_log = "V4.7.25 - 适配最新4.1.9.35客户端、优化自动通过好友备注设置、优化面板重启载入新按钮状态刷新"
+version = "V4.7.27"
+version_log = "V4.7.27 - 优化远程访问、关闭SESSION_COOKIE_HTTPONLY方便内外网访问、优化面板接口测试"
 
 # ============================================================
 # 标准库导入
@@ -13,6 +13,7 @@ import re
 import sys
 import time
 import json
+import hashlib
 import random
 import calendar
 import threading
@@ -160,6 +161,7 @@ class WXBotConfig:
 
         # ---------- 全局监听开关 ----------
         self.AllListen_switch = False   # True=黑名单模式，False=白名单模式
+        self.chat_listen_only = False    # 私聊只监听不 AI 回复
 
         # ---------- 用户与权限 ----------
         self.listen_list = []           # 白名单/黑名单用户列表
@@ -179,6 +181,7 @@ class WXBotConfig:
         self.group = []                 # 监听的群聊列表
         self.group_api_map = {}         # 群聊专属接口映射 {群名: api_index}
         self.group_switch = False       # 群机器人总开关
+        self.group_listen_only = False   # 群聊只监听不 AI 回复
         self.group_reply_at = False     # 群聊是否仅在被 @ 时才回复
         self.group_welcome = False      # 群新人欢迎语开关
         self.group_welcome_random = 1.0 # 群新人欢迎语触发概率（0.0~1.0）
@@ -270,18 +273,20 @@ class WXBotConfig:
             if not os.path.exists(self.CONFIG_FILE):
                 base_config = {
                     "api_configs": [
-                        {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "gpt-5.4"},
-                        {"sdk": "DusAPI", "key": "your-api-key", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+                        {"sdk": "", "key": "", "url": "", "model": ""},
+                        {"sdk": "", "key": "", "url": "", "model": ""},
                     ],
                     "api_index": 0,
                     "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",
                     "admin": "文件传输助手",
                     "AllListen_switch": False,
                     "AllListen_filter_mute": True,
+                    "chat_listen_only": False,
                     "listen_list": [],
                     "group": [],
                     "group_api_map": {},
                     "group_switch": False,
+                    "group_listen_only": False,
                     "group_reply_at": False,
                     "group_reply_at_msg": True,
                     "group_reply_quote": False,
@@ -444,16 +449,16 @@ class WXBotConfig:
         if 'api_configs' not in self.config and 'api_sdk' in self.config:
             self.config['api_configs'] = [
                 {
-                    'sdk':   self.config.get('api_sdk', 'DusAPI'),
+                    'sdk':   self.config.get('api_sdk', ''),
                     'key':   self.config.get('api_key', ''),
-                    'url':   self.config.get('base_url', 'https://api.dusapi.com'),
-                    'model': self.config.get('model1', 'gpt-5'),
+                    'url':   self.config.get('base_url', ''),
+                    'model': self.config.get('model1', ''),
                 },
                 {
-                    'sdk':   self.config.get('api_sdk', 'DusAPI'),
+                    'sdk':   self.config.get('api_sdk', ''),
                     'key':   self.config.get('api_key', ''),
-                    'url':   self.config.get('base_url', 'https://api.dusapi.com'),
-                    'model': self.config.get('model2', 'claude-sonnet-4-6'),
+                    'url':   self.config.get('base_url', ''),
+                    'model': self.config.get('model2', ''),
                 },
             ]
             self.config['api_index'] = 0
@@ -463,8 +468,8 @@ class WXBotConfig:
             log(message="旧 API 配置已自动迁移为新格式并保存")
 
         self.api_configs = self.config.get('api_configs', [
-            {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "gpt-5"},
-            {"sdk": "DusAPI", "key": "", "url": "https://api.dusapi.com", "model": "claude-sonnet-4-6"},
+            {"sdk": "", "key": "", "url": "", "model": ""},
+            {"sdk": "", "key": "", "url": "", "model": ""},
         ])
         self.api_index = self.config.get('api_index', 0)
         if self.api_index >= len(self.api_configs):
@@ -472,7 +477,7 @@ class WXBotConfig:
 
         # 从当前接口配置派生兼容属性（供 AI 接口类使用）
         _cur = self.api_configs[self.api_index] if self.api_configs else {}
-        self.api_sdk  = _cur.get('sdk', 'DusAPI')
+        self.api_sdk  = _cur.get('sdk', '')
         self.api_key  = _cur.get('key', '')
         self.base_url = _cur.get('url', '')
         self.model1   = _cur.get('model', '')
@@ -483,11 +488,13 @@ class WXBotConfig:
         self.listen_list          = self.config.get('listen_list', [])
         self.AllListen_switch     = self.config.get('AllListen_switch')
         self.AllListen_filter_mute = bool(self.config.get('AllListen_filter_mute', True))
+        self.chat_listen_only     = bool(self.config.get('chat_listen_only', False))
 
         # 群聊配置
         self.group                = self.config.get('group', [])
         self.group_api_map        = self.config.get('group_api_map', {})
         self.group_switch         = self.config.get('group_switch')
+        self.group_listen_only    = bool(self.config.get('group_listen_only', False))
         self.group_reply_at       = self.config.get('group_reply_at')
         self.group_reply_at_msg   = bool(self.config.get('group_reply_at_msg', True))
         self.group_reply_quote    = bool(self.config.get('group_reply_quote', False))
@@ -779,8 +786,15 @@ class MemoryManager:
     """
     对话记忆管理类
     按窗口分文件存储收发消息，并在 AI 请求时提供历史上下文。
-    存储路径：{base_path}/{wx_id}/{chat_name}/{chat_name}_memory.json
+    存储路径：{base_path}/{wx_id}/{storage_name}/{storage_name}_memory.json
     """
+
+    WINDOWS_RESERVED_NAMES = {
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    }
+    INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
     def __init__(self, wx_id, base_path):
         self.wx_id     = wx_id
@@ -792,11 +806,51 @@ class MemoryManager:
             self._locks[chat_name] = threading.Lock()
         return self._locks[chat_name]
 
+    @classmethod
+    def _is_windows_reserved_name(cls, name):
+        stem = name.split('.', 1)[0].upper()
+        return stem in cls.WINDOWS_RESERVED_NAMES
+
+    @staticmethod
+    def _hash_storage_name(name):
+        raw_name = str(name)
+        return "hash" + hashlib.sha256(raw_name.encode('utf-8')).hexdigest()
+
+    @classmethod
+    def _resolve_storage_name(cls, chat_name):
+        """
+        将微信窗口名转换为 Windows 可用的目录/文件名前缀。
+        非法符号直接剔除；剔除后为空或仍不适合作为 Windows 名称时使用 hash 前缀兜底。
+        """
+        raw_name = str(chat_name)
+        storage_name = cls.INVALID_FILENAME_CHARS_RE.sub('', raw_name)
+        storage_name = storage_name.strip().rstrip('. ')
+        if (
+            not storage_name
+            or storage_name in ('.', '..')
+            or cls._is_windows_reserved_name(storage_name)
+            or len(storage_name) > 120
+        ):
+            return cls._hash_storage_name(raw_name), True
+        return storage_name, storage_name != raw_name
+
+    @staticmethod
+    def _write_original_name(dir_path, chat_name):
+        name_path = os.path.join(dir_path, 'name.json')
+        try:
+            with open(name_path, 'w', encoding='utf-8') as f:
+                json.dump({"name": str(chat_name)}, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            log(level="WARNING", message=f"写入记忆原始名称记录失败: {e}")
+
     def _get_memory_path(self, chat_name):
         """返回记忆文件路径，并确保目录存在"""
-        dir_path = os.path.join(self.base_path, self.wx_id, chat_name)
+        storage_name, should_write_name = self._resolve_storage_name(chat_name)
+        dir_path = os.path.join(self.base_path, self.wx_id, storage_name)
         os.makedirs(dir_path, exist_ok=True)
-        return os.path.join(dir_path, f"{chat_name}_memory.json")
+        if should_write_name:
+            self._write_original_name(dir_path, chat_name)
+        return os.path.join(dir_path, f"{storage_name}_memory.json")
 
     @staticmethod
     def _normalize_message_time(message_time=None):
@@ -1962,8 +2016,6 @@ class WXBot:
         self._moments_like_next_time  = None    # 下次随机朋友圈点赞的触发时间（datetime 或 None）
         self._random_moments_state    = {}     # 随机定时朋友圈运行状态缓存 {task_id: state_dict}
         self._random_msg_state        = {}     # 随机定时消息运行状态缓存 {task_id: state_dict}
-        self._pause_chat_reply        = False  # 暂停私聊 AI 自动回复标志
-        self._pause_group_reply       = False  # 暂停群聊 AI 自动回复标志
         self.memory_manager      = None         # 记忆管理器（init_wx_listeners 时创建）
         self.all_Mode_listen_list = []           # 全局模式下的动态监听列表，元素格式：[昵称, 最新消息时间戳]
         self.start_time          = datetime.now()
@@ -2009,7 +2061,7 @@ class WXBot:
             log(level="WARNING", message=f"群组接口索引 {idx} 超出范围，回退到默认接口")
             return self.api
         cfg = configs[idx]
-        sdk = cfg.get('sdk', 'DusAPI')
+        sdk = cfg.get('sdk', '')
 
         # 轻量代理配置：仅覆盖接口相关字段，其余不涉及
         class _ApiProxy:
@@ -2109,6 +2161,140 @@ class WXBot:
     # 微信监听器初始化
     # ----------------------------------------------------------
 
+    def _listen_add_error(self, result):
+        """从 wxautox 添加监听返回值中提取错误信息，兼容 bool/dict 两类返回。"""
+        if isinstance(result, dict):
+            return result.get('message', str(result))
+        return str(result)
+
+    def _subwindow_who(self, chat):
+        """读取子窗口对象的 who 属性，读取失败时返回 None。"""
+        try:
+            return getattr(chat, 'who', None)
+        except Exception:
+            return None
+
+    def _try_get_all_subwindow_names(self):
+        """获取当前所有已监听子窗口名称集合，失败时返回 None。"""
+        try:
+            chats = self.wx.GetAllSubWindow()
+        except Exception as e:
+            log(level="ERROR", message=f"获取全部监听子窗口失败: {e}")
+            return None
+        if not chats:
+            return set()
+        return {who for who in (self._subwindow_who(chat) for chat in chats) if who}
+
+    def _get_all_subwindow_names(self):
+        """获取当前所有已监听子窗口名称集合。"""
+        listened_names = self._try_get_all_subwindow_names()
+        return listened_names if listened_names is not None else set()
+
+    def _get_verified_subwindow(self, nickname):
+        """通过 GetSubWindow 获取并校验单个监听子窗口。"""
+        try:
+            chat = self.wx.GetSubWindow(nickname=nickname)
+        except Exception as e:
+            log(level="WARNING", message=f"获取监听子窗口 {nickname} 失败: {e}")
+            return None
+        if chat and self._subwindow_who(chat) == nickname:
+            return chat
+        return None
+
+    def _add_listen_chat_once(self, nickname, label):
+        """执行一次 AddListenChat，并记录基础结果。"""
+        result = self.wx.AddListenChat(nickname=nickname, callback=self.message_handle_callback)
+        if result:
+            log(message=f"添加{label} {nickname} 监听完成")
+        else:
+            log(level="ERROR", message=f"添加{label} {nickname} 监听失败, {self._listen_add_error(result)}")
+        return result
+
+    def _verify_initial_listeners(self, expected_chats, retry_count=3):
+        """
+        初始化监听完成后，用 GetAllSubWindow 校验所有应监听对象。
+        未出现在子窗口列表中的对象最多重试 retry_count 次，仍失败则跳过实际监听。
+        """
+        expected = []
+        seen = set()
+        for nickname in expected_chats:
+            if nickname and nickname not in seen:
+                expected.append(nickname)
+                seen.add(nickname)
+        if not expected:
+            return
+
+        listened_names = self._get_all_subwindow_names()
+        missing = [nickname for nickname in expected if nickname not in listened_names]
+        if not missing:
+            log(message="初始化监听子窗口校验通过")
+            return
+
+        log(level="WARNING", message=f"初始化监听子窗口缺失，准备重试: {missing}")
+        for attempt in range(1, retry_count + 1):
+            for nickname in missing:
+                time.sleep(0.5)
+                self._add_listen_chat_once(nickname, "初始化重试")
+            listened_names = self._get_all_subwindow_names()
+            missing = [nickname for nickname in missing if nickname not in listened_names]
+            if not missing:
+                log(message=f"初始化监听子窗口重试第 {attempt} 次后校验通过")
+                return
+            log(level="WARNING", message=f"初始化监听子窗口第 {attempt} 次重试后仍缺失: {missing}")
+
+        log(level="ERROR", message=f"以下对象初始化监听重试失败，已跳过实际监听: {missing}")
+
+    def _add_and_verify_subwindow(self, nickname, retry_count=3):
+        """
+        添加单个监听并用 GetSubWindow 校验，返回校验成功的子窗口对象。
+        初次添加失败或未返回子窗口时再重试 retry_count 次。
+        """
+        total_attempts = retry_count + 1
+        for attempt in range(1, total_attempts + 1):
+            if attempt == 1:
+                log(message=f"{nickname} 不在动态监听列表，正在添加监听")
+            else:
+                log(level="WARNING", message=f"{nickname} 动态监听校验失败，正在进行第 {attempt - 1} 次重试")
+                time.sleep(0.5)
+
+            self._add_listen_chat_once(nickname, "动态监听")
+            sub_chat = self._get_verified_subwindow(nickname)
+            if sub_chat:
+                return sub_chat
+
+        log(level="ERROR", message=f"{nickname} 动态监听添加失败，重试 {retry_count} 次后仍未获取到子窗口，已跳过")
+        return None
+
+    def _remove_dynamic_listen_chat(self, chat):
+        """从全局模式动态监听列表中移除指定会话。"""
+        before_count = len(self.all_Mode_listen_list)
+        self.all_Mode_listen_list = [
+            listen_chat for listen_chat in self.all_Mode_listen_list
+            if listen_chat[0] != chat
+        ]
+        if len(self.all_Mode_listen_list) != before_count:
+            log(level="WARNING", message=f"{chat} 动态监听子窗口校验失败，已从动态监听列表移除")
+
+    def _remove_listen_chat_verified(self, nickname):
+        """移除监听后用 GetAllSubWindow 校验子窗口是否已消失。"""
+        try:
+            self.wx.RemoveListenChat(nickname)
+        except Exception as e:
+            log(level="ERROR", message=f"{nickname} 删除监听失败: {e}")
+            return False
+
+        time.sleep(0.2)
+        listened_names = self._try_get_all_subwindow_names()
+        if listened_names is None:
+            log(level="ERROR", message=f"{nickname} 删除监听后无法校验，保留在动态监听列表")
+            return False
+        if nickname not in listened_names:
+            log(message=f"{nickname} 删除监听校验通过")
+            return True
+
+        log(level="ERROR", message=f"{nickname} 删除监听校验失败，子窗口仍存在，保留在动态监听列表")
+        return False
+
     def init_wx_listeners(self):
         """
         初始化微信客户端及各类监听：
@@ -2152,34 +2338,27 @@ class WXBot:
         time.sleep(1)
         self.wx.StartListening()
 
+        expected_listeners = []
+
         # 添加管理员账号监听（管理员始终监听，不受白名单模式限制）
         time.sleep(0.5)
-        result = self.wx.AddListenChat(nickname=self.config.cmd, callback=self.message_handle_callback)
-        if result:
-            log(message=f"添加管理员 {self.config.cmd} 监听完成")
-        else:
-            log(level="ERROR", message=f"添加管理员 {self.config.cmd} 监听失败, {result['message']}")
+        self._add_listen_chat_once(self.config.cmd, "管理员")
+        expected_listeners.append(self.config.cmd)
 
         # 白名单模式下逐一添加用户监听
         if not self.config.AllListen_switch:
             log(message="白名单模式开启")
             for user in self.config.listen_list:
                 time.sleep(0.5)
-                result = self.wx.AddListenChat(nickname=user, callback=self.message_handle_callback)
-                if result:
-                    log(message=f"添加用户 {user} 监听完成")
-                else:
-                    log(level="ERROR", message=f"添加用户 {user} 监听失败, {result['message']}")
+                self._add_listen_chat_once(user, "用户")
+                expected_listeners.append(user)
 
         # 若群机器人开关开启，则添加群聊监听
         if self.config.group_switch:
             for user in self.config.group:
                 time.sleep(0.5)
-                result = self.wx.AddListenChat(nickname=user, callback=self.message_handle_callback)
-                if result:
-                    log(message=f"添加群组 {user} 监听完成")
-                else:
-                    log(level="ERROR", message=f"添加群组 {user} 监听失败, {result['message']}")
+                self._add_listen_chat_once(user, "群组")
+                expected_listeners.append(user)
 
         # 注册自定义转发监听（跳过已在私聊/群组列表中的来源，避免重复注册）
         if self.config.custom_forward_switch:
@@ -2196,11 +2375,10 @@ class WXBot:
             for _source in _fwd_sources:
                 if _source and _source not in _already_listened:
                     time.sleep(0.5)
-                    _res = self.wx.AddListenChat(nickname=_source, callback=self.message_handle_callback)
-                    if _res:
-                        log(message=f"添加自定义转发监听源 {_source} 完成")
-                    else:
-                        log(level="ERROR", message=f"添加自定义转发监听源 {_source} 失败")
+                    self._add_listen_chat_once(_source, "自定义转发监听源")
+                    expected_listeners.append(_source)
+
+        self._verify_initial_listeners(expected_listeners)
 
         # 注册定时消息任务（新版：支持多种重复类型）
         if self.config.scheduled_msg_switch:
@@ -2864,9 +3042,8 @@ class WXBot:
             
             if (self.config.AtMe in message.content and self.config.group_reply_at) \
                     or not self.config.group_reply_at:
-                # 群聊 AI 自动回复已暂停，继续接收消息但不回复
-                # log(level="DEBUG", message=f"[DEBUG] 群聊暂停标志：{self._pause_group_reply}，来源：{chat.who}")
-                if self._pause_group_reply:
+                if self.config.group_listen_only:
+                    log(message=f"群组 {chat.who} 已启用只监听不AI回复，跳过 AI 调用")
                     return result
                 # 去除消息中的 @ 标识后再传给 AI
                 content_without_at = re.sub(self.config.AtMe, "", message.content).strip()
@@ -3119,15 +3296,8 @@ class WXBot:
         :param message: 消息对象
         :return:        发送结果
         """
-        # 私聊 AI 自动回复已暂停（白名单/全局模式均适用），继续接收消息但不回复
-        # log(level="DEBUG", message=f"[DEBUG] 私聊暂停标志：{self._pause_chat_reply}，来源：{chat.who}")
-        if self._pause_chat_reply:
-            return True
         result = True
         user_key = self._get_reply_count_key(chat, message)
-        limit_handled, limit_result = self._check_chat_max_round_limit(chat, user_key)
-        if limit_handled:
-            return limit_result
 
         api_error_reply = False
         api_error_should_mark = False
@@ -3154,6 +3324,12 @@ class WXBot:
                         log(message=f"私聊 {chat.who} 关键字消息：" + message.content)
                         reply = self.config.keyword_dict[keyword]
             if not is_keyword:
+                if self.config.chat_listen_only:
+                    log(message=f"私聊 {chat.who} 已启用只监听不AI回复，跳过 AI 调用")
+                    return True
+                limit_handled, limit_result = self._check_chat_max_round_limit(chat, user_key)
+                if limit_handled:
+                    return limit_result
                 # 未命中关键词，调用 AI 接口（带入历史记忆）
                 history = []
                 if self.config.memory_switch and self.memory_manager:
@@ -3372,13 +3548,13 @@ class WXBot:
             )
         elif content == "/暂停恢复指令":
             result = chat.SendMsg(
-                '--- 暂停/恢复自动回复 ---\n'
-                '[/自动回复状态] 查看当前暂停状态\n'
-                '[/暂停私聊自动回复] 暂停私聊 AI 回复（全局模式下同时停止收新消息）\n'
-                '[/恢复私聊自动回复] 恢复私聊 AI 回复\n'
-                '[/暂停群聊自动回复] 暂停群聊 AI 回复\n'
-                '[/恢复群聊自动回复] 恢复群聊 AI 回复\n'
-                '⚠️ 暂停期间机器人仍在运行，仅屏蔽 AI 自动回复，方便人工接管'
+                '--- 只监听不 AI 回复 ---\n'
+                '[/自动回复状态] 查看当前只监听状态\n'
+                '[/暂停私聊自动回复] 开启私聊只监听不 AI 回复\n'
+                '[/恢复私聊自动回复] 关闭私聊只监听不 AI 回复\n'
+                '[/暂停群聊自动回复] 开启群聊只监听不 AI 回复\n'
+                '[/恢复群聊自动回复] 关闭群聊只监听不 AI 回复\n'
+                '开启后监听、记忆、关键词回复和自定义转发保持运行，仅停止调用 AI 接口自动回复'
             )
         elif content == "/图片识别指令":
             result = chat.SendMsg(
@@ -3472,24 +3648,24 @@ class WXBot:
             result = chat.SendMsg("回复延迟已关闭")
         # --- 暂停/恢复自动回复 ---
         elif content == "/暂停私聊自动回复":
-            self._pause_chat_reply = True
-            result = chat.SendMsg("私聊自动回复已暂停，机器人继续接收消息但不会 AI 回复，发送 /恢复私聊自动回复 恢复")
+            self.config.set_config('chat_listen_only', True)
+            result = chat.SendMsg("私聊已开启只监听不 AI 回复；监听、记忆、关键词回复和自定义转发保持运行。发送 /恢复私聊自动回复 可关闭")
         elif content == "/恢复私聊自动回复":
-            self._pause_chat_reply = False
-            result = chat.SendMsg("私聊自动回复已恢复")
+            self.config.set_config('chat_listen_only', False)
+            result = chat.SendMsg("私聊只监听不 AI 回复已关闭，私聊 AI 自动回复已恢复")
         elif content == "/暂停群聊自动回复":
-            self._pause_group_reply = True
-            result = chat.SendMsg("群聊自动回复已暂停，机器人继续接收消息但不会 AI 回复，发送 /恢复群聊自动回复 恢复")
+            self.config.set_config('group_listen_only', True)
+            result = chat.SendMsg("群聊已开启只监听不 AI 回复；监听、记忆、关键词回复和自定义转发保持运行。发送 /恢复群聊自动回复 可关闭")
         elif content == "/恢复群聊自动回复":
-            self._pause_group_reply = False
-            result = chat.SendMsg("群聊自动回复已恢复")
+            self.config.set_config('group_listen_only', False)
+            result = chat.SendMsg("群聊只监听不 AI 回复已关闭，群聊 AI 自动回复已恢复")
         elif content == "/自动回复状态":
-            chat_st  = "⏸ 已暂停" if self._pause_chat_reply  else "▶ 运行中"
-            group_st = "⏸ 已暂停" if self._pause_group_reply else "▶ 运行中"
+            chat_st  = "只监听不 AI 回复" if self.config.chat_listen_only else "AI 自动回复开启"
+            group_st = "只监听不 AI 回复" if self.config.group_listen_only else "AI 自动回复开启"
             result = chat.SendMsg(
                 f"--- 自动回复状态 ---\n"
-                f"私聊自动回复：{chat_st}\n"
-                f"群聊自动回复：{group_st}"
+                f"私聊：{chat_st}\n"
+                f"群聊：{group_st}"
             )
         elif content.startswith("/接口测试"):
             message_re = message
@@ -4166,11 +4342,19 @@ class WXBot:
         将指定会话加入全局动态监听列表，并向 wxautox 注册监听回调。
 
         :param chat: 会话昵称（字符串）
+        :return:     校验成功的子窗口对象；失败返回 None
         """
-        log(message=chat + ' 不在动态监听列表，正在添加进列表')
+        sub_chat = self._add_and_verify_subwindow(chat)
+        if not sub_chat:
+            return None
+
+        if self.is_chat_listened(chat):
+            return sub_chat
+
+        log(message=chat + ' 已添加监听，正在加入动态监听列表')
         self.all_Mode_listen_list.append([chat, time.time()])
         log(message='当前全局模式动态监听列表：' + str(self.all_Mode_listen_list))
-        self.wx.AddListenChat(nickname=chat, callback=self.message_handle_callback)
+        return sub_chat
 
     def is_chat_listened(self, chat):
         """
@@ -4208,11 +4392,17 @@ class WXBot:
                     if message.attr == 'friend':
                         new_msg = self.next_message_handle()
                         if not self.is_chat_listened(chat):
-                            self.add_chat_to_listen(chat)
+                            _sub_chat = self.add_chat_to_listen(chat)
                         else:
                             log(message=chat + '在监听列表')
+                            _sub_chat = self._get_verified_subwindow(chat)
+                            if not _sub_chat:
+                                self._remove_dynamic_listen_chat(chat)
                         for msg in new_msg:
-                            self.process_message(self.wx.GetSubWindow(nickname=chat), msg)
+                            if _sub_chat:
+                                self.process_message(_sub_chat, msg)
+                            else:
+                                log(level="ERROR", message=f"{chat} 未获取到子窗口，跳过本次消息处理")
 
         def process_listen_messages():
             """
@@ -4232,23 +4422,20 @@ class WXBot:
 
         def remove_timeout_listen(chat_time_out=600):
             """
-            移除超过指定时长未收到消息的监听会话（默认 3 分钟）。
+            移除超过指定时长未收到消息的监听会话（默认 10 分钟）。
             使用列表副本遍历，避免遍历时修改原列表导致跳过元素。
             """
             for listen_chat in self.all_Mode_listen_list[:]:  # 遍历副本，安全删除
                 if time.time() - listen_chat[1] >= chat_time_out:
                     log(message=str(listen_chat[0]) + '对话超时，正在删除监听')
-                    self.wx.RemoveListenChat(listen_chat[0])
-                    self.all_Mode_listen_list.remove(listen_chat)
+                    if self._remove_listen_chat_verified(listen_chat[0]):
+                        self.all_Mode_listen_list.remove(listen_chat)
 
         def get_next_new_message():
             """
             【当前启用】通过 GetNextNewMessage 获取新消息（V2 版本接口）。
             黑名单过滤后，仅处理 friend 类型的私聊消息。
             """
-            # 全局模式下私聊自动回复已暂停，直接跳过收消息
-            if self._pause_chat_reply:
-                return
             Next_callback_down_map = {}  # {msg.id: save_path}
             def Next_callback(msg):
                 nonlocal Next_callback_down_map
@@ -4332,11 +4519,16 @@ class WXBot:
                                 log(level="ERROR", message=f"自定义转发处理出错: {_fwd_e}")
                         
                         if not self.is_chat_listened(chat):
-                            self.add_chat_to_listen(chat)
+                            _sub_chat = self.add_chat_to_listen(chat)
                         else:
                             log(message=chat + '在监听列表')
-                        _sub_chat = self.wx.GetSubWindow(nickname=chat)
-                        self.process_message(_sub_chat, msg)
+                            _sub_chat = self._get_verified_subwindow(chat)
+                            if not _sub_chat:
+                                self._remove_dynamic_listen_chat(chat)
+                        if _sub_chat:
+                            self.process_message(_sub_chat, msg)
+                        else:
+                            log(level="ERROR", message=f"{chat} 未获取到子窗口，跳过本次消息处理")
 
         # ---- 全局监听模式主流程 ----
         # 当前仅启用 get_next_new_message（混合模式中的新消息拉取）
@@ -4386,7 +4578,9 @@ class WXBot:
             "api_total":          len(self.config.api_configs),
             "listen_mode":        "黑名单" if self.config.AllListen_switch else "白名单",
             "listen_count":       len(self.config.listen_list),
+            "chat_listen_only":   self.config.chat_listen_only,
             "group_switch":       self.config.group_switch,
+            "group_listen_only":  self.config.group_listen_only,
             "group_count":        len(self.config.group),
             "msg_received":       self.msg_received_count,
             "msg_replied":        self.msg_replied_count,
@@ -4407,8 +4601,8 @@ class WXBot:
             "chat_max_round_switch": self.config.chat_max_round_switch,
             "chat_max_round_default": self.config.chat_max_round_default,
             "chat_max_round_reset_days": self.config.chat_max_round_reset_days,
-            "pause_chat_reply":      self._pause_chat_reply,
-            "pause_group_reply":     self._pause_group_reply,
+            "pause_chat_reply":      self.config.chat_listen_only,
+            "pause_group_reply":     self.config.group_listen_only,
         }
 
     def stop_wxbot(self):
@@ -4465,6 +4659,8 @@ class WXBot:
             log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.35")
             log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.35")
             log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.7 ~ 4.1.9.35")
+            log(level="ERROR", message=str(e) + "\n 若以上情况都检查完没有问题，那大概率为wx本身或者windows系统不稳定导致的，重启程序即可，若是一直这样，如果您是虚拟机就请分配更多性能，若是实体机可以联系作者询问")
+            log(level="ERROR", message=str(e) + "\n 若以上情况都检查完没有问题，那大概率为wx本身或者windows系统不稳定导致的，重启程序即可，若是一直这样，如果您是虚拟机就请分配更多性能，若是实体机可以联系作者询问")
             self.run_flag = False
 
         # 主循环
