@@ -54,9 +54,9 @@ def format_expired_at(ts: int | None) -> str:
 
 def format_reply(result: ClaimResult) -> str:
     if result.status == "success":
-        return f"签到成功 ✅\n今天给你抽到：{result.display_amount} {result.display_unit}\n兑换码：{result.code}\n有效期到：{format_expired_at(result.expired_at)}（北京时间）"
+        return f"签到成功 ✅\n今天给你抽到：{result.display_amount} {result.display_unit}\n兑换码：{result.code}\n早八前有效哦。\n登录松 Key，在钱包管理页面兑换。"
     if result.status == "already_claimed":
-        return f"你今天已经领过啦 ✅\n额度：{result.display_amount} {result.display_unit}\n兑换码：{result.code}\n有效期到：{format_expired_at(result.expired_at)}（北京时间）"
+        return "你今天已经领过啦 ✅"
     if result.status == "no_code":
         return "今天的兑换码暂时领完了，等补码后再来试一下。"
     return "签到暂时失败了，稍后再试一下。"

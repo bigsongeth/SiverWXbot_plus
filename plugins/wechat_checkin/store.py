@@ -103,7 +103,7 @@ class CheckinStore:
         now = now or datetime.now(TZ)
         if now.tzinfo is None:
             now = now.replace(tzinfo=TZ)
-        claim_date = now.astimezone(TZ).date().isoformat()
+        claim_date = now.astimezone(timezone.utc).date().isoformat()
         now_iso = now.astimezone(TZ).isoformat(timespec="seconds")
         now_ts = int(now.timestamp())
         con = self.connect()
