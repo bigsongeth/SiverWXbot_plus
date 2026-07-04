@@ -211,8 +211,13 @@ def _forward_material(chat, msg, cfg, sender, session) -> bool:
         part = targets[i:i + chunk_size]
         try:
             result = msg.forward(part)
-            success = bool(result)
-            err = "" if success else _wxresponse_message(result)
+            # wxautox4 40.1.15 实测：成功时返回 None（与文档的 WxResponse 不符），
+            # 失败时抛异常或返回 falsy WxResponse（带 message）
+            if result is None:
+                success, err = True, ""
+            else:
+                success = bool(result)
+                err = "" if success else _wxresponse_message(result)
         except Exception as e:
             success, err = False, str(e)
         if success:
