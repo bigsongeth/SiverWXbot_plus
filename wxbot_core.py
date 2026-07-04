@@ -2934,6 +2934,13 @@ class WXBot:
                             log(message=chat.who + " 对话最新消息时间已更新")
                             listen_chat[1] = time.time()
                             break
+                # ncc_community plugin hook: 管理群转发/关键词拉群，业务逻辑见 plugins/ncc_community/
+                try:
+                    from plugins.ncc_community import handle_friend_message
+                    if handle_friend_message(self, chat, msg):
+                        return
+                except Exception as _ncc_err:
+                    log(level="ERROR", message=f"ncc_community plugin error: {_ncc_err}")
                 result = self.process_message(chat, msg)
                 # 自定义规则转发处理（在普通消息处理完成后执行，不影响原有流程）
                 if self.config.custom_forward_switch:
@@ -2948,8 +2955,15 @@ class WXBot:
                     )
 
             elif msg.attr == "system":
+                # ncc_community plugin hook: 分群迎新卡片（命中后跳过全局欢迎语，避免重复欢迎）
+                _ncc_welcomed = False
+                try:
+                    from plugins.ncc_community import handle_system_message
+                    _ncc_welcomed = handle_system_message(self, chat, msg)
+                except Exception as _ncc_err:
+                    log(level="ERROR", message=f"ncc_community plugin error: {_ncc_err}")
                 # 系统消息：触发群新人欢迎语逻辑（仅限已配置群组，纯转发来源群组跳过）
-                if self.config.group_welcome and chat.who in self.config.group:
+                if not _ncc_welcomed and self.config.group_welcome and chat.who in self.config.group:
                     result = self.send_group_welcome_msg(chat, msg)
                     if not result:
                         self.is_err(
@@ -2958,6 +2972,13 @@ class WXBot:
                         )
 
             elif msg.attr == "self":
+                # ncc_community plugin hook: 机器人账号自己在管理群发的消息也当指令（手机端操作场景）
+                try:
+                    from plugins.ncc_community import handle_self_message
+                    if handle_self_message(self, chat, msg):
+                        return
+                except Exception as _ncc_err:
+                    log(level="ERROR", message=f"ncc_community plugin error: {_ncc_err}")
                 # 自己账号同步过来的消息（如从手机向文件传输助手发送指令）
                 # 仅当当前窗口与管理员配置匹配时才作为指令处理
                 if chat.who == self.config.cmd:
