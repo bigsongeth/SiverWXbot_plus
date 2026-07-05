@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<!-- ncc_kb 插件独立配置页。独立文件，不改上游 dashboard.html，合并零冲突。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>知识库开关 · SiverWXbot</title>
+  <style>
+    :root { --bg:#f5f6f8; --card:#fff; --line:#e5e7eb; --text:#1f2328; --muted:#6b7280; --brand:#0d9488; --brand-d:#0f766e; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }
+    .wrap { max-width:760px; margin:0 auto; padding:28px 20px 60px; }
+    .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+    h1 { font-size:20px; margin:0; }
+    .back { color:var(--brand); text-decoration:none; font-size:14px; }
+    .sub { color:var(--muted); font-size:13px; margin:0 0 20px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; margin-bottom:16px; }
+    .card h2 { font-size:15px; margin:0 0 4px; }
+    .card .hint { color:var(--muted); font-size:12.5px; margin:0 0 14px; }
+    .row { display:flex; align-items:center; gap:10px; padding:9px 10px; border:1px solid var(--line); border-radius:9px; margin-bottom:8px; background:#fafafa; }
+    .row label { flex:1; cursor:pointer; word-break:break-all; }
+    .switch { position:relative; width:44px; height:24px; flex:none; }
+    .switch input { opacity:0; width:0; height:0; }
+    .slider { position:absolute; inset:0; background:#cbd5e1; border-radius:24px; transition:.2s; cursor:pointer; }
+    .slider:before { content:""; position:absolute; width:18px; height:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+    .switch input:checked + .slider { background:var(--brand); }
+    .switch input:checked + .slider:before { transform:translateX(20px); }
+    textarea, input[type=text] { width:100%; border:1px solid var(--line); border-radius:9px; padding:9px 11px; font-size:14px; font-family:inherit; color:var(--text); }
+    textarea { min-height:88px; resize:vertical; }
+    .grid { display:grid; grid-template-columns:120px 1fr; gap:10px 12px; align-items:center; }
+    .grid span { color:var(--muted); font-size:13px; }
+    details { margin-top:6px; }
+    summary { cursor:pointer; color:var(--muted); font-size:13px; user-select:none; }
+    .bar { position:sticky; bottom:0; background:linear-gradient(transparent,var(--bg) 30%); padding:16px 0 4px; display:flex; gap:12px; align-items:center; }
+    button { background:var(--brand); color:#fff; border:0; border-radius:9px; padding:11px 22px; font-size:15px; cursor:pointer; }
+    button:hover { background:var(--brand-d); }
+    button.ghost { background:#eef2f5; color:var(--text); }
+    #msg { font-size:13.5px; }
+    .ok { color:var(--brand-d); } .err { color:#dc2626; }
+    .empty { color:var(--muted); font-size:13px; padding:6px 2px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>🧠 知识库开关</h1>
+      <a class="back" href="/dashboard">← 返回面板</a>
+    </div>
+    <p class="sub">选择哪些群聊 / 私聊接入 NCC 知识库。开启后，该会话的 AI 回答会走知识库（自动判定 NCC 话题、命中才检索），并套用 NCC 肥肉人设；关闭则回到该会话原本的接口与人设。改动下一条消息即生效，无需重启。</p>
+
+    <div class="card">
+      <h2>群聊</h2>
+      <p class="hint">下面是机器人当前监听的群。打开开关即接入知识库。</p>
+      <div id="groups"><div class="empty">加载中…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>私聊</h2>
+      <p class="hint">填入要接入知识库的私聊对象（备注名 / 昵称，与微信里显示的一致），每行一个。</p>
+      <textarea id="chats" placeholder="张三&#10;李四"></textarea>
+    </div>
+
+    <div class="card">
+      <details>
+        <summary>高级设置（知识库端点 / 人设，一般不用改）</summary>
+        <div class="grid" style="margin-top:12px;">
+          <span>人设 prompt</span><input type="text" id="prompt_name" placeholder="NCC肥肉">
+          <span>端点 URL</span><input type="text" id="ep_url" placeholder="http://100.71.182.5:8434">
+          <span>模型名</span><input type="text" id="ep_model" placeholder="ncc-kb">
+          <span>SDK</span><input type="text" id="ep_sdk" placeholder="DusAPI">
+          <span>Key</span><input type="text" id="ep_key" placeholder="ncc-local">
+        </div>
+      </details>
+    </div>
+
+    <div class="bar">
+      <button id="save">保存</button>
+      <button class="ghost" onclick="location.reload()">重新加载</button>
+      <span id="msg"></span>
+    </div>
+  </div>
+
+  <script>
+    let CFG = null;
+    function esc(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+    async function load() {
+      const r = await fetch('/ncc_kb/config');
+      const d = await r.json();
+      if (d.status !== 'success') { document.getElementById('msg').innerHTML = '<span class="err">加载失败：'+esc(d.message||'')+'</span>'; return; }
+      CFG = d.config;
+      const enabled = new Set(CFG.enabled_groups || []);
+      const gc = document.getElementById('groups');
+      const groups = d.candidate_groups || [];
+      if (!groups.length) { gc.innerHTML = '<div class="empty">机器人还没有监听任何群（先在主面板配置群聊）。</div>'; }
+      else {
+        gc.innerHTML = groups.map((g,i) =>
+          '<div class="row"><label for="g'+i+'">'+esc(g)+'</label>'+
+          '<span class="switch"><input type="checkbox" id="g'+i+'" data-name="'+esc(g)+'"'+(enabled.has(g)?' checked':'')+'><span class="slider"></span></span></div>'
+        ).join('');
+      }
+      document.getElementById('chats').value = (CFG.enabled_chats || []).join('\n');
+      document.getElementById('prompt_name').value = CFG.prompt_name || '';
+      const ep = CFG.endpoint || {};
+      document.getElementById('ep_url').value = ep.url || '';
+      document.getElementById('ep_model').value = ep.model || '';
+      document.getElementById('ep_sdk').value = ep.sdk || '';
+      document.getElementById('ep_key').value = ep.key || '';
+    }
+
+    document.getElementById('save').onclick = async () => {
+      const groups = [...document.querySelectorAll('#groups input:checked')].map(x => x.dataset.name);
+      const chats = document.getElementById('chats').value.split('\n').map(s=>s.trim()).filter(Boolean);
+      const payload = {
+        enabled_groups: groups,
+        enabled_chats: chats,
+        prompt_name: document.getElementById('prompt_name').value.trim(),
+        endpoint: {
+          url: document.getElementById('ep_url').value.trim(),
+          model: document.getElementById('ep_model').value.trim(),
+          sdk: document.getElementById('ep_sdk').value.trim(),
+          key: document.getElementById('ep_key').value.trim()
+        }
+      };
+      const msg = document.getElementById('msg');
+      msg.textContent = '保存中…';
+      try {
+        const r = await fetch('/ncc_kb/save', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+        const d = await r.json();
+        msg.innerHTML = d.status==='success' ? '<span class="ok">✓ '+esc(d.message)+'</span>' : '<span class="err">✗ '+esc(d.message||'保存失败')+'</span>';
+      } catch(e) { msg.innerHTML = '<span class="err">✗ '+esc(e.message)+'</span>'; }
+    };
+
+    load();
+  </script>
+</body>
+</html>

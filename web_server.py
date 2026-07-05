@@ -1491,6 +1491,58 @@ def test_webhook():
         log('ERROR', f'测试 Webhook 失败: {e}')
         return jsonify({'status': 'error', 'message': str(e)})
 
+@app.route('/ncc_kb')
+@login_required
+def ncc_kb_page():
+    """知识库开关独立配置页（ncc_kb 插件）。独立模板，避免改上游 dashboard.html。"""
+    return render_template('ncc_kb.html')
+
+
+@app.route('/ncc_kb/config')
+@login_required
+def ncc_kb_get_config():
+    """返回知识库开关配置 + 候选群列表（供页面渲染勾选框）。"""
+    try:
+        from plugins.ncc_kb import get_config
+        cfg = get_config()
+        candidate_groups = []
+        base = read_config()
+        if base and isinstance(base.get('group'), list):
+            candidate_groups = base['group']
+        return jsonify({'status': 'success', 'config': cfg, 'candidate_groups': candidate_groups})
+    except Exception as e:
+        log('ERROR', f'读取知识库开关配置失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+@app.route('/ncc_kb/save', methods=['POST'])
+@login_required
+def ncc_kb_save_config():
+    """保存知识库开关配置（启用群/私聊列表 + 可选端点/人设）。"""
+    try:
+        from plugins.ncc_kb import get_config, save_config
+        data = request.get_json() or {}
+        cfg = get_config()
+        if isinstance(data.get('enabled_groups'), list):
+            cfg['enabled_groups'] = [str(x).strip() for x in data['enabled_groups'] if str(x).strip()]
+        if isinstance(data.get('enabled_chats'), list):
+            cfg['enabled_chats'] = [str(x).strip() for x in data['enabled_chats'] if str(x).strip()]
+        if isinstance(data.get('prompt_name'), str) and data['prompt_name'].strip():
+            cfg['prompt_name'] = data['prompt_name'].strip()
+        if isinstance(data.get('endpoint'), dict):
+            ep = cfg.get('endpoint', {})
+            for k in ('sdk', 'url', 'key', 'model'):
+                if k in data['endpoint'] and str(data['endpoint'][k]).strip():
+                    ep[k] = str(data['endpoint'][k]).strip()
+            cfg['endpoint'] = ep
+        save_config(cfg)
+        log('SUCCESS', f"知识库开关已更新：群 {len(cfg['enabled_groups'])} 个，私聊 {len(cfg['enabled_chats'])} 个")
+        return jsonify({'status': 'success', 'message': '知识库开关已保存（下一条消息即生效，无需重启）', 'config': cfg})
+    except Exception as e:
+        log('ERROR', f'保存知识库开关配置失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
 @app.route('/pick_image_file', methods=['GET'])
 @login_required
 def pick_image_file():

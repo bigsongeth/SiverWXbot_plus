@@ -1227,10 +1227,15 @@ class OpenAIAPI:
                 t = h.get('time', '')
                 raw = h.get('content', '')
                 sender = h.get('sender', '')
-                if role == 'user' and sender:
-                    content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
+                if role == 'user':
+                    if sender:
+                        content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
+                    else:
+                        content = f"[{t}] {raw}" if t else raw
                 else:
-                    content = f"[{t}] {raw}" if t else raw
+                    # assistant（本机器人自己过去的发言）喂纯内容：不加 [时间]/发送者前缀，
+                    # 否则模型会模仿该格式，把时间戳/发送者写进新回复里（时间戳外漏 bug）。
+                    content = raw
                 messages.append({"role": role, "content": content})
         if image_path or image_url:
             user_content = [
@@ -1721,6 +1726,7 @@ class DusAPI:
             )
 
         result_parts = []
+        reasoning_parts = []
 
         for raw_line in response.iter_lines(decode_unicode=True):
             if not raw_line:
@@ -1765,11 +1771,21 @@ class DusAPI:
                 if choices:
                     delta = choices[0].get("delta") or {}
                     # 优先取 content，其次取 reasoning_content（reasoning 模型兜底）
-                    text = delta.get("content") or delta.get("reasoning_content") or ""
-                    if text:
-                        result_parts.append(text)
+                    # 只把 content 收进正文；reasoning_content 是思考过程，单独收集，
+                    # 仅当整轮完全没有 content 时才兜底，避免思考混进回复发出去。
+                    piece = delta.get("content") or ""
+                    if piece:
+                        result_parts.append(piece)
+                    else:
+                        rc = delta.get("reasoning_content") or ""
+                        if rc:
+                            reasoning_parts.append(rc)
 
-        return "".join(result_parts)
+        text = "".join(result_parts)
+        if not text.strip() and reasoning_parts:
+            log(message="DusAPI GPT 流式：content 为空，改用 reasoning_content 兜底回复")
+            return "".join(reasoning_parts)
+        return text
 
     def chat(self, message, model=None, stream=True, prompt=None, history=None,
              image_path: str = "", image_url: str = ""):
@@ -2088,9 +2104,18 @@ class WXBot:
     def _get_group_api(self, group_name):
         """
         获取群聊对应的 AI 接口实例。
+        - 若该群开启了知识库（ncc_kb 插件），返回知识库接口
         - 若配置了 group_api_map 映射，则返回对应接口（惰性初始化并缓存）
         - 否则返回默认接口 self.api
         """
+        # ncc_kb plugin hook: 知识库开关（业务逻辑见 plugins/ncc_kb/）
+        try:
+            from plugins.ncc_kb import kb_api_for
+            _kb = kb_api_for(self, group_name, True)
+            if _kb is not None:
+                return _kb
+        except Exception as _kb_err:
+            log(level="ERROR", message=f"ncc_kb api hook error: {_kb_err}")
         raw = self.config.group_api_map.get(group_name)
         if raw is None:
             return self.api
@@ -2430,6 +2455,13 @@ class WXBot:
                 log(message="定时朋友圈注册完成")
             except Exception as e:
                 log(level="ERROR", message=f"定时朋友圈注册失败：{e}")
+
+        # ai_news_note 插件 hook：每日 AI 日报 -> 微信收藏笔记 -> 发群（逻辑在 plugins/ai_news_note）
+        try:
+            from plugins.ai_news_note import register_daily_note
+            register_daily_note(self, schedule)
+        except Exception as e:
+            log(level="ERROR", message=f"ai_news_note 注册失败：{e}")
 
         log(message="监听器初始化完成")
 
@@ -3173,7 +3205,15 @@ class WXBot:
         return result
 
     def _get_chat_api(self, user_name):
-        """获取私聊用户对应的 AI 接口实例（白名单模式查 chat_api_map，否则用默认接口）"""
+        """获取私聊用户对应的 AI 接口实例（知识库开关优先 > 白名单 chat_api_map > 默认接口）"""
+        # ncc_kb plugin hook: 私聊知识库开关（在全局模式下也生效，补齐上游的空缺）
+        try:
+            from plugins.ncc_kb import kb_api_for
+            _kb = kb_api_for(self, user_name, False)
+            if _kb is not None:
+                return _kb
+        except Exception as _kb_err:
+            log(level="ERROR", message=f"ncc_kb api hook error: {_kb_err}")
         if not self.config.AllListen_switch:
             idx = self.config.chat_api_map.get(user_name)
             if idx is not None:
@@ -3183,7 +3223,15 @@ class WXBot:
         return self.api
 
     def _get_chat_prompt(self, user_name):
-        """获取私聊用户对应的 prompt 内容（白名单模式查 chat_prompt_map，全局模式用 default_prompt）"""
+        """获取私聊用户对应的 prompt 内容（知识库开启时用 NCC 人设 > 白名单 chat_prompt_map > default_prompt）"""
+        # ncc_kb plugin hook
+        try:
+            from plugins.ncc_kb import kb_prompt_for
+            _kb_p = kb_prompt_for(self, user_name, False)
+            if _kb_p:
+                return _kb_p
+        except Exception as _kb_err:
+            log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
         if not self.config.AllListen_switch:
             name = self.config.chat_prompt_map.get(user_name) or self.config.default_prompt
         else:
@@ -3191,7 +3239,15 @@ class WXBot:
         return self.config.get_prompt_content(name)
 
     def _get_group_prompt(self, group_name):
-        """获取群组对应的 prompt 内容（查 group_prompt_map，未配置则用 default_prompt）"""
+        """获取群组对应的 prompt 内容（知识库开启时用 NCC 人设 > group_prompt_map > default_prompt）"""
+        # ncc_kb plugin hook
+        try:
+            from plugins.ncc_kb import kb_prompt_for
+            _kb_p = kb_prompt_for(self, group_name, True)
+            if _kb_p:
+                return _kb_p
+        except Exception as _kb_err:
+            log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
         name = self.config.group_prompt_map.get(group_name) or self.config.default_prompt
         return self.config.get_prompt_content(name)
 
@@ -4731,8 +4787,9 @@ class WXBot:
                         if not self.run_flag:
                             log(level="ERROR", message=str(e) + "\n全局模式出错！！请检查程序！！")
 
-                # ---- 定时任务执行（定时消息 / 定时朋友圈）----
-                if self.config.scheduled_msg_switch or self.config.scheduled_moments_switch:
+                # ---- 定时任务执行（定时消息 / 定时朋友圈 / ai_news_note 日报）----
+                if (self.config.scheduled_msg_switch or self.config.scheduled_moments_switch
+                        or getattr(self, '_ai_news_note_enabled', False)):
                     schedule.run_pending()
 
                 # ---- 随机定时朋友圈模块 ----
