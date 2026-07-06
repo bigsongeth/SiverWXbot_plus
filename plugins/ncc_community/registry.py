@@ -1,0 +1,216 @@
+# -*- coding: utf-8 -*-
+"""本地群登记表（registry.json）—— 引擎的地基。
+
+真相源是 Notion（人维护分组/权限），本模块是同步下来的运行时缓存，
+机器人的转发/发现/迎新都读它。数据由 notion_sync 写入、discovery 补充。
+
+数据结构：
+{
+  "synced_at": "2026-07-07T01:00:00",
+  "groupings": {                     # 转发分组（对应 Notion「转发群聊分组」）
+    "大理群": {"number": 4, "forward_enabled": true},
+    ...
+  },
+  "groups": {                        # 键 = 群当前名字（对应 Notion「群名」标题）
+    "NCC大理共居一家人👪": {
+      "name": "NCC大理共居一家人👪",  # 群当前名（寻址用，未打备注前）
+      "remark": "NCC大理共居一家人👪🐶", # 目标备注（打上后寻址用这个）
+      "remark_applied": false,        # 是否已在微信里打上🐶备注
+      "notion_page_id": "…",
+      "allow_forward": true,
+      "allow_speak": true,
+      "welcome_url": "",
+      "groupings": ["大理群"],
+      "status": "active",             # active=Notion 已归类；pending=新发现未归类
+      "last_seen": "2026-07-07T…"
+    }
+  }
+}
+
+寻址主键 target(g) = remark（已打备注）否则 name。这样 86 个存量群在打备注前
+仍能按当前名字转发，打上🐶后自动切到按备注寻址（群名再改也锁得住）。
+"""
+from __future__ import annotations
+
+import copy
+import json
+import os
+import threading
+from datetime import datetime
+
+DOG = "\U0001f436"  # 🐶
+
+_LOCK = threading.RLock()
+_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_DIR, "data")
+REGISTRY_PATH = os.path.join(DATA_DIR, "registry.json")
+
+_EMPTY = {"synced_at": None, "groupings": {}, "groups": {}}
+
+
+# ---------------------------------------------------------------- 读写
+
+def load() -> dict:
+    """读取登记表，文件不存在时返回空结构（不落盘，等首次 sync/discovery 再写）。"""
+    with _LOCK:
+        if not os.path.exists(REGISTRY_PATH):
+            return copy.deepcopy(_EMPTY)
+        try:
+            with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return copy.deepcopy(_EMPTY)
+        data.setdefault("groupings", {})
+        data.setdefault("groups", {})
+        return data
+
+
+def save(data: dict) -> None:
+    """原子化写入登记表。"""
+    with _LOCK:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp = REGISTRY_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, REGISTRY_PATH)
+
+
+# ---------------------------------------------------------------- 寻址
+
+def target(group: dict) -> str:
+    """一个群的寻址字符串：打了🐶备注用备注，否则用当前群名。"""
+    if group.get("remark_applied") and group.get("remark"):
+        return group["remark"]
+    return group.get("name", "")
+
+
+def match_key(group: dict):
+    """返回该群在微信里可能显示的名字集合（用于把 chat.who 匹配到登记表）。"""
+    keys = set()
+    if group.get("name"):
+        keys.add(group["name"])
+    if group.get("remark_applied") and group.get("remark"):
+        keys.add(group["remark"])
+    return keys
+
+
+# ---------------------------------------------------------------- 查询
+
+def find_by_chat_who(data: dict, chat_who: str):
+    """把一个实时 chat.who 匹配到登记表里的群（先精确名/备注，再宽松）。返回 (name, group) 或 (None, None)。"""
+    if not chat_who:
+        return None, None
+    for name, g in data.get("groups", {}).items():
+        if chat_who in match_key(g):
+            return name, g
+    return None, None
+
+
+def is_known(data: dict, chat_who: str) -> bool:
+    name, _ = find_by_chat_who(data, chat_who)
+    return name is not None
+
+
+def list_forward_groupings(data: dict):
+    """可用于转发的分组列表（forward_enabled 且至少含 1 个允许转发的群），
+    按 Notion 分组编号排序（无编号排最后）。返回 [(grouping_name, target_count)]。"""
+    result = []
+    for gname, ginfo in data.get("groupings", {}).items():
+        if not ginfo.get("forward_enabled", True):
+            continue
+        cnt = len(targets_for_grouping(data, gname))
+        if cnt > 0:
+            result.append((gname, ginfo.get("number"), cnt))
+    # 有编号的按编号升序，无编号(None)的排最后按名字
+    result.sort(key=lambda x: (x[1] is None, x[1] if x[1] is not None else 0, x[0]))
+    return [(name, cnt) for name, _num, cnt in result]
+
+
+def targets_for_grouping(data: dict, grouping_name: str):
+    """某分组下所有【允许转发】的群的寻址字符串列表。"""
+    out = []
+    for g in data.get("groups", {}).values():
+        if grouping_name in g.get("groupings", []) and g.get("allow_forward", False):
+            t = target(g)
+            if t:
+                out.append(t)
+    return out
+
+
+def get_group(data: dict, name: str):
+    return data.get("groups", {}).get(name)
+
+
+# ---------------------------------------------------------------- 变更
+
+def touch_last_seen(name: str) -> None:
+    """更新某群最近可见时间（发现已登记群说话时调用）。"""
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if g:
+            g["last_seen"] = datetime.now().isoformat(timespec="seconds")
+            save(data)
+
+
+def add_pending(name: str) -> dict:
+    """把一个新发现的群登记为 pending（未归类），返回该群条目。"""
+    with _LOCK:
+        data = load()
+        if name in data["groups"]:
+            return data["groups"][name]
+        g = {
+            "name": name,
+            "remark": name + DOG,
+            "remark_applied": False,
+            "notion_page_id": None,
+            "allow_forward": False,   # 未归类前默认不参与转发，安全
+            "allow_speak": False,
+            "welcome_url": "",
+            "groupings": [],
+            "status": "pending",
+            "last_seen": datetime.now().isoformat(timespec="seconds"),
+        }
+        data["groups"][name] = g
+        save(data)
+        return g
+
+
+def mark_remark_applied(name: str, remark: str) -> None:
+    """标记某群已打上🐶备注。"""
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if g:
+            g["remark"] = remark
+            g["remark_applied"] = True
+            save(data)
+
+
+def upsert_from_notion(groupings: dict, groups: dict) -> dict:
+    """用 Notion 拉取结果覆盖分组与群的【人管字段】，保留机器人管的字段
+    （remark_applied / last_seen / status=pending 的发现态）。返回合并后的登记表。"""
+    with _LOCK:
+        data = load()
+        data["groupings"] = groupings
+        merged = data.get("groups", {})
+        for name, incoming in groups.items():
+            old = merged.get(name, {})
+            # 人管字段以 Notion 为准
+            g = {
+                "name": name,
+                "remark": old.get("remark") or (name + DOG),
+                "remark_applied": old.get("remark_applied", False),   # 机器人管，保留
+                "notion_page_id": incoming.get("notion_page_id"),
+                "allow_forward": incoming.get("allow_forward", False),
+                "allow_speak": incoming.get("allow_speak", False),
+                "welcome_url": incoming.get("welcome_url", ""),
+                "groupings": incoming.get("groupings", []),
+                "status": "active",
+                "last_seen": old.get("last_seen"),
+            }
+            merged[name] = g
+        data["groups"] = merged
+        data["synced_at"] = datetime.now().isoformat(timespec="seconds")
+        save(data)
+        return data

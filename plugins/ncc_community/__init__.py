@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
-"""ncc_community 插件：NCC 社群自动化三件套。
+"""ncc_community 插件：NCC 社群自动化。
 
-- forward.py  管理群转发：管理群内指令驱动，把任意消息群发到一组群聊
-- welcome.py  分群迎新：新人进群发送定制欢迎语 + 在地化链接卡片
-- invite.py   关键词拉群：私聊/群聊命中关键词后把发送人拉进目标群
+- forward.py   管理群转发：菜单式指令，把任意消息群发到一组群聊（读 registry）
+- registry.py  本地群登记表：群/分组/权限，Notion 同步下来的运行时缓存
+- notion_sync  Notion 双向同步：拉分组/权限、回写新发现群
+- remark.py    干净打🐶备注（登记表标志幂等，避免 wxautox 追加坑）
+- discovery.py 被动发现：未登记群一说话 → 打备注 + 入 Notion 待归类 + 提醒
+- welcome.py   分群迎新：新人进群发欢迎语 + 在地化链接卡片
+- invite.py    关键词拉群：私聊/群聊命中关键词后把发送人拉进目标群
 
 权限模型：管理群（进群即管理员）替代旧协议的 wxid 白名单验证。
 wxbot_core.py 只保留三个最小 hook（friend/self/system 三个分支各一处），
@@ -18,7 +22,7 @@ from .welcome import handle_welcome
 
 
 def handle_friend_message(bot, chat, msg) -> bool:
-    """friend 消息入口：管理群走指令/转发，其他会话走拉群关键词。
+    """friend 消息入口：管理群走指令/转发；其他群旁路发现新群；私聊/群走拉群关键词。
 
     返回 True 表示已处理，核心应跳过后续 AI/转发流程。
     """
@@ -26,6 +30,14 @@ def handle_friend_message(bot, chat, msg) -> bool:
     who = str(getattr(chat, "who", "") or "")
     if who == cfg.get("admin_group"):
         return handle_admin_message(bot, chat, msg, cfg)
+
+    # 旁路：被动发现新群（不拦截正常流程，异常不外抛）
+    try:
+        from . import discovery
+        discovery.handle_discovery(bot, chat, msg, cfg)
+    except Exception:
+        pass
+
     return handle_invite(bot, chat, msg, cfg)
 
 
