@@ -4740,8 +4740,15 @@ class WXBot:
             log(level="ERROR", message=str(e) + "\n 若以上情况都检查完没有问题，那大概率为wx本身或者windows系统不稳定导致的，重启程序即可，若是一直这样，如果您是虚拟机就请分配更多性能，若是实体机可以联系作者询问")
             self.run_flag = False
 
+        # ui_watchdog plugin hook: 主循环心跳监控，wxautox UI 卡死时自动整进程重启
+        try:
+            from plugins.ui_watchdog import heartbeat as _wd_heartbeat, disarm as _wd_disarm
+        except Exception:
+            _wd_heartbeat = _wd_disarm = lambda: None
+
         # 主循环
         while self.run_flag:
+            _wd_heartbeat()
             try:
                 # ---- 离线检测模块（每 check_interval 次循环执行一次）----
                 check_counter += 1
@@ -4837,6 +4844,7 @@ class WXBot:
 
             time.sleep(wait_time)
 
+        _wd_disarm()
         log(level="WARNING", message='siver_wxbot主线程安全退出，正在退出监听...')
 
     def run(self):

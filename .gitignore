@@ -38,3 +38,6 @@ tests/
 *.log
 *.png
 
+
+# ui_watchdog 插件运行时数据（自启动标记、重启历史）
+plugins/ui_watchdog/data/

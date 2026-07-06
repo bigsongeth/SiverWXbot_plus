@@ -1248,6 +1248,36 @@ def stop_bot():
         log('WARNING', '状态：机器人未运行')
         return jsonify({'status': 'error', 'message': '机器人未运行'})
 
+def _watchdog_autostart_bot():
+    """ui_watchdog plugin hook: 看门狗整进程重启后自动拉起机器人（逻辑同 start_bot）"""
+    global bot_thread
+    if bot_thread and bot_thread.is_alive():
+        log('WARNING', '【看门狗】机器人已在运行，无需自动启动')
+        return
+
+    def run_bot():
+        pythoncom.CoInitialize()
+        global bot
+        try:
+            if bot:
+                try:
+                    bot.stop()
+                    log('INFO', '已清理上次残留的 WeChat 监听')
+                except Exception as _e:
+                    log('WARNING', f'清理旧监听时出错（可忽略）: {_e}')
+            bot = WXBot()
+            bot.run()
+        finally:
+            pythoncom.CoUninitialize()
+            _restore_sleep()
+    try:
+        bot_thread = threading.Thread(target=run_bot, daemon=True)
+        bot_thread.start()
+        _prevent_sleep()
+        log('SUCCESS', '【看门狗】面板重启完成，机器人已自动启动')
+    except Exception as e:
+        log('ERROR', f'【看门狗】自动启动机器人失败: {str(e)}')
+
 @app.route('/check_activate')
 @login_required
 def check_activate():
@@ -2005,6 +2035,14 @@ def main():
         webbrowser.open(f"http://127.0.0.1:{free_port}")
         # 定时启停
         time_start_stop()
+        # ui_watchdog plugin hook: 看门狗触发的重启，10 秒后自动拉起机器人
+        try:
+            from plugins.ui_watchdog import consume_autostart_flag
+            if consume_autostart_flag():
+                log('WARNING', '【看门狗】检测到自动重启标记，10 秒后自动启动机器人')
+                threading.Timer(10.0, _watchdog_autostart_bot).start()
+        except Exception as _wd_e:
+            log('ERROR', f'【看门狗】自启动检查失败: {_wd_e}')
         if siver_panel_manager is not None:
             siver_panel_manager.set_local_port_provider(get_panel_server_port)
             siver_panel_manager.start()
