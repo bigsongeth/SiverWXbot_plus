@@ -224,6 +224,27 @@ def mark_remark_applied(name: str, remark: str) -> None:
             save(data)
 
 
+def record_managed(name: str, page_id: str = None) -> None:
+    """记录一个群已纳管（打了🐶 + 可选 Notion page_id）。不存在则新建。
+    Phase 3 批量迁移用：微信里发现的群，无论库里有没有，都能落地登记。"""
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if not g:
+            g = {
+                "name": name, "remark": name + DOG, "remark_applied": False,
+                "notion_page_id": None, "allow_forward": False, "allow_speak": False,
+                "welcome_url": "", "groupings": [], "status": "pending",
+                "last_seen": datetime.now().isoformat(timespec="seconds"),
+            }
+            data["groups"][name] = g
+        g["remark"] = name + DOG
+        g["remark_applied"] = True
+        if page_id:
+            g["notion_page_id"] = page_id
+        save(data)
+
+
 def upsert_from_notion(groupings: dict, groups: dict) -> dict:
     """用 Notion 拉取结果覆盖分组与群的【人管字段】，保留机器人管的字段
     （remark_applied / last_seen / status=pending 的发现态）。返回合并后的登记表。"""
@@ -233,11 +254,12 @@ def upsert_from_notion(groupings: dict, groups: dict) -> dict:
         merged = data.get("groups", {})
         for name, incoming in groups.items():
             old = merged.get(name, {})
-            # 人管字段以 Notion 为准
+            # 人管字段以 Notion 为准；remark_applied 取「本地已标记 或 Notion 标题带🐶」
+            applied = old.get("remark_applied", False) or bool(incoming.get("notion_marked"))
             g = {
                 "name": name,
                 "remark": old.get("remark") or (name + DOG),
-                "remark_applied": old.get("remark_applied", False),   # 机器人管，保留
+                "remark_applied": applied,   # 机器人管 + Notion🐶标记兜底
                 "notion_page_id": incoming.get("notion_page_id"),
                 "allow_forward": incoming.get("allow_forward", False),
                 "allow_speak": incoming.get("allow_speak", False),

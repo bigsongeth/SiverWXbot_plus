@@ -29,6 +29,8 @@ def handle_friend_message(bot, chat, msg) -> bool:
     cfg = store.load()
     who = str(getattr(chat, "who", "") or "")
     if who == cfg.get("admin_group"):
+        if _try_batch(bot, chat, msg, cfg):
+            return True
         return handle_admin_message(bot, chat, msg, cfg)
 
     # 旁路：被动发现新群（不拦截正常流程，异常不外抛）
@@ -50,8 +52,27 @@ def handle_self_message(bot, chat, msg) -> bool:
     """
     cfg = store.load()
     if str(getattr(chat, "who", "") or "") == cfg.get("admin_group"):
+        if _try_batch(bot, chat, msg, cfg):
+            return True
         return handle_admin_message(bot, chat, msg, cfg)
     return False
+
+
+def _try_batch(bot, chat, msg, cfg) -> bool:
+    """管理群里的 Phase3 批量纳管指令（批量备注/预览/回写Notion）。命中返回 True。"""
+    if str(getattr(msg, "type", "") or "") != "text":
+        return False
+    content = str(getattr(msg, "content", "") or "").strip()
+    from .common import is_bot_reply
+    if not content or is_bot_reply(content):
+        return False
+    try:
+        from . import batch
+        return batch.handle_batch_command(bot, chat, cfg, content)
+    except Exception as e:
+        from .common import log
+        log("ERROR", f"批量指令出错: {e}")
+        return False
 
 
 def handle_system_message(bot, chat, msg) -> bool:
