@@ -32,12 +32,18 @@ class FakeMsg:
         self.type = mtype
         self.attr = attr
         self.sender = sender
-        self.forwarded = []
-        self.forward_ok = True
+        self.forwarded = []      # 记录每次 forward 的单个目标
+        self.forward_ok = True   # False 模拟视频号等转不了的消息
 
-    def forward(self, targets, **kw):
-        self.forwarded.append(list(targets))
-        return None if self.forward_ok else {"status": "失败", "message": "找不到"}
+    def forward(self, target, **kw):
+        # 新模型：一次只转一个群（单目标字符串）
+        self.forwarded.append(target)
+        # 成功 None；失败返回 falsy 的 WxResponse（模拟真实 __bool__）
+        return None if self.forward_ok else FakeWxResponse(False, "转发失败")
+
+
+ZERO_DELAY = {"group_min": 0, "group_max": 0, "batch_every": 10, "batch_min": 0,
+              "batch_max": 0, "msg_min": 0, "msg_max": 0, "max_retries": 1}
 
 
 class FakeWx:
@@ -159,29 +165,89 @@ class EngineTest(unittest.TestCase):
 
     # ---------- forward 菜单 ----------
 
-    def test_menu_flow(self):
+    def _drain(self):
+        """同步执行队列里的群发任务（零延迟）。"""
+        while not forward._QUEUE.empty():
+            task = forward._QUEUE.get()
+            task["delay"] = dict(ZERO_DELAY)
+            forward._deliver(task)
+            forward._QUEUE.task_done()
+
+    def test_menu_collect_then_send_flow(self):
         seed_registry()
         # 发“转发” → 菜单
         handle_friend_message(self.bot, self.admin, FakeMsg("转发"))
         self.assertIn("大理群", self.admin.sent[-1])
         self.assertIn("1.", self.admin.sent[-1])
-        # 回“1” → 开始会话
+        # 回“1” → 进入收集模式（不立即转发）
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
-        self.assertIn("开始转发到「大理群」", self.admin.sent[-1])
-        self.assertIsNotNone(forward._get_session("大松"))
-        # 发素材 → 转发到 2 个允许转发的群
-        mat = FakeMsg("[图片]", mtype="image")
-        handle_friend_message(self.bot, self.admin, mat)
-        self.assertEqual(set(mat.forwarded[0]), {"大理A群", "大理B群"})
-        self.assertIn("已转发到 2 个群", self.admin.sent[-1])
-        # 结束
-        handle_friend_message(self.bot, self.admin, FakeMsg("结束"))
-        self.assertIn("成功 2", self.admin.sent[-1])
+        self.assertIn("已进入转发到「大理群」", self.admin.sent[-1])
+        session = forward._get_session("大松")
+        self.assertIsNotNone(session)
+        # 发两条素材 → 只收集，不转发
+        m1 = FakeMsg("[图片]", mtype="image")
+        m2 = FakeMsg("正文", mtype="text")
+        handle_friend_message(self.bot, self.admin, m1)
+        handle_friend_message(self.bot, self.admin, m2)
+        self.assertEqual(m1.forwarded, [])            # 收集阶段不转发
+        self.assertEqual(len(forward._get_session("大松")["messages"]), 2)
+        self.assertIn("已收集 2 条", self.admin.sent[-1])
+        # 发“发送” → 入队 + 会话清除
+        handle_friend_message(self.bot, self.admin, FakeMsg("发送"))
+        self.assertIsNone(forward._get_session("大松"))
+        self.assertIn("开始把 2 条群发", self.admin.sent[-1])
+        # 执行队列：每条消息分别转发到 2 个群（一群一群，共 4 次）
+        self._drain()
+        self.assertEqual(sorted(m1.forwarded), ["大理A群", "大理B群"])
+        self.assertEqual(sorted(m2.forwarded), ["大理A群", "大理B群"])
+        report = " ".join(m for _, m in self.bot.wx.sent)
+        self.assertIn("群发完成", report)
 
-    def test_direct_forward_command(self):
+    def test_direct_forward_command_enters_collect(self):
         seed_registry()
         handle_friend_message(self.bot, self.admin, FakeMsg("转发 大理群"))
-        self.assertIn("开始转发到「大理群」", self.admin.sent[-1])
+        self.assertIn("已进入转发到「大理群」", self.admin.sent[-1])
+        self.assertIsNotNone(forward._get_session("大松"))
+
+    def test_cancel_collect(self):
+        seed_registry()
+        handle_friend_message(self.bot, self.admin, FakeMsg("转发 大理群"))
+        handle_friend_message(self.bot, self.admin, FakeMsg("取消"))
+        self.assertIsNone(forward._get_session("大松"))
+
+    def test_send_without_content(self):
+        seed_registry()
+        handle_friend_message(self.bot, self.admin, FakeMsg("转发 大理群"))
+        handle_friend_message(self.bot, self.admin, FakeMsg("发送"))
+        self.assertIn("还没收集到内容", self.admin.sent[-1])
+        self.assertIsNotNone(forward._get_session("大松"))  # 仍在收集
+
+    def test_deliver_one_group_at_a_time_no_multiselect(self):
+        # 5 个群，验证每次 forward 只传 1 个群（绕开 9 限制）
+        seed_registry()
+        big = {f"群{i}": {"notion_page_id": f"p{i}", "allow_forward": True,
+               "allow_speak": True, "welcome_url": "", "groupings": ["大组"]} for i in range(5)}
+        registry.upsert_from_notion({"大组": {"number": 1, "forward_enabled": True}}, big)
+        m = FakeMsg("素材", mtype="text")
+        task = {"bot": self.bot, "admin": ADMIN, "messages": [m],
+                "targets": [f"群{i}" for i in range(5)], "grouping": "大组", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["ok"], 5)
+        self.assertEqual(sorted(m.forwarded), sorted(f"群{i}" for i in range(5)))
+
+    def test_deliver_unforwardable_skipped_after_two_groups(self):
+        # 模拟视频号：forward 一直失败 → 前 2 群试过后判死，后续群跳过
+        seed_registry()
+        vid = FakeMsg("[视频号]", mtype="link"); vid.forward_ok = False
+        targets = [f"群{i}" for i in range(6)]
+        task = {"bot": self.bot, "admin": ADMIN, "messages": [vid],
+                "targets": targets, "grouping": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["dead"], [0])
+        # 只在前 2 个群尝试过（每群 max_retries=1 次），后 4 群跳过
+        self.assertEqual(len(vid.forwarded), 2)
+        report = " ".join(m for _, m in self.bot.wx.sent)
+        self.assertIn("全程转发失败", report)
 
     def test_menu_number_out_of_range(self):
         seed_registry()

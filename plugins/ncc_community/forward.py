@@ -1,60 +1,174 @@
 # -*- coding: utf-8 -*-
-"""管理群转发与管理指令 —— 引擎的②（菜单式转发）。
+"""管理群转发与管理指令 —— 引擎的②（收集后群发，照搬旧 WCRobot 模型）。
 
-核心交互（都在管理群内，群成员即管理员）：
+核心交互（都在指令群内，群成员即管理员）：
 
-    转发            -> 机器人回带编号的分组菜单
-    3               -> 选第 3 个分组，进入收集模式
-    <任意消息若干条>  -> 每条实时 msg.forward() 到该分组所有【允许转发】的群
-    结束             -> 退出并汇报
+    转发              -> 机器人回带编号的分组菜单
+    3                 -> 选第 3 个分组，进入【收集模式】
+    <消息一条条发>     -> 全部攒起来（不立即转发）
+    发送              -> 后台队列开始逐群群发
+    取消              -> 放弃
 
-分组与权限来自 Notion（同步到本地 registry），不在群里维护——发「同步」即时拉取。
-收集会话按发送人隔离，多位管理员可同时各转各的。
-机器人自己的回复带 REPLY_PREFIX，指令层忽略，避免自触发。
+为什么不"来一条转一条"、不"一次多目标 forward"：
+- 旧系统走协议、无 UI 限制；wxauto 是 UI 自动化，`msg.forward([多个群])` 会撞
+  微信"多选转发"最多 9 个的上限。
+- 所以这里改成【一群一群发】：对每个群 `msg.forward(单个群)`，彻底绕开 9 限制；
+  并照搬旧系统的防风控延迟（群间 3-5s、每 10 群额外 5-10s、消息间 1-2s、重试 3 次）。
+- 群发很慢（几十群×几条要几分钟），所以放【后台线程】跑，收集/接收消息不被阻塞。
+- ⚠️视频号卡片 wxauto 转不了（协议能、UI 不能），发送时会识别失败并在汇报里列出。
+
+分组与权限来自 Notion（同步到本地 registry），发「同步」即时拉取。
 """
 from __future__ import annotations
 
 import re
 import time
+import random
 import threading
+from queue import Queue
 
 from . import store, registry
 from .common import REPLY_PREFIX, is_bot_reply, log, reply
 
-# 收集会话：sender -> {"grouping", "targets", "last_active", "ok", "fail"}
+# 收集会话：sender -> {"grouping","targets","messages":[msg...],"last_active"}
 _SESSIONS = {}
-# 待选菜单：sender -> {"menu": [分组名...], "ts": t}
+# 待选菜单：sender -> {"menu":[分组名...],"ts":t}
 _PENDING_MENU = {}
 _STATE_LOCK = threading.Lock()
 
-# 主窗口操作锁（打备注/检查群组会切主窗口，避免并发互踩）
+# 主窗口操作锁：每次 forward 单独加锁，间隔延迟时释放，让监听线程能插空收消息
 MAIN_WINDOW_LOCK = threading.Lock()
 
-MENU_TTL = 120  # 菜单待选有效期（秒）
+MENU_TTL = 120          # 菜单待选有效期（秒）
+SESSION_TTL = 600       # 收集会话闲置超时（秒）
 
-HELP_TEXT = """肥肉管理指令（本群成员即管理员）：
-【转发】
-  转发            列出分组菜单，回复编号即可开始
-  转发 <分组名>    直接开始转发到该分组
-  结束 / 取消      结束本次转发
-【查看】
-  分组列表         查看所有转发分组及群数
-  待归类           查看新发现、待你在 Notion 归类的群
-  同步             立刻从 Notion 拉取最新分组/权限
-  检查群组 <分组>   逐群试连通并汇报
-【拉群关键词】
-  拉群列表 / 设拉群 <关键词>|<目标群> / 删拉群 <关键词>
-【迎新】
-  迎新列表 / 开迎新 <群名> / 关迎新 <群名>
-  设迎新文案 <群名>|<文案>（{name}=新人昵称）/ 设迎新链接 <群名>|<链接>
-说明：分组和「允许转发/发言」在 Notion『群聊列表』里维护，改完发「同步」。
-带 | 的指令用竖线分隔参数（群名里常有空格）。"""
+# 防风控延迟默认值（照搬旧 WCRobot），可被 config.forward 覆盖
+DELAY = {
+    "group_min": 3.0, "group_max": 5.0,       # 群间
+    "batch_every": 10, "batch_min": 5.0, "batch_max": 10.0,  # 每 N 群额外歇
+    "msg_min": 1.0, "msg_max": 2.0,           # 同群消息间
+    "max_retries": 3,
+}
 
-_NON_FORWARDABLE_TYPES = {"time", "other"}
+# 收集时忽略的消息类型（时间条/系统提示）
+_SKIP_COLLECT_TYPES = {"time", "system", "other"}
 
+# ------------------------------------------------------------------ 后台群发队列
+
+_QUEUE: "Queue" = Queue()
+_WORKER_STARTED = False
+_WORKER_LOCK = threading.Lock()
+
+
+def _ensure_worker():
+    global _WORKER_STARTED
+    with _WORKER_LOCK:
+        if not _WORKER_STARTED:
+            threading.Thread(target=_forward_worker, daemon=True).start()
+            _WORKER_STARTED = True
+
+
+def _delays(cfg):
+    d = dict(DELAY)
+    d.update((cfg.get("forward", {}) or {}).get("delay", {}) or {})
+    return d
+
+
+def _forward_one(msg, group, d) -> tuple[bool, str]:
+    """把一条消息转发到单个群，带重试。返回 (成功, 错误)。"""
+    last_err = ""
+    for attempt in range(int(d["max_retries"])):
+        try:
+            with MAIN_WINDOW_LOCK:
+                r = msg.forward(group)          # 单目标，绕开 9 限制
+            # wxautox 成功返回 None；失败返回 falsy WxResponse 或抛异常
+            if r is None or r:
+                return True, ""
+            last_err = _wxresponse_message(r)
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(2)
+    return False, last_err
+
+
+def _forward_worker():
+    """后台群发线程：从队列取任务，投递并汇报。"""
+    while True:
+        task = _QUEUE.get()
+        try:
+            if task:
+                _deliver(task)
+        except Exception as e:
+            log("ERROR", f"群发线程异常: {e}")
+            try:
+                _worker_report(task.get("bot"), task.get("admin"), f"{REPLY_PREFIX} 群发过程中出错：{e}")
+            except Exception:
+                pass
+        finally:
+            _QUEUE.task_done()
+
+
+def _deliver(task) -> dict:
+    """逐群逐条投递（可同步调用便于测试）。返回统计。带防风控延迟。"""
+    bot = task["bot"]; admin = task["admin"]
+    messages = task["messages"]; targets = task["targets"]
+    grouping = task["grouping"]; d = task["delay"]
+
+    ok = 0
+    fail = 0
+    dead_msgs = set()       # 连续失败、判定不可转发（如视频号）的消息下标
+    fail_streak = {}        # 消息下标 -> 连续失败次数
+    fail_detail = []
+
+    for gi, group in enumerate(targets):
+        if gi > 0 and gi % int(d["batch_every"]) == 0:
+            time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
+        for mi, msg in enumerate(messages):
+            if mi in dead_msgs:
+                continue
+            success, err = _forward_one(msg, group, d)
+            if success:
+                ok += 1
+                fail_streak[mi] = 0
+            else:
+                fail += 1
+                fail_streak[mi] = fail_streak.get(mi, 0) + 1
+                mtype = str(getattr(msg, "type", "") or "")
+                fail_detail.append(f"[{group}] 第{mi+1}条({mtype}): {err}")
+                if fail_streak[mi] >= 2:   # 连续 2 个群都失败 → 判不可转发，后续跳过
+                    dead_msgs.add(mi)
+            time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
+        time.sleep(random.uniform(d["group_min"], d["group_max"]))
+
+    lines = [f"{REPLY_PREFIX} 群发完成 ✅ 分组「{grouping}」",
+             f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {len(messages)} 条。"]
+    if dead_msgs:
+        nums = "、".join(f"第{i+1}条" for i in sorted(dead_msgs))
+        lines.append(f"⚠️ {nums} 全程转发失败（视频号等 wxauto 无法转发的类型已跳过）。")
+    if fail_detail and len(fail_detail) <= 12:
+        lines.append("失败明细：\n" + "\n".join(fail_detail))
+    elif fail_detail:
+        lines.append(f"失败明细较多（{len(fail_detail)} 条），已写日志。")
+        log("WARNING", "群发失败明细: " + " | ".join(fail_detail))
+    _worker_report(bot, admin, "\n".join(lines))
+    return {"ok": ok, "fail": fail, "dead": sorted(dead_msgs)}
+
+
+def _worker_report(bot, admin, text):
+    if not bot or not admin:
+        return
+    try:
+        with MAIN_WINDOW_LOCK:
+            bot.wx.SendMsg(msg=text, who=admin)
+    except Exception as e:
+        log("ERROR", f"群发汇报失败: {e}")
+
+
+# ------------------------------------------------------------------ 消息入口
 
 def handle_admin_message(bot, chat, msg, cfg) -> bool:
-    """管理群消息入口。返回 True 表示已处理。"""
+    """指令群消息入口。返回 True 表示已处理。"""
+    _ensure_worker()
     attr = str(getattr(msg, "attr", "") or "")
     if attr not in ("friend", "self"):
         return False
@@ -66,22 +180,27 @@ def handle_admin_message(bot, chat, msg, cfg) -> bool:
     if is_bot_reply(content):
         return False
 
-    _expire_sessions(chat, cfg)
+    _expire_sessions()
 
+    # 收集模式优先：会话存在时，除结束/取消指令外，一律当素材收集
+    session = _get_session(sender)
+    if session is not None:
+        if mtype == "text":
+            plain = content.strip().replace(" ", "")
+            if plain in ("发送", "开始", "结束", "完成", "1", "go", "GO"):
+                return _finish_and_enqueue(bot, chat, cfg, sender, session)
+            if plain in ("取消", "0"):
+                return _cancel_session(chat, sender)
+        # 其它（含文字/图片/卡片）都收集
+        return _collect_material(chat, sender, session, msg, mtype)
+
+    # 非收集模式：菜单数字选择 / 指令
     if mtype == "text":
         text = content.strip()
-        # 优先：待选菜单下回复纯数字 = 选分组
         if _resolve_menu_selection(chat, cfg, sender, text):
             return True
         if _try_command(bot, chat, cfg, sender, text):
             return True
-
-    session = _get_session(sender)
-    if session is not None:
-        if mtype in _NON_FORWARDABLE_TYPES:
-            return False
-        return _forward_material(chat, msg, cfg, sender, session)
-
     return False
 
 
@@ -102,13 +221,9 @@ def _try_command(bot, chat, cfg, sender, text) -> bool:
         reply(chat, _format_pending()); return True
     if plain in ("同步", "拉取", "拉取notion", "拉取Notion", "刷新"):
         return _do_sync(chat)
-    if plain in ("结束", "完成"):
-        return _end_session(chat, sender, cancelled=False)
-    if plain == "取消":
-        return _end_session(chat, sender, cancelled=True)
-    if plain == "拉群列表":
+    if plain in ("拉群列表",):
         reply(chat, _format_invites(cfg)); return True
-    if plain == "迎新列表":
+    if plain in ("迎新列表",):
         reply(chat, _format_welcomes(cfg)); return True
 
     m = re.match(r"^(转发|检查群组|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
@@ -130,7 +245,6 @@ def _try_command(bot, chat, cfg, sender, text) -> bool:
             "设迎新文案": lambda: _set_welcome_field(chat, cfg, a, "text", b),
             "设迎新链接": lambda: _set_welcome_field(chat, cfg, a, "url", b),
         }[cmd]()
-
     return False
 
 
@@ -148,13 +262,12 @@ def _show_menu(chat, sender) -> bool:
     lines = ["选择要转发到的分组（回复编号）："]
     for i, (name, cnt) in enumerate(groupings, 1):
         lines.append(f"  {i}. {name}（{cnt} 群）")
-    lines.append("——回复数字开始，或发「取消」放弃。")
+    lines.append("——回复数字进入收集模式，或发「取消」放弃。")
     reply(chat, "\n".join(lines))
     return True
 
 
 def _resolve_menu_selection(chat, cfg, sender, text) -> bool:
-    """待选菜单存在且用户回复纯数字时，解析为分组并开始收集。"""
     if not re.fullmatch(r"\d{1,2}", text):
         return False
     with _STATE_LOCK:
@@ -187,82 +300,58 @@ def _start_session(chat, sender, grouping) -> bool:
         return True
     targets = registry.targets_for_grouping(data, grouping)
     if not targets:
-        reply(chat, f"分组「{grouping}」下没有【允许转发】的群。"
-                    f"去 Notion 给群勾上「允许转发」再发「同步」。")
+        reply(chat, f"分组「{grouping}」下没有【允许转发】的群。去 Notion 勾上「允许转发」再发「同步」。")
         return True
     with _STATE_LOCK:
         _SESSIONS[sender] = {"grouping": grouping, "targets": list(targets),
-                             "last_active": time.time(), "ok": 0, "fail": 0}
-    reply(chat, f"开始转发到「{grouping}」（{len(targets)} 个群）。\n"
-                f"现在发的每条消息（文字/图片/视频/文件/链接均可）都会群发；"
-                f"发「结束」收工。")
+                             "messages": [], "last_active": time.time()}
+    reply(chat, f"已进入转发到「{grouping}」（{len(targets)} 个群）。\n"
+                f"把要群发的内容【一条条发过来】（文字/图片/公众号/链接/文件都行，"
+                f"视频号可能转不了）。\n发完回复【发送】开始群发，中途【取消】退出。")
     return True
 
 
-def _end_session(chat, sender, cancelled) -> bool:
-    with _STATE_LOCK:
-        session = _SESSIONS.pop(sender, None)
-        _PENDING_MENU.pop(sender, None)
-    if session is None:
-        if cancelled:
-            reply(chat, "已取消。")
-        else:
-            reply(chat, "当前没有进行中的转发。发「转发」选分组开始。")
-        return True
-    if cancelled:
-        reply(chat, "已取消转发模式。")
-    else:
-        reply(chat, f"转发结束 ✅ 分组「{session['grouping']}」："
-                    f"成功 {session['ok']} 条次，失败 {session['fail']} 条次。")
-    return True
-
-
-def _expire_sessions(chat, cfg):
-    timeout = int(cfg.get("forward", {}).get("session_timeout", 300))
-    now = time.time()
-    expired = []
-    with _STATE_LOCK:
-        for sender, session in list(_SESSIONS.items()):
-            if now - session["last_active"] > timeout:
-                expired.append((sender, session))
-                del _SESSIONS[sender]
-        for sender in [s for s, p in _PENDING_MENU.items() if now - p["ts"] > MENU_TTL]:
-            _PENDING_MENU.pop(sender, None)
-    for sender, session in expired:
-        reply(chat, f"@{sender} 的转发会话闲置超时，已自动结束"
-                    f"（成功 {session['ok']}，失败 {session['fail']}）。")
-
-
-def _forward_material(chat, msg, cfg, sender, session) -> bool:
-    targets = session["targets"]
-    chunk_size = max(1, int(cfg.get("forward", {}).get("chunk_size", 8)))
-    ok_list, fail_list = [], []
-    for i in range(0, len(targets), chunk_size):
-        part = targets[i:i + chunk_size]
-        try:
-            result = msg.forward(part)
-            # wxautox4 实测：成功返回 None
-            if result is None:
-                success, err = True, ""
-            else:
-                success = bool(result)
-                err = "" if success else _wxresponse_message(result)
-        except Exception as e:
-            success, err = False, str(e)
-        if success:
-            ok_list.extend(part)
-        else:
-            fail_list.extend(part)
-            log("ERROR", f"转发到 {part} 失败: {err}")
-        time.sleep(1)
-    session["ok"] += len(ok_list)
-    session["fail"] += len(fail_list)
+def _collect_material(chat, sender, session, msg, mtype) -> bool:
+    if mtype in _SKIP_COLLECT_TYPES:
+        return True  # 时间条/系统消息不收集，但算已处理（避免落到 AI）
+    session["messages"].append(msg)
     session["last_active"] = time.time()
-    if fail_list:
-        reply(chat, f"该条已转发 {len(ok_list)}/{len(targets)} 个群，失败：{'、'.join(fail_list)}")
-    else:
-        reply(chat, f"已转发到 {len(ok_list)} 个群 ✅")
+    n = len(session["messages"])
+    reply(chat, f"已收集 {n} 条，继续发或回复【发送】开始群发。")
     return True
+
+
+def _finish_and_enqueue(bot, chat, cfg, sender, session) -> bool:
+    msgs = session["messages"]
+    if not msgs:
+        reply(chat, "还没收集到内容呢，先把要转发的消息发过来。")
+        return True
+    targets = session["targets"]
+    grouping = session["grouping"]
+    with _STATE_LOCK:
+        _SESSIONS.pop(sender, None)
+    admin = cfg.get("admin_group")
+    _QUEUE.put({"bot": bot, "admin": admin, "messages": list(msgs),
+                "targets": list(targets), "grouping": grouping, "delay": _delays(cfg)})
+    reply(chat, f"开始把 {len(msgs)} 条群发到「{grouping}」的 {len(targets)} 个群 🚀\n"
+                f"为防风控加了随机延迟，会比较慢，发完我在这儿汇报结果。")
+    return True
+
+
+def _cancel_session(chat, sender) -> bool:
+    with _STATE_LOCK:
+        _SESSIONS.pop(sender, None)
+    reply(chat, "已退出转发模式。")
+    return True
+
+
+def _expire_sessions():
+    now = time.time()
+    with _STATE_LOCK:
+        for s in [s for s, v in _SESSIONS.items() if now - v["last_active"] > SESSION_TTL]:
+            _SESSIONS.pop(s, None)
+        for s in [s for s, p in _PENDING_MENU.items() if now - p["ts"] > MENU_TTL]:
+            _PENDING_MENU.pop(s, None)
 
 
 def _wxresponse_message(result) -> str:
