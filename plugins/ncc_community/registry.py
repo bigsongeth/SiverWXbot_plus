@@ -137,6 +137,43 @@ def targets_for_grouping(data: dict, grouping_name: str):
     return out
 
 
+def forward_groupings_detailed(data: dict):
+    """可转发分组（带 Notion 分组编号），按编号排序。返回 [(name, number, count)]。
+    只含有【分组编号】的分组（编号是群里选择用的号）。"""
+    result = []
+    for gname, ginfo in data.get("groupings", {}).items():
+        if not ginfo.get("forward_enabled", True):
+            continue
+        num = ginfo.get("number")
+        if num is None:
+            continue
+        cnt = len(targets_for_grouping(data, gname))
+        if cnt > 0:
+            result.append((gname, int(num), cnt))
+    result.sort(key=lambda x: x[1])
+    return result
+
+
+def grouping_name_by_number(data: dict, number: int):
+    """按 Notion 分组编号找分组名。"""
+    for gname, ginfo in data.get("groupings", {}).items():
+        if ginfo.get("number") == number:
+            return gname
+    return None
+
+
+def all_forward_targets(data: dict):
+    """所有【允许转发】的群的寻址字符串（去重）——"所有群聊"用。"""
+    seen, out = set(), []
+    for g in data.get("groups", {}).values():
+        if g.get("allow_forward", False):
+            t = target(g)
+            if t and t not in seen:
+                seen.add(t)
+                out.append(t)
+    return out
+
+
 def get_group(data: dict, name: str):
     return data.get("groups", {}).get(name)
 
