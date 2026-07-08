@@ -71,6 +71,16 @@ class FakeWx:
     def ChatWith(self, who=None, exact=False):
         self.chatted.append(who)
 
+    def GetSubWindow(self, nickname):
+        return None
+
+    def GetHistoryMessage(self, n=100, callback=None, **kw):
+        msgs = list(self.timeline)
+        if callback:
+            for m in msgs:
+                callback(m)   # 触发停止回调（测试里不真截断）
+        return msgs
+
     def GetAllMessage(self):
         return list(self.timeline)
 

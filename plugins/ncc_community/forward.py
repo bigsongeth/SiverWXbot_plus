@@ -126,31 +126,55 @@ _CMD_RE = re.compile(r"^\d{1,2}(\s*\+\s*\d{1,2})*$")   # 只排 0-99 的菜单/�
 GATHER_SETTLE = 1.2                    # 切到源群后等 UI 稳定的秒数（测试里置 0）
 
 
-def _gather_content(bot, source, operator):
-    """【核心】不依赖实时监听：把源群拉出来 GetAllMessage，读取 operator 在本次收集
-    起点（最后一条 COLLECT_PROMPT）之后发的所有内容消息（新鲜 UI 元素）。
-
-    这样无论 wxauto 实时 listener 漏没漏、有没有滚出可见区，只要消息还在群里渲染，
-    就能读到并转发。返回新鲜的 msg 列表。找不到收集起点则返回 []（宁可不发也不错发）。
-    """
+def _stop_sign():
     try:
-        with MAIN_WINDOW_LOCK:
-            bot.wx.ChatWith(source, exact=False)
-            time.sleep(GATHER_SETTLE)
-            msgs = bot.wx.GetAllMessage() or []
+        from wxautox4 import WxParam
+        return WxParam.CALLBACK_STOP_SIGN
+    except Exception:
+        return "stop"
+
+
+def _read_source_messages(bot, source):
+    """在主窗口用 GetHistoryMessage【往上滑动加载】源群消息，滑到本次收集起点
+    （COLLECT_PROMPT）就停。这样即使消息多、超出可见区，也会被滚动加载出来。
+    返回滚动加载到的消息集（已被收集起点截断，只含本次会话范围）。"""
+    with MAIN_WINDOW_LOCK:
+        bot.wx.ChatWith(source, exact=False)
+        time.sleep(GATHER_SETTLE)
+        STOP = _stop_sign()
+
+        def cb(m):
+            if str(getattr(m, "attr", "")) == "self" and PROMPT_MARK in str(getattr(m, "content", "")):
+                return STOP   # 滑到收集起点，停止上滑
+
+        try:
+            return bot.wx.GetHistoryMessage(n=100, callback=cb) or []
+        except Exception as e:
+            log("WARNING", f"GetHistoryMessage 失败，回退 GetAllMessage: {e}")
+            try:
+                return bot.wx.GetAllMessage() or []
+            except Exception:
+                return []
+
+
+def _gather_content(bot, source, operator):
+    """【核心】不依赖实时监听：主窗口上滑加载到收集起点，取 operator 本次发的所有
+    内容消息。无论实时 listener 漏没漏、有没有滚出可见区，都能拿全。"""
+    try:
+        msgs = _read_source_messages(bot, source)
     except Exception as e:
         log("ERROR", f"读取源群消息失败: {e}")
         return []
-    # 找最后一次收集起点
-    start = None
-    for i, m in enumerate(msgs):
-        if str(getattr(m, "attr", "")) == "self" and PROMPT_MARK in str(getattr(m, "content", "")):
-            start = i
-    if start is None:
-        log("WARNING", "未找到收集起点(COLLECT_PROMPT)，本次不转发")
-        return []
+
+    has_prompt = any(str(getattr(m, "attr", "")) == "self" and PROMPT_MARK in str(getattr(m, "content", ""))
+                     for m in msgs)
+    log("INFO", f"gather 上滑读到 {len(msgs)} 条；收集起点={'找到' if has_prompt else '未找到'}")
+
+    # GetHistoryMessage 已按收集起点截断，本次范围内 operator 的内容全取；
+    # 未找到起点则回退取末尾最近，避免漏发。
+    scope = msgs if has_prompt else msgs[-20:]
     out = []
-    for m in msgs[start + 1:]:
+    for m in scope:
         if str(getattr(m, "attr", "")) != "friend":
             continue
         if operator and str(getattr(m, "sender", "")) != operator:
