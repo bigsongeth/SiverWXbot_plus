@@ -333,7 +333,7 @@ class EngineTest(unittest.TestCase):
         stat = forward._deliver(task)
         self.assertEqual(stat["dead"], [0])         # 整条转发失败
         self.assertEqual(stat["ok"], 0)
-        self.assertIn("全程转发失败", " ".join(m for _, m in self.bot.wx.sent))
+        self.assertIn("转发失败", " ".join(m for _, m in self.bot.wx.sent))
 
     def test_direct_sync_shortcut(self):
         called = {}

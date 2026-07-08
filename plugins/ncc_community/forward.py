@@ -94,22 +94,56 @@ def _delays(cfg):
     return d
 
 
-def _forward_chunk(msg, groups, d) -> tuple[bool, str]:
-    """把【一条消息】用一次 forward 转给【一批群（≤9）】，带重试。
-    转发前 roll_into_view 把消息滚进可见区（wxauto 只有可见消息才能转发）。
-    整个 roll+forward 在主窗口锁内原子完成，避免主循环中途抢窗口。"""
+def _forward_located_message(bot, source, sig, group_chunks, d) -> tuple[bool, str]:
+    """【定位后转发】按签名(类型+内容)把这条消息在视图里定位出来，拿它当下的
+    新鲜元素，立即转发给各批群（每批≤9）。整个"定位→取新鲜元素→转发"在同一次
+    持锁内原子完成，规避元素失效和主循环抢窗口。带重试。
+
+    定位办法：ChatWith 回到最新 → GetHistoryMessage 往上滚，回调匹配到本条签名就停，
+    视图正好停在这条上 → GetAllMessage 取此刻可见（有效）的同签名元素。
+    """
+    STOP = _stop_sign()
     last_err = ""
     for _ in range(int(d["max_retries"])):
         try:
             with MAIN_WINDOW_LOCK:
+                bot.wx.ChatWith(source, exact=False)
+                time.sleep(GATHER_SETTLE)
+
+                def cb(m, _s=sig):
+                    if _sig(m) == _s:
+                        return STOP          # 滚到这条就停，视图定位到它
+
                 try:
-                    msg.roll_into_view()
+                    bot.wx.GetHistoryMessage(n=120, callback=cb, goback=False)
+                except TypeError:
+                    bot.wx.GetHistoryMessage(n=120, callback=cb)
                 except Exception:
                     pass
-                r = msg.forward(list(groups))   # 一次转多群（微信原生分别转发）
-            if r is None or r:                  # wxautox 成功返回 None
-                return True, ""
-            last_err = _wxresponse_message(r)
+
+                visible = bot.wx.GetAllMessage() or []
+                fresh = next((m for m in visible if _sig(m) == sig), None)
+                if fresh is None:
+                    last_err = "视图中定位不到该消息"
+                else:
+                    ok_all, errs = True, []
+                    for cg in group_chunks:
+                        try:
+                            fresh.roll_into_view()
+                        except Exception:
+                            pass
+                        try:
+                            r = fresh.forward(list(cg))
+                            if not (r is None or r):
+                                ok_all = False
+                                errs.append(_wxresponse_message(r))
+                        except Exception as e:
+                            ok_all = False
+                            errs.append(str(e))
+                        time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))
+                    if ok_all:
+                        return True, ""
+                    last_err = "; ".join(errs)
         except Exception as e:
             last_err = str(e)
         time.sleep(2)
@@ -213,9 +247,8 @@ def _sig(msg):
 
 
 def _deliver(task) -> dict:
-    """消息主序 + 一次转一批群：
-    只【读一次】源群拿到有效消息元素，然后【逐条消息】用 forward([一批≤9群]) 群发。
-    操作数从 N×M 降到 N×⌈M/9⌉，每条消息只需"可见一次"就发一批群，几乎无失效窗口。
+    """先拿本次要转消息的【签名清单】(身份)，再【逐条】：滚动定位到该消息、取当下
+    有效元素、转发给各批群。每条只在"可见"时才转，规避元素失效。按时序逐条处理。
     主窗口锁已和主循环共用，转发期间主循环不会来抢窗口。
     """
     bot = task["bot"]; admin = task["admin"]
@@ -223,32 +256,34 @@ def _deliver(task) -> dict:
     label = task["label"]; d = task["delay"]
     operator = task.get("operator")
 
-    # 只读一次（停在收集起点，元素有效）
-    msgs = _gather_content(bot, admin, operator, goback=False)
-    if not msgs:
+    # 拿签名清单（只需身份；GetHistoryMessage 会把全部滚出来，即便元素随后失效也不影响取签名）
+    manifest = _gather_content(bot, admin, operator, goback=True)
+    if not manifest:
         _worker_report(bot, admin, f"{REPLY_PREFIX} 没读到要转发的内容（收集起点可能丢失），请重新 ncc→1。")
         return {"ok": 0, "fail": 0, "dead": []}
-    n_msgs = len(msgs)
+    sigs = []
+    seen = set()
+    for m in manifest:                 # 去重保序
+        s = _sig(m)
+        if s not in seen:
+            seen.add(s)
+            sigs.append(s)
+    n_msgs = len(sigs)
     chunk = max(1, min(CHUNK_SIZE, int(task.get("chunk_size", CHUNK_SIZE))))
     group_chunks = [targets[i:i + chunk] for i in range(0, len(targets), chunk)]
 
     ok = fail = 0
-    dead = []             # 整条转发失败的消息（多为视频号等）
+    dead = []
     fail_detail = []
 
-    for mi, msg in enumerate(msgs):
-        any_ok = False
-        for ci, cg in enumerate(group_chunks):
-            success, err = _forward_chunk(msg, cg, d)
-            if success:
-                ok += len(cg)
-                any_ok = True
-            else:
-                fail += len(cg)
-                fail_detail.append(f"第{mi+1}条({_sig(msg)[0]})→{len(cg)}群: {err}")
-            time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))
-        if not any_ok:
+    for mi, sig in enumerate(sigs):
+        success, err = _forward_located_message(bot, admin, sig, group_chunks, d)
+        if success:
+            ok += len(targets)
+        else:
+            fail += len(targets)
             dead.append(mi)
+            fail_detail.append(f"第{mi+1}条({sig[0]}): {err}")
         time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
 
     # 收尾：主窗口回到最新
@@ -262,7 +297,7 @@ def _deliver(task) -> dict:
              f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。"]
     if dead:
         nums = "、".join(f"第{i+1}条" for i in dead)
-        lines.append(f"⚠️ {nums} 全程转发失败并已跳过（多为视频号等 wxauto 无法转发的类型）。")
+        lines.append(f"⚠️ {nums} 转发失败（视图定位不到或该消息不支持转发）。")
     if fail_detail and len(fail_detail) <= 12:
         lines.append("失败明细：\n" + "\n".join(fail_detail))
     elif fail_detail:
