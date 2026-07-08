@@ -57,6 +57,9 @@ class FakeWx:
     def ChatWith(self, who=None, exact=False):
         self.chatted.append(who)
 
+    def GetAllMessage(self):
+        return []   # 测试里让 _refresh_collected 回退到原始收集引用
+
     def SetGroupRemark(self, value):
         # 模拟 wxautox 追加行为：若已有备注则追加（用于验证我们不会重复设置）
         last = self.chatted[-1] if self.chatted else ""
@@ -188,15 +191,18 @@ class EngineTest(unittest.TestCase):
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
         self.assertIn("一个一个来", self.admin.sent[-1])
         self.assertEqual(forward._get_state("大松")["state"], forward.S_FWD_COLLECT)
-        # 收集两条（不转发）
+        # 收集两条（静默，不转发、不逐条回复）
         m1 = FakeMsg("[视频号]大曹", mtype="other")   # 视频号也收集
         m2 = FakeMsg("正文", mtype="text")
+        before = len(self.admin.sent)
         handle_friend_message(self.bot, self.admin, m1)
         handle_friend_message(self.bot, self.admin, m2)
         self.assertEqual(m1.forwarded, [])
-        self.assertIn("已收集 2 条消息", self.admin.sent[-1])
-        # 发 1 → 选分组菜单（编号 + 所有群聊）
+        self.assertEqual(len(self.admin.sent), before)   # 收集阶段静默，无新回复
+        self.assertEqual(len(forward._get_state("大松")["messages"]), 2)
+        # 发 1 → 汇总 + 选分组菜单（编号 + 所有群聊）
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
+        self.assertIn("已收集 2 条消息", self.admin.sent[-1])
         self.assertIn("1 👈 所有群聊", self.admin.sent[-1])
         self.assertIn("4 👈 大理群", self.admin.sent[-1])   # 大理群 分组编号=4
         self.assertEqual(forward._get_state("大松")["state"], forward.S_FWD_CHOOSE)

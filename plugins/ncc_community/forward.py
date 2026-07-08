@@ -63,7 +63,8 @@ MAIN_MENU = (
 
 COLLECT_PROMPT = (
     "请发送需要转发的内容，支持公众号、推文、视频号、文字、图片、合并消息，一个一个来\n"
-    "发送【1】进入下一步\n"
+    "（收集时我不逐条回复，放心连着发）\n"
+    "发完回复【1】进入下一步\n"
     "随时发送【0】退出转发模式"
 )
 
@@ -120,11 +121,46 @@ def _forward_worker():
             _QUEUE.task_done()
 
 
+def _refresh_collected(bot, admin, collected):
+    """群发前把源群(=指令群)拉到最新、重抓消息，用"新鲜"的 UI 元素替换收集时的引用。
+
+    wxauto 只给可见消息注册 UI 控件，收集后被机器人回复顶出可见区的消息元素会失效
+    （"消息对象已失效"）。这里按 (类型,内容) 把收集到的消息匹配回当前可见的新鲜元素。
+    抓取失败或匹配不到就回退到原始引用（至少可见的那几条还能转）。
+    """
+    if not admin or not collected:
+        return collected
+    try:
+        with MAIN_WINDOW_LOCK:
+            bot.wx.ChatWith(admin, exact=False)
+            time.sleep(1.0)
+            fresh = bot.wx.GetAllMessage() or []
+    except Exception as e:
+        log("WARNING", f"群发前重抓消息失败，用原始引用: {e}")
+        return collected
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for fm in fresh:
+        buckets[(str(getattr(fm, "type", "")), str(getattr(fm, "content", "")))].append(fm)
+    out, hits = [], 0
+    for cm in collected:
+        key = (str(getattr(cm, "type", "")), str(getattr(cm, "content", "")))
+        if buckets.get(key):
+            out.append(buckets[key].pop(0))
+            hits += 1
+        else:
+            out.append(cm)
+    log("INFO", f"群发前重抓消息：{hits}/{len(collected)} 条命中新鲜元素")
+    return out
+
+
 def _deliver(task) -> dict:
     """逐群逐条投递（可同步调用便于测试）。带防风控延迟，完成后汇报。"""
     bot = task["bot"]; admin = task["admin"]
-    messages = task["messages"]; targets = task["targets"]
+    targets = task["targets"]
     label = task["label"]; d = task["delay"]
+    # 关键：群发前重取新鲜消息元素，规避"消息对象已失效"
+    messages = _refresh_collected(bot, admin, task["messages"])
 
     ok = fail = 0
     dead_msgs = set()
@@ -255,9 +291,10 @@ def _handle_collect(chat, sender, st, msg, mtype, text) -> bool:
         return True
     if mtype in _SKIP_COLLECT_TYPES:
         return True       # 时间条/系统消息不收集
+    # 收集阶段【全程静默】——不逐条回复，避免机器人回复把已收集的消息顶出可见区导致
+    # UI 元素失效（wxauto 只给可见消息注册控件）。收到几条到发「1」时一并汇总。
     st["messages"].append(msg)
     st["last_active"] = time.time()
-    reply(chat, f"已收集 {len(st['messages'])} 条消息，继续发送或者回复【1】选择群聊")
     return True
 
 
