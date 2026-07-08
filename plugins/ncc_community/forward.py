@@ -121,36 +121,47 @@ def _forward_worker():
             _QUEUE.task_done()
 
 
-def _refresh_collected(bot, admin, collected):
-    """群发前把源群(=指令群)拉到最新、重抓消息，用"新鲜"的 UI 元素替换收集时的引用。
+PROMPT_MARK = "请发送需要转发的内容"   # 收集起点边界（COLLECT_PROMPT 里的唯一子串）
+_CMD_RE = re.compile(r"^\d{1,2}(\s*\+\s*\d{1,2})*$")   # 只排 0-99 的菜单/多选数字，不误伤长数字内容
+GATHER_SETTLE = 1.2                    # 切到源群后等 UI 稳定的秒数（测试里置 0）
 
-    wxauto 只给可见消息注册 UI 控件，收集后被机器人回复顶出可见区的消息元素会失效
-    （"消息对象已失效"）。这里按 (类型,内容) 把收集到的消息匹配回当前可见的新鲜元素。
-    抓取失败或匹配不到就回退到原始引用（至少可见的那几条还能转）。
+
+def _gather_content(bot, source, operator):
+    """【核心】不依赖实时监听：把源群拉出来 GetAllMessage，读取 operator 在本次收集
+    起点（最后一条 COLLECT_PROMPT）之后发的所有内容消息（新鲜 UI 元素）。
+
+    这样无论 wxauto 实时 listener 漏没漏、有没有滚出可见区，只要消息还在群里渲染，
+    就能读到并转发。返回新鲜的 msg 列表。找不到收集起点则返回 []（宁可不发也不错发）。
     """
-    if not admin or not collected:
-        return collected
     try:
         with MAIN_WINDOW_LOCK:
-            bot.wx.ChatWith(admin, exact=False)
-            time.sleep(1.0)
-            fresh = bot.wx.GetAllMessage() or []
+            bot.wx.ChatWith(source, exact=False)
+            time.sleep(GATHER_SETTLE)
+            msgs = bot.wx.GetAllMessage() or []
     except Exception as e:
-        log("WARNING", f"群发前重抓消息失败，用原始引用: {e}")
-        return collected
-    from collections import defaultdict
-    buckets = defaultdict(list)
-    for fm in fresh:
-        buckets[(str(getattr(fm, "type", "")), str(getattr(fm, "content", "")))].append(fm)
-    out, hits = [], 0
-    for cm in collected:
-        key = (str(getattr(cm, "type", "")), str(getattr(cm, "content", "")))
-        if buckets.get(key):
-            out.append(buckets[key].pop(0))
-            hits += 1
-        else:
-            out.append(cm)
-    log("INFO", f"群发前重抓消息：{hits}/{len(collected)} 条命中新鲜元素")
+        log("ERROR", f"读取源群消息失败: {e}")
+        return []
+    # 找最后一次收集起点
+    start = None
+    for i, m in enumerate(msgs):
+        if str(getattr(m, "attr", "")) == "self" and PROMPT_MARK in str(getattr(m, "content", "")):
+            start = i
+    if start is None:
+        log("WARNING", "未找到收集起点(COLLECT_PROMPT)，本次不转发")
+        return []
+    out = []
+    for m in msgs[start + 1:]:
+        if str(getattr(m, "attr", "")) != "friend":
+            continue
+        if operator and str(getattr(m, "sender", "")) != operator:
+            continue
+        if str(getattr(m, "type", "")) in _SKIP_COLLECT_TYPES:
+            continue
+        c = str(getattr(m, "content", "") or "").strip()
+        if _CMD_RE.match(c):        # 排除 1 / 99 / 2+4 这类指令数字
+            continue
+        out.append(m)
+    log("INFO", f"从源群现读到 {len(out)} 条待转发内容（operator={operator}）")
     return out
 
 
@@ -159,8 +170,12 @@ def _deliver(task) -> dict:
     bot = task["bot"]; admin = task["admin"]
     targets = task["targets"]
     label = task["label"]; d = task["delay"]
-    # 关键：群发前重取新鲜消息元素，规避"消息对象已失效"
-    messages = _refresh_collected(bot, admin, task["messages"])
+    # 关键：投递前从源群【现读】新鲜消息（不依赖实时监听、规避失效）
+    messages = _gather_content(bot, admin, task.get("operator"))
+    if not messages:
+        _worker_report(bot, admin, f"{REPLY_PREFIX} 没读到要转发的内容（可能消息已滚动太远或收集起点丢失），"
+                                   f"请重新 ncc→1 转发。")
+        return {"ok": 0, "fail": 0, "dead": []}
 
     ok = fail = 0
     dead_msgs = set()
@@ -245,7 +260,7 @@ def handle_admin_message(bot, chat, msg, cfg) -> bool:
         if st["state"] == S_MAIN:
             return _handle_main_menu(bot, chat, cfg, sender, text)
         if st["state"] == S_FWD_COLLECT:
-            return _handle_collect(chat, sender, st, msg, mtype, text)
+            return _handle_collect(bot, chat, cfg, sender, st, msg, mtype, text)
         if st["state"] == S_FWD_CHOOSE:
             return _handle_choose(bot, chat, cfg, sender, st, text)
 
@@ -281,19 +296,18 @@ def _handle_main_menu(bot, chat, cfg, sender, text) -> bool:
 
 # ------------------------------------------------------------------ 转发：收集
 
-def _handle_collect(chat, sender, st, msg, mtype, text) -> bool:
+def _handle_collect(bot, chat, cfg, sender, st, msg, mtype, text) -> bool:
     if text == "1":       # 收集完，进入选分组
-        if not st["messages"]:
-            reply(chat, "还未收集到任何消息，请先发送需要转发的内容")
+        # 不依赖实时监听：从源群现读 operator 本次发的所有内容
+        source = cfg.get("admin_group")
+        content = _gather_content(bot, source, sender)
+        if not content:
+            reply(chat, "还未读到任何要转发的消息，请先发送需要转发的内容（发完再回复【1】）")
             return True
-        _set_state(sender, S_FWD_CHOOSE, messages=st["messages"])
-        reply(chat, _choose_menu(len(st["messages"])))
+        _set_state(sender, S_FWD_CHOOSE, count=len(content))
+        reply(chat, _choose_menu(len(content)))
         return True
-    if mtype in _SKIP_COLLECT_TYPES:
-        return True       # 时间条/系统消息不收集
-    # 收集阶段【全程静默】——不逐条回复，避免机器人回复把已收集的消息顶出可见区导致
-    # UI 元素失效（wxauto 只给可见消息注册控件）。收到几条到发「1」时一并汇总。
-    st["messages"].append(msg)
+    # 收集阶段【全程静默】——收不收得到都不影响：真正内容在发「1」时从群里现读。
     st["last_active"] = time.time()
     return True
 
@@ -344,11 +358,12 @@ def _handle_choose(bot, chat, cfg, sender, st, text) -> bool:
         reply(chat, "未找到任何可转发的群组（检查 Notion 里群是否勾了「允许转发」），或发送【0】退出")
         return True
 
-    messages = st["messages"]
+    count = st.get("count", 0)
     _clear_state(sender)
-    _QUEUE.put({"bot": bot, "admin": cfg.get("admin_group"), "messages": list(messages),
+    # 不传消息对象：worker 投递前从源群现读 operator 的内容（新鲜元素、不漏不失效）
+    _QUEUE.put({"bot": bot, "admin": cfg.get("admin_group"), "operator": sender,
                 "targets": list(targets), "label": label, "delay": _delays(cfg)})
-    reply(chat, f"开始转发 {len(messages)} 条消息到 {len(targets)} 个群…\n"
+    reply(chat, f"开始转发 {count} 条消息到 {len(targets)} 个群…\n"
                 f"为避免风控，将会添加随机延迟，请耐心等待，完成后我在这儿汇报。")
     return True
 

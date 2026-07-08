@@ -46,6 +46,19 @@ ZERO_DELAY = {"group_min": 0, "group_max": 0, "batch_every": 10, "batch_min": 0,
               "batch_max": 0, "msg_min": 0, "msg_max": 0, "max_retries": 1}
 
 
+def _prompt():
+    """一条 COLLECT_PROMPT 自己消息，作为收集起点边界。"""
+    return FakeMsg(content="🤖 请发送需要转发的内容，一个一个来", mtype="text",
+                   attr="self", sender="self")
+
+
+def build_timeline(bot, *content_msgs, operator="大松"):
+    """给源群时间线放上 [收集起点, 内容消息...]，模拟用户发的内容。"""
+    for m in content_msgs:
+        m.attr = "friend"; m.sender = operator
+    bot.wx.timeline = [_prompt(), *content_msgs]
+
+
 class FakeWx:
     nickname = "🐶肥肉"
 
@@ -53,12 +66,13 @@ class FakeWx:
         self.chatted = []
         self.remarks = {}     # 群名 -> 备注（模拟“追加”行为验证幂等）
         self.sent = []
+        self.timeline = []    # 源群消息时间线（_gather_content 现读这个）
 
     def ChatWith(self, who=None, exact=False):
         self.chatted.append(who)
 
     def GetAllMessage(self):
-        return []   # 测试里让 _refresh_collected 回退到原始收集引用
+        return list(self.timeline)
 
     def SetGroupRemark(self, value):
         # 模拟 wxautox 追加行为：若已有备注则追加（用于验证我们不会重复设置）
@@ -107,6 +121,7 @@ class EngineTest(unittest.TestCase):
         store._cache = None
         store._cache_mtime = None
         forward._STATE.clear()
+        forward.GATHER_SETTLE = 0    # 测试里不等 UI
         discovery._SEEN.clear()
         self.bot = FakeBot()
         self.admin = FakeChat(ADMIN)
@@ -186,31 +201,25 @@ class EngineTest(unittest.TestCase):
 
     def test_forward_collect_choose_send_flow(self):
         seed_registry()
+        # 源群里用户发的内容（含视频号 other 类型）
+        m1 = FakeMsg("[视频号]大曹", mtype="other")
+        m2 = FakeMsg("正文", mtype="text")
+        build_timeline(self.bot, m1, m2)
         # ncc → 主菜单 → 1 进入转发收集
         handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
         self.assertIn("一个一个来", self.admin.sent[-1])
         self.assertEqual(forward._get_state("大松")["state"], forward.S_FWD_COLLECT)
-        # 收集两条（静默，不转发、不逐条回复）
-        m1 = FakeMsg("[视频号]大曹", mtype="other")   # 视频号也收集
-        m2 = FakeMsg("正文", mtype="text")
-        before = len(self.admin.sent)
-        handle_friend_message(self.bot, self.admin, m1)
-        handle_friend_message(self.bot, self.admin, m2)
-        self.assertEqual(m1.forwarded, [])
-        self.assertEqual(len(self.admin.sent), before)   # 收集阶段静默，无新回复
-        self.assertEqual(len(forward._get_state("大松")["messages"]), 2)
-        # 发 1 → 汇总 + 选分组菜单（编号 + 所有群聊）
+        # 发 1 → 从源群【现读】2 条 + 选分组菜单
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
         self.assertIn("已收集 2 条消息", self.admin.sent[-1])
-        self.assertIn("1 👈 所有群聊", self.admin.sent[-1])
         self.assertIn("4 👈 大理群", self.admin.sent[-1])   # 大理群 分组编号=4
         self.assertEqual(forward._get_state("大松")["state"], forward.S_FWD_CHOOSE)
         # 选“4” → 入队 + 状态清除
         handle_friend_message(self.bot, self.admin, FakeMsg("4"))
         self.assertIsNone(forward._get_state("大松"))
         self.assertIn("开始转发 2 条消息到 2 个群", self.admin.sent[-1])
-        # 执行队列
+        # 执行队列：worker 再从源群现读 → 转发（一群一群）
         self._drain()
         self.assertEqual(sorted(m1.forwarded), ["大理A群", "大理B群"])
         self.assertEqual(sorted(m2.forwarded), ["大理A群", "大理B群"])
@@ -218,20 +227,20 @@ class EngineTest(unittest.TestCase):
 
     def test_forward_all_groups_option(self):
         seed_registry()
+        m = FakeMsg("正文", mtype="text")
+        build_timeline(self.bot, m)
         handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
-        handle_friend_message(self.bot, self.admin, FakeMsg("正文", mtype="text"))
-        handle_friend_message(self.bot, self.admin, FakeMsg("1"))     # 进入选分组
+        handle_friend_message(self.bot, self.admin, FakeMsg("1"))     # 现读 1 条，进入选分组
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))     # 1 = 所有群聊
         self.assertIn("开始转发 1 条消息到 2 个群", self.admin.sent[-1])
         self._drain()
-        # 完成汇报里含 label「所有群聊」+ 2 个群（大理A/B，C 不允许转发）
         report = " ".join(m for _, m in self.bot.wx.sent)
         self.assertIn("所有群聊", report)
         self.assertIn("2 个群", report)
+        self.assertEqual(sorted(m.forwarded), ["大理A群", "大理B群"])
 
     def test_forward_multiselect(self):
-        # 两个带编号且各有群的分组，多选 4+6
         groupings = {"大理群": {"number": 4, "forward_enabled": True},
                      "黄山群": {"number": 6, "forward_enabled": True}}
         groups = {
@@ -239,15 +248,26 @@ class EngineTest(unittest.TestCase):
             "黄A": {"notion_page_id": "2", "allow_forward": True, "allow_speak": True, "welcome_url": "", "groupings": ["黄山群"]},
         }
         registry.upsert_from_notion(groupings, groups)
+        m = FakeMsg("正文", mtype="text")
+        build_timeline(self.bot, m)
         handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
-        m = FakeMsg("正文", mtype="text")
-        handle_friend_message(self.bot, self.admin, m)
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
         handle_friend_message(self.bot, self.admin, FakeMsg("4+6"))   # 多选
         self.assertIn("开始转发 1 条消息到 2 个群", self.admin.sent[-1])
         self._drain()
         self.assertEqual(sorted(m.forwarded), ["大A", "黄A"])
+
+    def test_gather_excludes_commands_and_other_senders(self):
+        # 现读只取本 operator 的、非数字指令的内容
+        m1 = FakeMsg("真内容", mtype="text")
+        cmd = FakeMsg("1", mtype="text")               # 指令数字，应排除
+        other = FakeMsg("别人发的", mtype="text")       # 他人消息，应排除
+        m1.attr = cmd.attr = other.attr = "friend"
+        m1.sender = cmd.sender = "大松"; other.sender = "路人"
+        self.bot.wx.timeline = [_prompt(), other, m1, cmd]
+        got = forward._gather_content(self.bot, ADMIN, "大松")
+        self.assertEqual([g.content for g in got], ["真内容"])
 
     def test_exit_zero(self):
         seed_registry()
@@ -259,10 +279,11 @@ class EngineTest(unittest.TestCase):
 
     def test_collect_proceed_without_content(self):
         seed_registry()
+        self.bot.wx.timeline = [_prompt()]   # 只有起点，无内容
         handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
         handle_friend_message(self.bot, self.admin, FakeMsg("1"))
-        handle_friend_message(self.bot, self.admin, FakeMsg("1"))   # 没收集就想下一步
-        self.assertIn("还未收集到任何消息", self.admin.sent[-1])
+        handle_friend_message(self.bot, self.admin, FakeMsg("1"))   # 现读为空
+        self.assertIn("还未读到任何要转发的消息", self.admin.sent[-1])
         self.assertEqual(forward._get_state("大松")["state"], forward.S_FWD_COLLECT)
 
     def test_sync_via_menu(self):
@@ -284,7 +305,8 @@ class EngineTest(unittest.TestCase):
 
     def test_deliver_one_group_at_a_time(self):
         m = FakeMsg("素材", mtype="text")
-        task = {"bot": self.bot, "admin": ADMIN, "messages": [m],
+        build_timeline(self.bot, m)   # worker 现读到这条
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
                 "targets": [f"群{i}" for i in range(5)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
         self.assertEqual(stat["ok"], 5)
@@ -292,7 +314,8 @@ class EngineTest(unittest.TestCase):
 
     def test_deliver_unforwardable_skipped_after_two_groups(self):
         vid = FakeMsg("[视频号]", mtype="other"); vid.forward_ok = False
-        task = {"bot": self.bot, "admin": ADMIN, "messages": [vid],
+        build_timeline(self.bot, vid)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
                 "targets": [f"群{i}" for i in range(6)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
         self.assertEqual(stat["dead"], [0])
