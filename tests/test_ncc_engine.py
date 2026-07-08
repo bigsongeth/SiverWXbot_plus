@@ -328,7 +328,7 @@ class EngineTest(unittest.TestCase):
         task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
                 "targets": [f"群{i}" for i in range(6)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
-        self.assertEqual(stat["dead"], [0])
+        self.assertEqual(len(stat["dead"]), 1)      # 一条被判失效（按签名）
         self.assertEqual(len(vid.forwarded), 2)     # 前 2 群试过，后 4 群跳过
         self.assertIn("全程转发失败", " ".join(m for _, m in self.bot.wx.sent))
 

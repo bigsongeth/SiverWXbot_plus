@@ -90,11 +90,16 @@ def _delays(cfg):
 
 
 def _forward_one(msg, group, d) -> tuple[bool, str]:
-    """把一条消息转发到单个群，带重试。返回 (成功, 错误)。"""
+    """把一条消息转发到单个群，带重试。转发前先 roll_into_view 把消息滚进可见区
+    （wxauto 只有可见消息才有有效控件、才能转发）。返回 (成功, 错误)。"""
     last_err = ""
     for _ in range(int(d["max_retries"])):
         try:
             with MAIN_WINDOW_LOCK:
+                try:
+                    msg.roll_into_view()        # 关键：转发前把这条滚进可见区
+                except Exception:
+                    pass
                 r = msg.forward(group)          # 单目标，绕开 9 限制
             if r is None or r:                  # wxautox 成功返回 None
                 return True, ""
@@ -134,10 +139,10 @@ def _stop_sign():
         return "stop"
 
 
-def _read_source_messages(bot, source):
+def _read_source_messages(bot, source, goback=True):
     """在主窗口用 GetHistoryMessage【往上滑动加载】源群消息，滑到本次收集起点
     （COLLECT_PROMPT）就停。这样即使消息多、超出可见区，也会被滚动加载出来。
-    返回滚动加载到的消息集（已被收集起点截断，只含本次会话范围）。"""
+    goback=False 时结束后停在收集起点（便于随后从上往下逐条转发，保持元素有效）。"""
     with MAIN_WINDOW_LOCK:
         bot.wx.ChatWith(source, exact=False)
         time.sleep(GATHER_SETTLE)
@@ -148,7 +153,14 @@ def _read_source_messages(bot, source):
                 return STOP   # 滑到收集起点，停止上滑
 
         try:
-            return bot.wx.GetHistoryMessage(n=100, callback=cb) or []
+            return bot.wx.GetHistoryMessage(n=100, callback=cb, goback=goback) or []
+        except TypeError:
+            # 老签名不支持 goback
+            try:
+                return bot.wx.GetHistoryMessage(n=100, callback=cb) or []
+            except Exception as e:
+                log("WARNING", f"GetHistoryMessage 失败，回退 GetAllMessage: {e}")
+                return bot.wx.GetAllMessage() or []
         except Exception as e:
             log("WARNING", f"GetHistoryMessage 失败，回退 GetAllMessage: {e}")
             try:
@@ -157,11 +169,12 @@ def _read_source_messages(bot, source):
                 return []
 
 
-def _gather_content(bot, source, operator):
+def _gather_content(bot, source, operator, goback=True):
     """【核心】不依赖实时监听：主窗口上滑加载到收集起点，取 operator 本次发的所有
-    内容消息。无论实时 listener 漏没漏、有没有滚出可见区，都能拿全。"""
+    内容消息。无论实时 listener 漏没漏、有没有滚出可见区，都能拿全。
+    goback=False：读完停在收集起点（投递时用，随后逐条 roll+转，元素保持有效）。"""
     try:
-        msgs = _read_source_messages(bot, source)
+        msgs = _read_source_messages(bot, source, goback=goback)
     except Exception as e:
         log("ERROR", f"读取源群消息失败: {e}")
         return []
@@ -189,55 +202,74 @@ def _gather_content(bot, source, operator):
     return out
 
 
+def _sig(msg):
+    return (str(getattr(msg, "type", "")), str(getattr(msg, "content", ""))[:60])
+
+
 def _deliver(task) -> dict:
-    """逐群逐条投递（可同步调用便于测试）。带防风控延迟，完成后汇报。"""
+    """一个群一个群地发：每个群都【重新上滑加载】源群消息拿到有效元素，
+    再从上到下逐条 roll_into_view + 转发到这个群。彻底规避"延时后消息滚出可见区失效"。
+    """
     bot = task["bot"]; admin = task["admin"]
     targets = task["targets"]
     label = task["label"]; d = task["delay"]
-    # 关键：投递前从源群【现读】新鲜消息（不依赖实时监听、规避失效）
-    messages = _gather_content(bot, admin, task.get("operator"))
-    if not messages:
-        _worker_report(bot, admin, f"{REPLY_PREFIX} 没读到要转发的内容（可能消息已滚动太远或收集起点丢失），"
-                                   f"请重新 ncc→1 转发。")
+    operator = task.get("operator")
+
+    # 先探一次拿数量（也验证读得到）
+    probe = _gather_content(bot, admin, operator, goback=True)
+    if not probe:
+        _worker_report(bot, admin, f"{REPLY_PREFIX} 没读到要转发的内容（收集起点可能丢失），请重新 ncc→1。")
         return {"ok": 0, "fail": 0, "dead": []}
+    n_msgs = len(probe)
 
     ok = fail = 0
-    dead_msgs = set()
-    fail_streak = {}
+    dead = set()          # 失效签名（连续 2 群失败，多为视频号等真转不了的）
+    streak = {}
     fail_detail = []
 
     for gi, group in enumerate(targets):
         if gi > 0 and gi % int(d["batch_every"]) == 0:
             time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
-        for mi, msg in enumerate(messages):
-            if mi in dead_msgs:
+        # 每个群都重新加载，拿当前有效的消息元素（停在收集起点，从上往下转）
+        msgs = _gather_content(bot, admin, operator, goback=False)
+        if not msgs:
+            fail_detail.append(f"[{group}] 本群读取消息失败")
+            continue
+        for msg in msgs:
+            sig = _sig(msg)
+            if sig in dead:
                 continue
             success, err = _forward_one(msg, group, d)
             if success:
                 ok += 1
-                fail_streak[mi] = 0
+                streak[sig] = 0
             else:
                 fail += 1
-                fail_streak[mi] = fail_streak.get(mi, 0) + 1
-                mtype = str(getattr(msg, "type", "") or "")
-                fail_detail.append(f"[{group}] 第{mi+1}条({mtype}): {err}")
-                if fail_streak[mi] >= 2:
-                    dead_msgs.add(mi)
+                streak[sig] = streak.get(sig, 0) + 1
+                fail_detail.append(f"[{group}] {sig[0]}: {err}")
+                if streak[sig] >= 2:
+                    dead.add(sig)
             time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
         time.sleep(random.uniform(d["group_min"], d["group_max"]))
 
+    # 收尾：把主窗口滚回最新，避免影响后续
+    try:
+        with MAIN_WINDOW_LOCK:
+            bot.wx.ChatWith(admin, exact=False)
+    except Exception:
+        pass
+
     lines = [f"{REPLY_PREFIX} 转发完成！{label}",
-             f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {len(messages)} 条。"]
-    if dead_msgs:
-        nums = "、".join(f"第{i+1}条" for i in sorted(dead_msgs))
-        lines.append(f"⚠️ {nums} 全程转发失败并已跳过（wxauto 无法转发的类型）。")
+             f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。"]
+    if dead:
+        lines.append(f"⚠️ 有 {len(dead)} 条全程转发失败并已跳过（多为视频号等 wxauto 无法转发的类型）。")
     if fail_detail and len(fail_detail) <= 12:
         lines.append("失败明细：\n" + "\n".join(fail_detail))
     elif fail_detail:
         lines.append(f"失败明细较多（{len(fail_detail)} 条），已写日志。")
         log("WARNING", "群发失败明细: " + " | ".join(fail_detail))
     _worker_report(bot, admin, "\n".join(lines))
-    return {"ok": ok, "fail": fail, "dead": sorted(dead_msgs)}
+    return {"ok": ok, "fail": fail, "dead": sorted(dead)}
 
 
 def _worker_report(bot, admin, text):
