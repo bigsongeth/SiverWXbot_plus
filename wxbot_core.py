@@ -143,6 +143,42 @@ def clean_ai_reply_text(text):
 
 
 # ============================================================
+# 发送前清洗：时间戳剥离 & 接话闸门
+# ============================================================
+# 历史消息以 "[2026/07/08 19:07:15] 发送者: 内容" 格式喂给模型（让模型有时间感），
+# 模型偶尔会模仿该格式把时间戳带进回复开头，发送前统一剥掉。
+LEADING_TIMESTAMP_RE = re.compile(
+    r'^\s*\[?\s*\d{4}[/\-]\d{1,2}[/\-]\d{1,2}[ T]\d{1,2}:\d{2}(?::\d{2})?\s*\]?\s*'
+)
+
+
+def strip_leading_timestamp(text):
+    """剥掉回复开头模仿历史消息格式的时间戳（可能连带多个）。"""
+    if not text:
+        return text
+    while True:
+        stripped = LEADING_TIMESTAMP_RE.sub("", text, count=1)
+        if stripped == text:
+            return text
+        text = stripped
+
+
+# 接话闸门：人设 prompt 里约定"判断无需接话时只输出这个标记"，发送前静默拦下。
+# 没在 prompt 里提这个标记的人设不受影响（模型不会自发输出它）。
+NO_REPLY_TOKEN = "[NO_REPLY]"
+
+
+def apply_no_reply_gate(reply):
+    """返回 (是否跳过发送, 清理后的回复)。标记之外还有正文时照常发送正文。"""
+    if not reply or NO_REPLY_TOKEN not in reply:
+        return False, reply
+    remainder = reply.replace(NO_REPLY_TOKEN, "").strip()
+    if remainder:
+        return False, remainder
+    return True, ""
+
+
+# ============================================================
 # 配置管理类
 # ============================================================
 class WXBotConfig:
@@ -1555,7 +1591,8 @@ class CozeAPI:
                 raw = h.get('content', '')
                 sender = h.get('sender', '')
                 if h.get('attr') == 'self':
-                    content = f"[{t}] {raw}" if t else raw
+                    # assistant 历史喂纯内容，避免模型模仿 [时间] 前缀（时间戳外漏 bug）
+                    content = raw
                     try:
                         additional_messages.append(CozeMessage.build_assistant_answer(content))
                     except Exception:
@@ -1832,10 +1869,15 @@ class DusAPI:
                     t = h.get('time', '')
                     raw = h.get('content', '')
                     sender = h.get('sender', '')
-                    if role == 'user' and sender:
-                        content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
+                    if role == 'user':
+                        if sender:
+                            content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
+                        else:
+                            content = f"[{t}] {raw}" if t else raw
                     else:
-                        content = f"[{t}] {raw}" if t else raw
+                        # assistant（本机器人自己过去的发言）喂纯内容：不加 [时间] 前缀，
+                        # 否则模型会模仿该格式把时间戳写进新回复（与 OpenAIAPI.chat 保持一致）。
+                        content = raw
                     messages.append({"role": role, "content": content})
             messages.append({"role": "user", "content": user_content})
 
@@ -1924,10 +1966,14 @@ class DusAPI:
                     t = h.get('time', '')
                     raw = h.get('content', '')
                     sender = h.get('sender', '')
-                    if role == 'user' and sender:
-                        content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
+                    if role == 'user':
+                        if sender:
+                            content = f"[{t}] {sender}: {raw}" if t else f"{sender}: {raw}"
+                        else:
+                            content = f"[{t}] {raw}" if t else raw
                     else:
-                        content = f"[{t}] {raw}" if t else raw
+                        # assistant 历史喂纯内容，避免模型模仿 [时间] 前缀（时间戳外漏 bug）
+                        content = raw
                     input_items.append({
                         "role": role,
                         "content": content
@@ -3159,6 +3205,11 @@ class WXBot:
                     reply = self.config.api_error_reply
                 else:
                     reply = self._clean_reply_for_send(reply)
+                    # 接话闸门：人设 prompt 约定"无需接话时只输出 [NO_REPLY]"，此处静默跳过发送
+                    skip_reply, reply = apply_no_reply_gate(reply)
+                    if skip_reply:
+                        log(message=f"群组 {chat.who} AI 判断无需接话，本条不回复")
+                        return result
 
                 # 拆分多条回复：首条 @ 发言人，后续条不 @
                 if self.config.group_split_reply_switch:
@@ -3265,11 +3316,13 @@ class WXBot:
 
     def _parse_split_reply(self, reply, max_count):
         """按 ||SPLIT|| 分隔符解析回复，过滤空白，截断到 max_count 条"""
-        parts = [p.strip() for p in reply.split(SPLIT_SEPARATOR) if p.strip()]
+        parts = [strip_leading_timestamp(p.strip()) for p in reply.split(SPLIT_SEPARATOR)]
+        parts = [p for p in parts if p]
         return parts[:max_count] if parts else [reply]
 
     def _clean_reply_for_send(self, reply):
         """按配置清洗即将发送给用户的 AI 回复。"""
+        reply = strip_leading_timestamp(reply)  # 时间戳剥离不受清洗开关控制
         if not self.config.clean_ai_reply_switch:
             return reply
         cleaned = clean_ai_reply_text(reply)
@@ -3473,6 +3526,11 @@ class WXBot:
             api_error_reply = True
         else:
             reply = self._clean_reply_for_send(reply)
+            # 接话闸门：人设 prompt 约定"无需接话时只输出 [NO_REPLY]"，此处静默跳过发送
+            skip_reply, reply = apply_no_reply_gate(reply)
+            if skip_reply:
+                log(message=f"私聊 {chat.who} AI 判断无需接话，本条不回复")
+                return True
 
         # 拆分多条回复：仅在开关开启且回复包含分隔符时生效
         if self.config.chat_split_reply_switch:
@@ -4746,6 +4804,14 @@ class WXBot:
         except Exception:
             _wd_heartbeat = _wd_disarm = lambda: None
 
+        # ncc_community hook: 主窗口串行锁，与 ncc 转发后台线程共用，避免主循环
+        # (消息轮询/新好友检查)与转发并发抢主窗口。详见 AI_COLLABORATION_GUIDE.md。
+        try:
+            from plugins.ncc_community.wxlock import WX_LOCK as _NCC_WX_LOCK
+        except Exception:
+            import threading as _ncc_th
+            _NCC_WX_LOCK = _ncc_th.RLock()
+
         # 主循环
         while self.run_flag:
             _wd_heartbeat()
@@ -4779,17 +4845,24 @@ class WXBot:
                     check_new_friend_time_MAX = max(check_new_friend_time_MIN, int(self.config.new_friend_check_max / wait_time))
                     check_new_counter += 1
                     if check_new_counter >= random.randint(check_new_friend_time_MIN, check_new_friend_time_MAX):
-                        try:
-                            self.Pass_New_Friends()
-                            # log(message="检查新好友完成")
-                        except Exception as e:
-                            self.is_err(self.wx.nickname + "  智能客服bot监听新好友出错！！请检查程序！！", e)
-                        check_new_counter = 0
+                        # ncc_community hook: 转发/消息正占用主窗口时，新好友检查【让路】
+                        # ——抢不到锁就跳过、不重置计数，下个循环再来，不与转发抢窗口。
+                        if _NCC_WX_LOCK.acquire(blocking=False):
+                            try:
+                                self.Pass_New_Friends()
+                                # log(message="检查新好友完成")
+                            except Exception as e:
+                                self.is_err(self.wx.nickname + "  智能客服bot监听新好友出错！！请检查程序！！", e)
+                            finally:
+                                _NCC_WX_LOCK.release()
+                                check_new_counter = 0
 
                 # ---- 全局监听模式（黑名单模式下启用）----
                 if self.config.AllListen_switch:
                     try:
-                        last_time = self.ALLListen_mode(last_time=last_time)
+                        # ncc_community hook: 消息轮询与转发共用主窗口锁，串行不抢窗口
+                        with _NCC_WX_LOCK:
+                            last_time = self.ALLListen_mode(last_time=last_time)
                     except Exception as e:
                         if not self.run_flag:
                             log(level="ERROR", message=str(e) + "\n全局模式出错！！请检查程序！！")

@@ -38,13 +38,18 @@ _STATE = {}                # sender -> {"state","messages":[...],"last_active"}
 _STATE_LOCK = threading.Lock()
 STATE_TTL = 600            # 状态闲置超时（秒）
 
-# 主窗口操作锁：每次 forward 单独加锁，间隔延迟时释放，让监听线程插空收消息
-MAIN_WINDOW_LOCK = threading.Lock()
+# 主窗口全局锁：转发线程 / 主循环消息轮询 / 主循环新好友检查【共用同一把】，串行化
+# 主窗口访问，避免并发抢窗口导致"转发到一半失败"。主循环侧的 hook 见 wxbot_core.py +
+# AI_COLLABORATION_GUIDE.md「潜在冲突：主窗口串行锁」。
+from .wxlock import WX_LOCK as MAIN_WINDOW_LOCK
 
-DELAY = {  # 防风控延迟默认值（照搬旧 WCRobot），可被 config.forward.delay 覆盖
-    "group_min": 3.0, "group_max": 5.0,
-    "batch_every": 10, "batch_min": 5.0, "batch_max": 10.0,
-    "msg_min": 1.0, "msg_max": 2.0, "max_retries": 3,
+# 一次 forward 最多转给几个群（微信"分别转发"多选上限约 9），超过分批
+CHUNK_SIZE = 9
+
+DELAY = {  # 防风控延迟（可被 config.forward.delay 覆盖）
+    "chunk_min": 1.0, "chunk_max": 2.5,     # 每次 forward（一批群）之间
+    "msg_min": 2.0, "msg_max": 4.0,         # 每条消息之间
+    "max_retries": 3,
 }
 
 # 收集时忽略的消息类型：只跳真噪音。视频号是 'other'，必须收集。
@@ -89,18 +94,19 @@ def _delays(cfg):
     return d
 
 
-def _forward_one(msg, group, d) -> tuple[bool, str]:
-    """把一条消息转发到单个群，带重试。转发前先 roll_into_view 把消息滚进可见区
-    （wxauto 只有可见消息才有有效控件、才能转发）。返回 (成功, 错误)。"""
+def _forward_chunk(msg, groups, d) -> tuple[bool, str]:
+    """把【一条消息】用一次 forward 转给【一批群（≤9）】，带重试。
+    转发前 roll_into_view 把消息滚进可见区（wxauto 只有可见消息才能转发）。
+    整个 roll+forward 在主窗口锁内原子完成，避免主循环中途抢窗口。"""
     last_err = ""
     for _ in range(int(d["max_retries"])):
         try:
             with MAIN_WINDOW_LOCK:
                 try:
-                    msg.roll_into_view()        # 关键：转发前把这条滚进可见区
+                    msg.roll_into_view()
                 except Exception:
                     pass
-                r = msg.forward(group)          # 单目标，绕开 9 限制
+                r = msg.forward(list(groups))   # 一次转多群（微信原生分别转发）
             if r is None or r:                  # wxautox 成功返回 None
                 return True, ""
             last_err = _wxresponse_message(r)
@@ -207,52 +213,45 @@ def _sig(msg):
 
 
 def _deliver(task) -> dict:
-    """一个群一个群地发：每个群都【重新上滑加载】源群消息拿到有效元素，
-    再从上到下逐条 roll_into_view + 转发到这个群。彻底规避"延时后消息滚出可见区失效"。
+    """消息主序 + 一次转一批群：
+    只【读一次】源群拿到有效消息元素，然后【逐条消息】用 forward([一批≤9群]) 群发。
+    操作数从 N×M 降到 N×⌈M/9⌉，每条消息只需"可见一次"就发一批群，几乎无失效窗口。
+    主窗口锁已和主循环共用，转发期间主循环不会来抢窗口。
     """
     bot = task["bot"]; admin = task["admin"]
     targets = task["targets"]
     label = task["label"]; d = task["delay"]
     operator = task.get("operator")
 
-    # 先探一次拿数量（也验证读得到）
-    probe = _gather_content(bot, admin, operator, goback=True)
-    if not probe:
+    # 只读一次（停在收集起点，元素有效）
+    msgs = _gather_content(bot, admin, operator, goback=False)
+    if not msgs:
         _worker_report(bot, admin, f"{REPLY_PREFIX} 没读到要转发的内容（收集起点可能丢失），请重新 ncc→1。")
         return {"ok": 0, "fail": 0, "dead": []}
-    n_msgs = len(probe)
+    n_msgs = len(msgs)
+    chunk = max(1, min(CHUNK_SIZE, int(task.get("chunk_size", CHUNK_SIZE))))
+    group_chunks = [targets[i:i + chunk] for i in range(0, len(targets), chunk)]
 
     ok = fail = 0
-    dead = set()          # 失效签名（连续 2 群失败，多为视频号等真转不了的）
-    streak = {}
+    dead = []             # 整条转发失败的消息（多为视频号等）
     fail_detail = []
 
-    for gi, group in enumerate(targets):
-        if gi > 0 and gi % int(d["batch_every"]) == 0:
-            time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
-        # 每个群都重新加载，拿当前有效的消息元素（停在收集起点，从上往下转）
-        msgs = _gather_content(bot, admin, operator, goback=False)
-        if not msgs:
-            fail_detail.append(f"[{group}] 本群读取消息失败")
-            continue
-        for msg in msgs:
-            sig = _sig(msg)
-            if sig in dead:
-                continue
-            success, err = _forward_one(msg, group, d)
+    for mi, msg in enumerate(msgs):
+        any_ok = False
+        for ci, cg in enumerate(group_chunks):
+            success, err = _forward_chunk(msg, cg, d)
             if success:
-                ok += 1
-                streak[sig] = 0
+                ok += len(cg)
+                any_ok = True
             else:
-                fail += 1
-                streak[sig] = streak.get(sig, 0) + 1
-                fail_detail.append(f"[{group}] {sig[0]}: {err}")
-                if streak[sig] >= 2:
-                    dead.add(sig)
-            time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
-        time.sleep(random.uniform(d["group_min"], d["group_max"]))
+                fail += len(cg)
+                fail_detail.append(f"第{mi+1}条({_sig(msg)[0]})→{len(cg)}群: {err}")
+            time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))
+        if not any_ok:
+            dead.append(mi)
+        time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
 
-    # 收尾：把主窗口滚回最新，避免影响后续
+    # 收尾：主窗口回到最新
     try:
         with MAIN_WINDOW_LOCK:
             bot.wx.ChatWith(admin, exact=False)
@@ -262,14 +261,15 @@ def _deliver(task) -> dict:
     lines = [f"{REPLY_PREFIX} 转发完成！{label}",
              f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。"]
     if dead:
-        lines.append(f"⚠️ 有 {len(dead)} 条全程转发失败并已跳过（多为视频号等 wxauto 无法转发的类型）。")
+        nums = "、".join(f"第{i+1}条" for i in dead)
+        lines.append(f"⚠️ {nums} 全程转发失败并已跳过（多为视频号等 wxauto 无法转发的类型）。")
     if fail_detail and len(fail_detail) <= 12:
         lines.append("失败明细：\n" + "\n".join(fail_detail))
     elif fail_detail:
         lines.append(f"失败明细较多（{len(fail_detail)} 条），已写日志。")
         log("WARNING", "群发失败明细: " + " | ".join(fail_detail))
     _worker_report(bot, admin, "\n".join(lines))
-    return {"ok": ok, "fail": fail, "dead": sorted(dead)}
+    return {"ok": ok, "fail": fail, "dead": dead}
 
 
 def _worker_report(bot, admin, text):

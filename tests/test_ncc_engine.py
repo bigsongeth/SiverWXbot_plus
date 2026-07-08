@@ -32,18 +32,20 @@ class FakeMsg:
         self.type = mtype
         self.attr = attr
         self.sender = sender
-        self.forwarded = []      # 记录每次 forward 的单个目标
+        self.forwarded = []      # 记录被转发到的所有群（forward 收列表）
         self.forward_ok = True   # False 模拟视频号等转不了的消息
 
     def forward(self, target, **kw):
-        # 新模型：一次只转一个群（单目标字符串）
-        self.forwarded.append(target)
-        # 成功 None；失败返回 falsy 的 WxResponse（模拟真实 __bool__）
+        # 新模型：一次转一批群（列表）
+        groups = target if isinstance(target, list) else [target]
+        self.forwarded.extend(groups)
         return None if self.forward_ok else FakeWxResponse(False, "转发失败")
 
+    def roll_into_view(self):
+        pass
 
-ZERO_DELAY = {"group_min": 0, "group_max": 0, "batch_every": 10, "batch_min": 0,
-              "batch_max": 0, "msg_min": 0, "msg_max": 0, "max_retries": 1}
+
+ZERO_DELAY = {"chunk_min": 0, "chunk_max": 0, "msg_min": 0, "msg_max": 0, "max_retries": 1}
 
 
 def _prompt():
@@ -313,23 +315,24 @@ class EngineTest(unittest.TestCase):
         handled = handle_friend_message(self.bot, self.admin, FakeMsg("3"))
         self.assertFalse(handled)   # 不劫持普通群聊里的数字
 
-    def test_deliver_one_group_at_a_time(self):
+    def test_deliver_chunks_over_9_groups(self):
+        # 12 个群 → 分 2 批（9+3），一条消息 forward 2 次覆盖全部
         m = FakeMsg("素材", mtype="text")
-        build_timeline(self.bot, m)   # worker 现读到这条
+        build_timeline(self.bot, m)
         task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
-                "targets": [f"群{i}" for i in range(5)], "label": "x", "delay": dict(ZERO_DELAY)}
+                "targets": [f"群{i}" for i in range(12)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
-        self.assertEqual(stat["ok"], 5)
-        self.assertEqual(sorted(m.forwarded), sorted(f"群{i}" for i in range(5)))
+        self.assertEqual(stat["ok"], 12)
+        self.assertEqual(sorted(m.forwarded), sorted(f"群{i}" for i in range(12)))
 
-    def test_deliver_unforwardable_skipped_after_two_groups(self):
+    def test_deliver_unforwardable_marked_dead(self):
         vid = FakeMsg("[视频号]", mtype="other"); vid.forward_ok = False
         build_timeline(self.bot, vid)
         task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
                 "targets": [f"群{i}" for i in range(6)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
-        self.assertEqual(len(stat["dead"]), 1)      # 一条被判失效（按签名）
-        self.assertEqual(len(vid.forwarded), 2)     # 前 2 群试过，后 4 群跳过
+        self.assertEqual(stat["dead"], [0])         # 整条转发失败
+        self.assertEqual(stat["ok"], 0)
         self.assertIn("全程转发失败", " ".join(m for _, m in self.bot.wx.sent))
 
     def test_direct_sync_shortcut(self):

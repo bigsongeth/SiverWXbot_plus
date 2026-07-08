@@ -92,9 +92,48 @@ elif event_type is None and 'choices' in data:
 *   **配置安全性**：修改 `config/config.json` 结构时，需确保 Dashboard 前端（`templates/dashboard.html`）能正确处理默认值，防止由于配置项缺失导致页面渲染失败。
 *   **无感热更**：修改逻辑后，若需重启服务生效，应事先告知用户。
 
-## 6. 常见协作任务流程
+## 6. 潜在冲突：主窗口串行锁（`wxbot_core.py` 主循环，★合并上游必看）
+
+**背景**：wxauto 是 UI 自动化，整个微信只有一个主窗口。机器人主循环（单线程）会跑
+消息轮询 `ALLListen_mode`(内部 `GetNextNewMessage`) 和新好友检查 `Pass_New_Friends`
+(内部 `SwitchToContact` 切通讯录)，而 `plugins/ncc_community` 的**转发跑在后台线程**也要
+驱动主窗口。两者并发会互相把窗口切走 → "转发到一半失败"。
+
+**定制方案**：用一把共享锁 `plugins/ncc_community/wxlock.py: WX_LOCK`（RLock）把三方串行化。
+`wxbot_core.py` 的 `run()` 主循环里有 **3 处 hook**（都以 `# ncc_community hook` 注释标记）：
+
+1. 主循环 `while self.run_flag:` 之前，导入锁：
+   ```python
+   try:
+       from plugins.ncc_community.wxlock import WX_LOCK as _NCC_WX_LOCK
+   except Exception:
+       import threading as _ncc_th
+       _NCC_WX_LOCK = _ncc_th.RLock()
+   ```
+2. **新好友检查**改为"抢不到锁就让路"（转发优先，抢不到不重置计数、下轮再来）：
+   ```python
+   if _NCC_WX_LOCK.acquire(blocking=False):
+       try:
+           self.Pass_New_Friends()
+       except Exception as e:
+           self.is_err(...)
+       finally:
+           _NCC_WX_LOCK.release()
+           check_new_counter = 0
+   # 没抢到锁：跳过，不重置计数
+   ```
+3. **消息轮询** `ALLListen_mode` 包在 `with _NCC_WX_LOCK:` 内。
+
+**合并上游后务必确认这 3 处还在**。转发线程侧对应地在 `plugins/ncc_community/forward.py`
+用 `MAIN_WINDOW_LOCK`（= 同一个 `WX_LOCK`）包裹每次 `roll_into_view + forward` 与
+读取/汇报操作。锁是 RLock：同线程可重入，跨线程互斥。
+
+**优先级原则**：新好友检查最低（抢不到就跳过）；消息轮询正常参与排队（保证还能收指令）；
+转发按操作粒度持锁（每次 forward 一批群后释放，让轮询插空）。
+
+## 7. 常见协作任务流程
 1.  **文件修改**：通过文件操作工具编辑代码内容。
 2.  **验证一致性**：检查是否误引入了已剔除的广告或不兼容的 API 路径。
-3.  **合并上游**：拉取上游更新后，按照第 4 节的检查清单逐项确认定制修改未被覆盖。
+3.  **合并上游**：拉取上游更新后，按第 4 节清单 + 第 6 节主窗口锁 hook 逐项确认定制未被覆盖。
 4.  **远程提交**：通过 SSH 调用 git 命令进行 commit。
 5.  **汇报总结**：清晰列出修改点及对应的 commit ID。
