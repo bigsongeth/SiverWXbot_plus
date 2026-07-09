@@ -94,60 +94,71 @@ def _delays(cfg):
     return d
 
 
-def _forward_located_message(bot, source, sig, group_chunks, d) -> tuple[bool, str]:
-    """【定位后转发】按签名(类型+内容)把这条消息在视图里定位出来，拿它当下的
-    新鲜元素，立即转发给各批群（每批≤9）。整个"定位→取新鲜元素→转发"在同一次
-    持锁内原子完成，规避元素失效和主循环抢窗口。带重试。
-
-    定位办法：ChatWith 回到最新 → GetHistoryMessage 往上滚，回调匹配到本条签名就停，
-    视图正好停在这条上 → GetAllMessage 取此刻可见（有效）的同签名元素。
-    """
+def _locate(bot, source, sig):
+    """（须在 MAIN_WINDOW_LOCK 内调用）滚动定位到 sig 对应消息，返回它当前可见的
+    新鲜元素或 None。ChatWith 回最新 → GetHistoryMessage 往上滚，匹配到本条签名就停，
+    视图停在它上面 → GetAllMessage 取此刻可见（有效）的同签名元素。"""
     STOP = _stop_sign()
-    last_err = ""
-    for _ in range(int(d["max_retries"])):
-        try:
+    bot.wx.ChatWith(source, exact=False)
+    time.sleep(GATHER_SETTLE)
+
+    def cb(m, _s=sig):
+        if _sig(m) == _s:
+            return STOP
+
+    try:
+        bot.wx.GetHistoryMessage(n=120, callback=cb, goback=False)
+    except TypeError:
+        bot.wx.GetHistoryMessage(n=120, callback=cb)
+    except Exception:
+        pass
+    for m in (bot.wx.GetAllMessage() or []):
+        if _sig(m) == sig:
+            return m
+    return None
+
+
+def _forward_located_message(bot, source, sig, group_chunks, d) -> tuple[bool, str]:
+    """把一条消息（按签名定位）转发给各批群（每批≤9）。
+
+    锁粒度：【每批单独持锁】，批间延时放在锁外——转发 99 群这种长任务时，主循环能在
+    每批之间插空收消息（不会被一把大锁闷住几十秒）。元素缓存复用，只有转发抛"已失效"
+    时才重新定位（自愈）。
+    """
+    cached = None
+    total_ok = True
+    errs = []
+    for cg in group_chunks:
+        chunk_ok = False
+        last = ""
+        for _ in range(int(d["max_retries"])):
             with MAIN_WINDOW_LOCK:
-                bot.wx.ChatWith(source, exact=False)
-                time.sleep(GATHER_SETTLE)
-
-                def cb(m, _s=sig):
-                    if _sig(m) == _s:
-                        return STOP          # 滚到这条就停，视图定位到它
-
-                try:
-                    bot.wx.GetHistoryMessage(n=120, callback=cb, goback=False)
-                except TypeError:
-                    bot.wx.GetHistoryMessage(n=120, callback=cb)
-                except Exception:
-                    pass
-
-                visible = bot.wx.GetAllMessage() or []
-                fresh = next((m for m in visible if _sig(m) == sig), None)
-                if fresh is None:
-                    last_err = "视图中定位不到该消息"
+                if cached is None:
+                    cached = _locate(bot, source, sig)
+                if cached is None:
+                    last = "视图中定位不到该消息"
                 else:
-                    ok_all, errs = True, []
-                    for cg in group_chunks:
+                    try:
                         try:
-                            fresh.roll_into_view()
+                            cached.roll_into_view()
                         except Exception:
                             pass
-                        try:
-                            r = fresh.forward(list(cg))
-                            if not (r is None or r):
-                                ok_all = False
-                                errs.append(_wxresponse_message(r))
-                        except Exception as e:
-                            ok_all = False
-                            errs.append(str(e))
-                        time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))
-                    if ok_all:
-                        return True, ""
-                    last_err = "; ".join(errs)
-        except Exception as e:
-            last_err = str(e)
-        time.sleep(2)
-    return False, last_err
+                        r = cached.forward(list(cg))
+                        if r is None or r:
+                            chunk_ok = True
+                        else:
+                            last = _wxresponse_message(r)
+                    except Exception as e:
+                        last = str(e)
+                        cached = None          # 元素失效 → 下轮重新定位
+            if chunk_ok:
+                break
+            time.sleep(2)
+        if not chunk_ok:
+            total_ok = False
+            errs.append(last)
+        time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))   # 锁外：让主循环插空收消息
+    return total_ok, "; ".join(errs)
 
 
 def _forward_worker():
