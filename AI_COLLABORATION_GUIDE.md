@@ -130,9 +130,21 @@ elif event_type is None and 'choices' in data:
 再干别的"。故改为闸门让路的**串行排队**模型：转发独占直到完成，其它按序跟上（不并发、不丢消息，
 代价是大群发期间收到的消息会延后几分钟处理——已与用户确认接受，选 A）。
 
-## 7. 常见协作任务流程
+## 7. 潜在冲突：wxautox4 库内改动（site-packages，★重装/升级必重打）
+
+为**放慢转发多选框逐群勾选、防止微信卡死**，改过 wxautox4 内一行（不在本仓库里，
+`pip install/upgrade wxautox4` 会被覆盖，届时需重新改）：
+
+- 文件：`…/site-packages/wxautox4/uia/uiautomation.py`
+- 改动：全局 `OPERATION_WAIT_TIME = 0.5` → `OPERATION_WAIT_TIME = 1.0`
+  （每次点击/勾选/输入后的等待，翻倍 → 勾群变慢；备份在同目录 `uiautomation.py.nccbak`）
+- 影响面：全局 UI 操作都变慢约 0.5s（收发消息也稍慢，可接受）。`forward` 本身在
+  `msgs/*.pyd`、多选框在 `ui/*.pyd`，都是编译的，改不了，只能拧这个底层等待。
+- 配合：`plugins/ncc_community/forward.py` 的 `DELAY`（批间 3-5s、消息间 5-8s）进一步降低连发频率。
+
+## 8. 常见协作任务流程
 1.  **文件修改**：通过文件操作工具编辑代码内容。
 2.  **验证一致性**：检查是否误引入了已剔除的广告或不兼容的 API 路径。
-3.  **合并上游**：拉取上游更新后，按第 4 节清单 + 第 6 节主窗口锁 hook 逐项确认定制未被覆盖。
+3.  **合并上游**：拉取上游更新后，按第 4 节清单 + 第 6 节主窗口闸门 hook + 第 7 节库内改动逐项确认。
 4.  **远程提交**：通过 SSH 调用 git 命令进行 commit。
 5.  **汇报总结**：清晰列出修改点及对应的 commit ID。

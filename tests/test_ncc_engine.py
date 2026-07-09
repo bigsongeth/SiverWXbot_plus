@@ -33,13 +33,18 @@ class FakeMsg:
         self.attr = attr
         self.sender = sender
         self.forwarded = []      # 记录被转发到的所有群（forward 收列表）
-        self.forward_ok = True   # False 模拟视频号等转不了的消息
+        self.forward_ok = True   # False 模拟整条转不了（视频号等）
+        self.gone_set = set()    # 这些群"无结果"（被踢/解散）
 
     def forward(self, target, **kw):
         # 新模型：一次转一批群（列表）
         groups = target if isinstance(target, list) else [target]
+        if not self.forward_ok:
+            return FakeWxResponse(False, "转发失败")
+        if any(g in self.gone_set for g in groups):
+            return FakeWxResponse(False, "无结果")   # 该批里有没了的群 → 整批失败，触发逐个回退
         self.forwarded.extend(groups)
-        return None if self.forward_ok else FakeWxResponse(False, "转发失败")
+        return None
 
     def roll_into_view(self):
         pass
@@ -323,17 +328,31 @@ class EngineTest(unittest.TestCase):
                 "targets": [f"群{i}" for i in range(12)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
         self.assertEqual(stat["ok"], 12)
+        self.assertEqual(stat["gone"], [])
         self.assertEqual(sorted(m.forwarded), sorted(f"群{i}" for i in range(12)))
 
-    def test_deliver_unforwardable_marked_dead(self):
+    def test_deliver_gone_group_marked_and_skipped(self):
+        # 群1 已没了(无结果)：整批失败→逐个回退→只把群1判不可达，其余照发
+        m = FakeMsg("素材", mtype="text"); m.gone_set = {"群1"}
+        build_timeline(self.bot, m)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": ["群0", "群1", "群2"], "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["gone"], ["群1"])
+        self.assertEqual(stat["ok"], 2)
+        self.assertEqual(sorted(m.forwarded), ["群0", "群2"])
+        self.assertIn("无结果", " ".join(mm for _, mm in self.bot.wx.sent))
+
+    def test_deliver_unforwardable_does_not_blame_groups(self):
+        # 整条都转不了（视频号）→ 判定是消息问题，不冤枉任何群（gone 为空）
         vid = FakeMsg("[视频号]", mtype="other"); vid.forward_ok = False
         build_timeline(self.bot, vid)
         task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
                 "targets": [f"群{i}" for i in range(6)], "label": "x", "delay": dict(ZERO_DELAY)}
         stat = forward._deliver(task)
-        self.assertEqual(stat["dead"], [0])         # 整条转发失败
+        self.assertEqual(stat["gone"], [])          # 没有群被标记不可达
         self.assertEqual(stat["ok"], 0)
-        self.assertIn("转发失败", " ".join(m for _, m in self.bot.wx.sent))
+        self.assertIn("整条转发失败", " ".join(m for _, m in self.bot.wx.sent))
 
     def test_direct_sync_shortcut(self):
         called = {}

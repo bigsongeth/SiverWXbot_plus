@@ -224,6 +224,21 @@ def mark_remark_applied(name: str, remark: str) -> None:
             save(data)
 
 
+def mark_unreachable(name_or_target: str):
+    """把一个"转发无结果/找不到"的群在本地标记为不可达（被踢/解散/改名）：
+    allow_forward=False + status="unreachable"，后续转发自动跳过它。
+    按 群名 / 备注 / 寻址串 三种都匹配。返回被标记的群名或 None。"""
+    with _LOCK:
+        data = load()
+        for name, g in data.get("groups", {}).items():
+            if name == name_or_target or g.get("remark") == name_or_target or target(g) == name_or_target:
+                g["allow_forward"] = False
+                g["status"] = "unreachable"
+                save(data)
+                return name
+    return None
+
+
 def record_managed(name: str, page_id: str = None) -> None:
     """记录一个群已纳管（打了🐶 + 可选 Notion page_id）。不存在则新建。
     Phase 3 批量迁移用：微信里发现的群，无论库里有没有，都能落地登记。"""
