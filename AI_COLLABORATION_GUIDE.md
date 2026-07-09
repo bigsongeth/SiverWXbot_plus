@@ -92,44 +92,43 @@ elif event_type is None and 'choices' in data:
 *   **配置安全性**：修改 `config/config.json` 结构时，需确保 Dashboard 前端（`templates/dashboard.html`）能正确处理默认值，防止由于配置项缺失导致页面渲染失败。
 *   **无感热更**：修改逻辑后，若需重启服务生效，应事先告知用户。
 
-## 6. 潜在冲突：主窗口串行锁（`wxbot_core.py` 主循环，★合并上游必看）
+## 6. 潜在冲突：主窗口"转发中"闸门（`wxbot_core.py`，★合并上游必看）
 
-**背景**：wxauto 是 UI 自动化，整个微信只有一个主窗口。机器人主循环（单线程）会跑
-消息轮询 `ALLListen_mode`(内部 `GetNextNewMessage`) 和新好友检查 `Pass_New_Friends`
-(内部 `SwitchToContact` 切通讯录)，而 `plugins/ncc_community` 的**转发跑在后台线程**也要
-驱动主窗口。两者并发会互相把窗口切走 → "转发到一半失败"。
+**背景**：wxauto 是 UI 自动化，整个微信只有一个主窗口，且有多条线在驱动它：
+- **wxautox 监听线程** `message_handle_callback`（群/私聊消息处理、AI 回复、ncc 转发触发）——这是本机器人处理群消息的**主路**；
+- **主循环** `ALLListen_mode`(动态新会话轮询) + `Pass_New_Friends`(新好友，切通讯录) + 定时任务；
+- `plugins/ncc_community` 的**转发后台线程**。
 
-**定制方案**：用一把共享锁 `plugins/ncc_community/wxlock.py: WX_LOCK`（RLock）把三方串行化。
-`wxbot_core.py` 的 `run()` 主循环里有 **3 处 hook**（都以 `# ncc_community hook` 注释标记）：
+它们并发会互相把窗口切走 → "转发到一半失败"。且消息处理是同步的（读→知识库/AI 十几秒→回复），
+若与转发并发就是灾难。
 
-1. 主循环 `while self.run_flag:` 之前，导入锁：
+**用户要求（2026-07）**：进了转发就先把转发做完，其它（加群/加好友/朋友圈/AI回复…）
+排队等它做完再按序执行，别互相堵、别丢消息。
+
+**定制方案**：`plugins/ncc_community/wxlock.py` 提供一个全局"转发中"闸门
+（`set_forwarding/is_forwarding/wait_while_forwarding`，带超时兜底防卡死）+ `WX_LOCK`。
+转发后台线程整个群发期间 `set_forwarding(True)`（`forward.py: _forward_worker` 里 try/finally）。
+`wxbot_core.py` 有 **2 处 hook**（都以 `# ncc_community hook` 注释标记）：
+
+1. **主循环** `while self.run_flag:` 内、`_wd_heartbeat()` 之后：转发中就让路（本轮不碰主窗口，
+   只心跳+睡；未读消息留在微信里，转发完下一轮自然读到，不丢）：
    ```python
-   try:
-       from plugins.ncc_community.wxlock import WX_LOCK as _NCC_WX_LOCK
-   except Exception:
-       import threading as _ncc_th
-       _NCC_WX_LOCK = _ncc_th.RLock()
+   from plugins.ncc_community.wxlock import is_forwarding as _ncc_is_forwarding  # 循环前导入(带 except 兜底)
+   ...
+   _wd_heartbeat()
+   if _ncc_is_forwarding():
+       time.sleep(wait_time)
+       continue
    ```
-2. **新好友检查**改为"抢不到锁就让路"（转发优先，抢不到不重置计数、下轮再来）：
-   ```python
-   if _NCC_WX_LOCK.acquire(blocking=False):
-       try:
-           self.Pass_New_Friends()
-       except Exception as e:
-           self.is_err(...)
-       finally:
-           _NCC_WX_LOCK.release()
-           check_new_counter = 0
-   # 没抢到锁：跳过，不重置计数
-   ```
-3. **消息轮询** `ALLListen_mode` 包在 `with _NCC_WX_LOCK:` 内。
+2. **监听回调** `message_handle_callback` 开头：转发中就 `wait_while_forwarding()` 等它做完再处理
+   （消息不丢，wxauto 会把后续回调排队，做完按序处理）。
 
-**合并上游后务必确认这 3 处还在**。转发线程侧对应地在 `plugins/ncc_community/forward.py`
-用 `MAIN_WINDOW_LOCK`（= 同一个 `WX_LOCK`）包裹每次 `roll_into_view + forward` 与
-读取/汇报操作。锁是 RLock：同线程可重入，跨线程互斥。
+**合并上游后务必确认这 2 处还在**，且 `_forward_worker` 里的 `set_forwarding` try/finally 还在。
+主循环因为每轮先 `_wd_heartbeat()` 再判断让路，转发再久也不会触发 ui_watchdog（心跳照常）。
 
-**优先级原则**：新好友检查最低（抢不到就跳过）；消息轮询正常参与排队（保证还能收指令）；
-转发按操作粒度持锁（每次 forward 一批群后释放，让轮询插空）。
+**为什么不再用"细粒度锁交错"**：那样 AI 回复(十几秒)会和转发交错抢窗口；用户明确要"转发做完
+再干别的"。故改为闸门让路的**串行排队**模型：转发独占直到完成，其它按序跟上（不并发、不丢消息，
+代价是大群发期间收到的消息会延后几分钟处理——已与用户确认接受，选 A）。
 
 ## 7. 常见协作任务流程
 1.  **文件修改**：通过文件操作工具编辑代码内容。

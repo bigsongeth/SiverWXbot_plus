@@ -2952,6 +2952,13 @@ class WXBot:
         :param msg:  消息对象（含 type、attr、sender、content 等属性）
         :param chat: 聊天窗口子对象（含 who 等属性）
         """
+        # ncc_community hook: 转发进行中就先等它做完再处理这条（不丢，排在转发后按序处理），
+        # 避免 AI 回复等窗口操作与转发并发抢窗口。详见 AI_COLLABORATION_GUIDE.md。
+        try:
+            from plugins.ncc_community.wxlock import wait_while_forwarding as _ncc_wait_fwd
+            _ncc_wait_fwd()
+        except Exception:
+            pass
         try:
             # 记录原始消息日志
             message_time = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
@@ -4804,17 +4811,21 @@ class WXBot:
         except Exception:
             _wd_heartbeat = _wd_disarm = lambda: None
 
-        # ncc_community hook: 主窗口串行锁，与 ncc 转发后台线程共用，避免主循环
-        # (消息轮询/新好友检查)与转发并发抢主窗口。详见 AI_COLLABORATION_GUIDE.md。
+        # ncc_community hook: 主窗口"转发中"闸门。转发进行时，主循环本轮跳过所有窗口活儿
+        # （新好友/消息轮询/定时任务），只心跳+睡；消息留在微信里没读，转发做完下一轮再读，
+        # 不丢。详见 AI_COLLABORATION_GUIDE.md「潜在冲突：主窗口串行闸门」。
         try:
-            from plugins.ncc_community.wxlock import WX_LOCK as _NCC_WX_LOCK
+            from plugins.ncc_community.wxlock import is_forwarding as _ncc_is_forwarding
         except Exception:
-            import threading as _ncc_th
-            _NCC_WX_LOCK = _ncc_th.RLock()
+            _ncc_is_forwarding = lambda: False
 
         # 主循环
         while self.run_flag:
             _wd_heartbeat()
+            # ncc_community hook: 转发进行中就让路（本轮不碰主窗口），转发完自然恢复
+            if _ncc_is_forwarding():
+                time.sleep(wait_time)
+                continue
             try:
                 # ---- 离线检测模块（每 check_interval 次循环执行一次）----
                 check_counter += 1
@@ -4845,24 +4856,17 @@ class WXBot:
                     check_new_friend_time_MAX = max(check_new_friend_time_MIN, int(self.config.new_friend_check_max / wait_time))
                     check_new_counter += 1
                     if check_new_counter >= random.randint(check_new_friend_time_MIN, check_new_friend_time_MAX):
-                        # ncc_community hook: 转发/消息正占用主窗口时，新好友检查【让路】
-                        # ——抢不到锁就跳过、不重置计数，下个循环再来，不与转发抢窗口。
-                        if _NCC_WX_LOCK.acquire(blocking=False):
-                            try:
-                                self.Pass_New_Friends()
-                                # log(message="检查新好友完成")
-                            except Exception as e:
-                                self.is_err(self.wx.nickname + "  智能客服bot监听新好友出错！！请检查程序！！", e)
-                            finally:
-                                _NCC_WX_LOCK.release()
-                                check_new_counter = 0
+                        try:
+                            self.Pass_New_Friends()
+                            # log(message="检查新好友完成")
+                        except Exception as e:
+                            self.is_err(self.wx.nickname + "  智能客服bot监听新好友出错！！请检查程序！！", e)
+                        check_new_counter = 0
 
                 # ---- 全局监听模式（黑名单模式下启用）----
                 if self.config.AllListen_switch:
                     try:
-                        # ncc_community hook: 消息轮询与转发共用主窗口锁，串行不抢窗口
-                        with _NCC_WX_LOCK:
-                            last_time = self.ALLListen_mode(last_time=last_time)
+                        last_time = self.ALLListen_mode(last_time=last_time)
                     except Exception as e:
                         if not self.run_flag:
                             log(level="ERROR", message=str(e) + "\n全局模式出错！！请检查程序！！")

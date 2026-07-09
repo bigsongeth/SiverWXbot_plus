@@ -38,10 +38,11 @@ _STATE = {}                # sender -> {"state","messages":[...],"last_active"}
 _STATE_LOCK = threading.Lock()
 STATE_TTL = 600            # 状态闲置超时（秒）
 
-# 主窗口全局锁：转发线程 / 主循环消息轮询 / 主循环新好友检查【共用同一把】，串行化
-# 主窗口访问，避免并发抢窗口导致"转发到一半失败"。主循环侧的 hook 见 wxbot_core.py +
-# AI_COLLABORATION_GUIDE.md「潜在冲突：主窗口串行锁」。
+# 主窗口全局闸门：转发线程 / 主循环 / 监听线程共用。转发进行时其它任务让路排队，
+# 转发做完再按序执行。主循环 + 监听线程侧 hook 见 wxbot_core.py +
+# AI_COLLABORATION_GUIDE.md「潜在冲突：主窗口串行闸门」。
 from .wxlock import WX_LOCK as MAIN_WINDOW_LOCK
+from .wxlock import set_forwarding
 
 # 一次 forward 最多转给几个群（微信"分别转发"多选上限约 9），超过分批
 CHUNK_SIZE = 9
@@ -157,7 +158,7 @@ def _forward_located_message(bot, source, sig, group_chunks, d) -> tuple[bool, s
         if not chunk_ok:
             total_ok = False
             errs.append(last)
-        time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))   # 锁外：让主循环插空收消息
+        time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))   # 批间节流（防风控）
     return total_ok, "; ".join(errs)
 
 
@@ -166,7 +167,12 @@ def _forward_worker():
         task = _QUEUE.get()
         try:
             if task:
-                _deliver(task)
+                # 举起"转发中"闸门：整个群发期间主循环/监听线程让路排队，做完再按序处理
+                set_forwarding(True)
+                try:
+                    _deliver(task)
+                finally:
+                    set_forwarding(False)
         except Exception as e:
             log("ERROR", f"群发线程异常: {e}")
             try:
