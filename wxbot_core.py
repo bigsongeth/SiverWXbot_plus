@@ -2,8 +2,8 @@
 # Siver微信机器人 siver_wxbot - 面向对象版本 - wxautox4版本
 # 作者：https://www.siver.top
 
-version = "V4.7.27"
-version_log = "V4.7.27 - 优化远程访问、关闭SESSION_COOKIE_HTTPONLY方便内外网访问、优化面板接口测试"
+version = "V4.7.28"
+version_log = "V4.7.28 - 优化群组引用消息回复、关键词回复支持引用或@、优化日志、优化定时消息注册与发送、定时消息 新好友自动回复 接口失败固定回复 超出次数固定回复支持换行"
 
 # ============================================================
 # 标准库导入
@@ -154,6 +154,71 @@ def clean_ai_reply_text(text):
     return cleaned
 
 
+def _shorten_log_text(text, max_len=500):
+    """压缩接口错误文本，避免把 HTML 错误页或完整 prompt 写入日志。"""
+    if text is None:
+        return ""
+    text = str(text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\[[^\]]+\]\([^)]+\)', lambda m: m.group(0).split('](', 1)[0].lstrip('['), text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) > max_len:
+        return text[:max_len].rstrip() + "..."
+    return text
+
+
+def _payload_log_summary(payload):
+    """生成请求体摘要，不记录 prompt、历史消息和用户原文。"""
+    if not isinstance(payload, dict):
+        return ""
+    summary = {}
+    for key in ("model", "stream", "max_tokens", "max_output_tokens"):
+        if key in payload:
+            summary[key] = payload.get(key)
+    if isinstance(payload.get("messages"), list):
+        summary["messages_count"] = len(payload["messages"])
+    if isinstance(payload.get("input"), list):
+        summary["input_count"] = len(payload["input"])
+    if "system" in payload:
+        summary["has_system"] = bool(payload.get("system"))
+    if _payload_has_image(payload):
+        summary["has_image"] = True
+    return json.dumps(summary, ensure_ascii=False)
+
+
+def _payload_has_image(value):
+    if isinstance(value, dict):
+        type_value = str(value.get("type", "")).lower()
+        source = value.get("source")
+        if (
+            "image" in type_value
+            or "image_url" in value
+            or (isinstance(source, dict) and "media_type" in source)
+        ):
+            return True
+        return any(_payload_has_image(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_payload_has_image(item) for item in value)
+    return False
+
+
+def _api_error_summary(error, payload=None, response=None):
+    """统一压缩 API 异常日志，保留排障关键字段。"""
+    parts = [f"{type(error).__name__}: {_shorten_log_text(error, 260)}"]
+    resp = response or getattr(error, "response", None)
+    if resp is not None:
+        status_code = getattr(resp, "status_code", None)
+        if status_code is not None:
+            parts.append(f"status={status_code}")
+        text = getattr(resp, "text", "")
+        if text:
+            parts.append(f"response={_shorten_log_text(text, 500)}")
+    payload_summary = _payload_log_summary(payload)
+    if payload_summary:
+        parts.append(f"payload={payload_summary}")
+    return ", ".join(part for part in parts if part)
+
+
 # ============================================================
 # 发送前清洗：时间戳剥离 & 接话闸门
 # ============================================================
@@ -247,6 +312,8 @@ class WXBotConfig:
         self.chat_keyword_switch = False    # 私聊关键词回复开关
         self.group_keyword_switch = False   # 群聊关键词回复开关
         self.group_keyword_at_only = False  # 群聊关键词仅被@时触发
+        self.keyword_reply_quote = False     # 关键词回复是否引用消息（私聊/群聊均生效）
+        self.group_keyword_reply_at_msg = False   # 群聊关键词回复是否@发言人
         self.keyword_dict = {}              # 关键词 -> 回复内容 字典
 
         # ---------- 自定义转发配置 ----------
@@ -355,6 +422,8 @@ class WXBotConfig:
                     "chat_keyword_switch": False,
                     "group_keyword_switch": False,
                     "group_keyword_at_only": False,
+                    "keyword_reply_quote": False,
+                    "group_keyword_reply_at_msg": False,
                     "keyword_dict": {},
                     "custom_forward_switch": False,
                     "custom_forward_list": [],
@@ -567,6 +636,11 @@ class WXBotConfig:
         self.chat_keyword_switch   = self.config.get('chat_keyword_switch')
         self.group_keyword_switch  = self.config.get('group_keyword_switch')
         self.group_keyword_at_only = self.config.get('group_keyword_at_only', False)
+        self.keyword_reply_quote = bool(self.config.get(
+            'keyword_reply_quote',
+            self.config.get('group_keyword_reply_quote', False)
+        ))
+        self.group_keyword_reply_at_msg = bool(self.config.get('group_keyword_reply_at_msg', False))
         self.keyword_dict          = self.config.get('keyword_dict', {})
 
         # 定时消息配置
@@ -1181,9 +1255,9 @@ class ReplyCountStore:
             return False
         if isinstance(result, dict):
             status = str(result.get("status", "")).lower()
-            if status in ("success", "ok", "true"):
+            if status in ("success", "ok", "true", "成功"):
                 return True
-            if status in ("error", "fail", "failed", "false"):
+            if status in ("error", "fail", "failed", "false", "失败", "错误"):
                 return False
             if result.get("code") == 0:
                 return True
@@ -1192,6 +1266,15 @@ class ReplyCountStore:
             if result.get("success") is False:
                 return False
         return bool(result)
+
+    @staticmethod
+    def send_result_message(result):
+        if isinstance(result, dict):
+            return result.get("message") or str(result)
+        try:
+            return result["message"]
+        except Exception:
+            return str(result)
 
 
 # ============================================================
@@ -1555,7 +1638,7 @@ class DifyAPI:
             # 构造详细的错误信息字典
             error_info = {
                 "error_type": "request_error",
-                "message":    str(e),
+                "message":    _api_error_summary(e, payload),
             }
             if e.response is not None:
                 try:
@@ -1566,7 +1649,7 @@ class DifyAPI:
                         "api_message": error_data.get("message", "No error details"),
                     })
                 except Exception:
-                    error_info["response_text"] = e.response.text
+                    error_info["response_text"] = _shorten_log_text(e.response.text)
             return {"success": False, "error": error_info}
 
 
@@ -1769,10 +1852,9 @@ class DusAPI:
         response.encoding = 'utf-8'
 
         if response.status_code >= 400:
-            raise Exception(
-                f"GPT接口请求失败，status={response.status_code}, "
-                f"response={response.text}, payload={json.dumps(payload, ensure_ascii=False)[:3000]}"
-            )
+            error = Exception("GPT接口请求失败")
+            error.response = response
+            raise error
 
         result_parts = []
         reasoning_parts = []
@@ -1921,10 +2003,11 @@ class DusAPI:
                         last_error = e
                         if attempt < max_retries:
                             delay = retry_delays[attempt]
-                            log(level="WARNING", message=f"DusAPI Claude 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                            err = _api_error_summary(e, payload)
+                            log(level="WARNING", message=f"DusAPI Claude 流式第 {attempt + 1} 次失败（{err}），{delay}s 后重试...")
                             time.sleep(delay)
                         else:
-                            log(level="ERROR", message=f"DusAPI Claude 流式已重试 {max_retries} 次，最终失败: {last_error}")
+                            log(level="ERROR", message=f"DusAPI Claude 流式已重试 {max_retries} 次，最终失败: {_api_error_summary(last_error, payload)}")
 
                 return "API返回错误，请稍后再试"
 
@@ -1947,10 +2030,11 @@ class DusAPI:
                     last_error = e
                     if attempt < max_retries:
                         delay = retry_delays[attempt]
-                        log(level="WARNING", message=f"DusAPI Claude 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                        err = _api_error_summary(e, payload)
+                        log(level="WARNING", message=f"DusAPI Claude 第 {attempt + 1} 次失败（{err}），{delay}s 后重试...")
                         time.sleep(delay)
                     else:
-                        log(level="ERROR", message=f"DusAPI Claude 已重试 {max_retries} 次，最终失败: {last_error}")
+                        log(level="ERROR", message=f"DusAPI Claude 已重试 {max_retries} 次，最终失败: {_api_error_summary(last_error, payload)}")
 
             return "API返回错误，请稍后再试"
 
@@ -2030,10 +2114,11 @@ class DusAPI:
                         last_error = e
                         if attempt < max_retries:
                             delay = retry_delays[attempt]
-                            log(level="WARNING", message=f"DusAPI GPT 流式第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                            err = _api_error_summary(e, payload)
+                            log(level="WARNING", message=f"DusAPI GPT 流式第 {attempt + 1} 次失败（{err}），{delay}s 后重试...")
                             time.sleep(delay)
                         else:
-                            log(level="ERROR", message=f"DusAPI GPT 流式已重试 {max_retries} 次，最终失败: {last_error}")
+                            log(level="ERROR", message=f"DusAPI GPT 流式已重试 {max_retries} 次，最终失败: {_api_error_summary(last_error, payload)}")
 
                 return "API返回错误，请稍后再试"
 
@@ -2058,10 +2143,11 @@ class DusAPI:
                     last_error = e
                     if attempt < max_retries:
                         delay = retry_delays[attempt]
-                        log(level="WARNING", message=f"DusAPI GPT 第 {attempt + 1} 次失败（{type(e).__name__}: {e}），{delay}s 后重试...")
+                        err = _api_error_summary(e, payload)
+                        log(level="WARNING", message=f"DusAPI GPT 第 {attempt + 1} 次失败（{err}），{delay}s 后重试...")
                         time.sleep(delay)
                     else:
-                        log(level="ERROR", message=f"DusAPI GPT 已重试 {max_retries} 次，最终失败: {last_error}")
+                        log(level="ERROR", message=f"DusAPI GPT 已重试 {max_retries} 次，最终失败: {_api_error_summary(last_error, payload)}")
 
             return "API返回错误，请稍后再试"
 
@@ -2762,6 +2848,32 @@ class WXBot:
             except Exception:
                 pass
 
+    def _plan_random_fire_for_today(self, state, task_id, now, time_start, time_end, action_text, log_prefix):
+        h_s, m_s = map(int, time_start.split(':'))
+        h_e, m_e = map(int, time_end.split(':'))
+        if not (0 <= h_s <= 23 and 0 <= h_e <= 23 and 0 <= m_s <= 59 and 0 <= m_e <= 59):
+            raise ValueError(f"无效时间窗口：{time_start} - {time_end}")
+
+        start_dt = now.replace(hour=h_s, minute=m_s, second=0, microsecond=0)
+        end_dt = now.replace(hour=h_e, minute=m_e, second=59, microsecond=0)
+        if start_dt >= end_dt:
+            day_end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+            end_dt = min(start_dt + timedelta(minutes=1) - timedelta(seconds=1), day_end)
+
+        earliest_dt = start_dt if now < start_dt else now + timedelta(seconds=1)
+        if earliest_dt > end_dt:
+            state['next_fire'] = None
+            state['skipped_date'] = now.date()
+            log(message=f"{log_prefix} {task_id}：今天时间窗口 {time_start}-{time_end} 已过，跳过今日{action_text}，等待下一个发送日")
+            return None
+
+        random_seconds = random.randint(0, int((end_dt - earliest_dt).total_seconds()))
+        fire_dt = (earliest_dt + timedelta(seconds=random_seconds)).replace(microsecond=0)
+        state['next_fire'] = fire_dt
+        state['skipped_date'] = None
+        log(message=f"{log_prefix} {task_id}：今天计划于 {fire_dt.strftime('%H:%M:%S')} {action_text}")
+        return fire_dt
+
     def _check_random_moments(self):
         """
         随机定时朋友圈调度检查。
@@ -2786,6 +2898,8 @@ class WXBot:
             state = self._random_moments_state.setdefault(task_id, {
                 'next_fire':    None,   # 今天计划触发的 datetime
                 'last_fire_date': None, # 上次实际触发的 date
+                'skipped_date': None,   # 今天随机时刻已过时记录跳过，避免启动后补发
+                'plan_signature': None,
                 'week_cache':   None,   # {'key': (year, week), 'days': [...]}
                 'month_cache':  None,   # {'key': (year, month), 'days': [...]}
             })
@@ -2793,6 +2907,15 @@ class WXBot:
             # --- 判断今天是否是发送日 ---
             repeat_type       = task.get('repeat_type', 'daily')
             random_days_count = max(1, int(task.get('random_days_count', 1)))
+            time_start        = task.get('time_start', '00:00')
+            time_end          = task.get('time_end',   '23:59')
+            plan_signature    = (repeat_type, random_days_count, time_start, time_end)
+            if state.get('plan_signature') != plan_signature:
+                state['next_fire'] = None
+                state['skipped_date'] = None
+                state['week_cache'] = None
+                state['month_cache'] = None
+                state['plan_signature'] = plan_signature
             is_eligible       = False
 
             if repeat_type == 'daily':
@@ -2828,26 +2951,17 @@ class WXBot:
             if state['last_fire_date'] == today:
                 continue
 
+            # 今天随机到的发送时刻已经过了，不补发，等下一次符合周期的日期
+            if state.get('skipped_date') == today:
+                continue
+
             # --- 还没计算今天的触发时间，则随机生成一个 ---
             if state['next_fire'] is None:
-                time_start = task.get('time_start', '00:00')
-                time_end   = task.get('time_end',   '23:59')
                 try:
-                    h_s, m_s   = map(int, time_start.split(':'))
-                    h_e, m_e   = map(int, time_end.split(':'))
-                    start_mins = h_s * 60 + m_s
-                    end_mins   = h_e * 60 + m_e
-                    if start_mins >= end_mins:
-                        end_mins = start_mins + 1
-                    fire_mins  = random.randint(start_mins, end_mins)
-                    fire_h, fire_m = divmod(fire_mins, 60)
-                    fire_dt    = now.replace(hour=fire_h, minute=fire_m,
-                                            second=random.randint(0, 59), microsecond=0)
-                    # 若随机时刻已过，则今天在当前时刻后 10 秒触发（避免错过）
-                    if fire_dt <= now:
-                        fire_dt = now + timedelta(seconds=10)
-                    state['next_fire'] = fire_dt
-                    log(message=f"随机朋友圈 {task_id}：今天计划于 {fire_dt.strftime('%H:%M:%S')} 发布")
+                    if self._plan_random_fire_for_today(
+                        state, task_id, now, time_start, time_end, "发布", "随机朋友圈"
+                    ) is None:
+                        continue
                 except Exception as ex:
                     log(level="ERROR", message=f"随机朋友圈 {task_id} 时间解析失败：{ex}")
                     continue
@@ -2895,12 +3009,23 @@ class WXBot:
             state = self._random_msg_state.setdefault(task_id, {
                 'next_fire':      None,
                 'last_fire_date': None,
+                'skipped_date':   None,
+                'plan_signature': None,
                 'week_cache':     None,
                 'month_cache':    None,
             })
 
             repeat_type       = task.get('repeat_type', 'daily')
             random_days_count = max(1, int(task.get('random_days_count', 1)))
+            time_start        = task.get('time_start', '00:00')
+            time_end          = task.get('time_end',   '23:59')
+            plan_signature    = (repeat_type, random_days_count, time_start, time_end)
+            if state.get('plan_signature') != plan_signature:
+                state['next_fire'] = None
+                state['skipped_date'] = None
+                state['week_cache'] = None
+                state['month_cache'] = None
+                state['plan_signature'] = plan_signature
             is_eligible       = False
 
             if repeat_type == 'daily':
@@ -2934,24 +3059,15 @@ class WXBot:
             if state['last_fire_date'] == today:
                 continue
 
+            if state.get('skipped_date') == today:
+                continue
+
             if state['next_fire'] is None:
-                time_start = task.get('time_start', '00:00')
-                time_end   = task.get('time_end',   '23:59')
                 try:
-                    h_s, m_s   = map(int, time_start.split(':'))
-                    h_e, m_e   = map(int, time_end.split(':'))
-                    start_mins = h_s * 60 + m_s
-                    end_mins   = h_e * 60 + m_e
-                    if start_mins >= end_mins:
-                        end_mins = start_mins + 1
-                    fire_mins  = random.randint(start_mins, end_mins)
-                    fire_h, fire_m = divmod(fire_mins, 60)
-                    fire_dt    = now.replace(hour=fire_h, minute=fire_m,
-                                            second=random.randint(0, 59), microsecond=0)
-                    if fire_dt <= now:
-                        fire_dt = now + timedelta(seconds=10)
-                    state['next_fire'] = fire_dt
-                    log(message=f"随机定时消息 {task_id}：今天计划于 {fire_dt.strftime('%H:%M:%S')} 发送")
+                    if self._plan_random_fire_for_today(
+                        state, task_id, now, time_start, time_end, "发送", "随机定时消息"
+                    ) is None:
+                        continue
                 except Exception as ex:
                     log(level="ERROR", message=f"随机定时消息 {task_id} 时间解析失败：{ex}")
                     continue
@@ -3174,7 +3290,13 @@ class WXBot:
                         if keyword in message.content:
                             log(message=f"群组 {chat.who} 关键字消息：" + message.content)
                             self.config.human_delay()  # 模拟人工操作延迟（可在面板配置）
-                            result = chat.SendMsg(msg=self.config.keyword_dict[keyword])
+                            result = self._send_group_reply(
+                                chat,
+                                message,
+                                self.config.keyword_dict[keyword],
+                                at_sender=self.config.group_keyword_reply_at_msg,
+                                quote=self.config.keyword_reply_quote,
+                            )
                             self.msg_replied_count += 1
                             time.sleep(1)
                             return result
@@ -3261,14 +3383,13 @@ class WXBot:
                 _quote    = self.config.group_reply_quote
                 for i, part in enumerate(parts):
                     self.config.human_delay()   # 每条发送前都延迟（含第一条，与原逻辑等效）
-                    if i == 0 and _quote and _at_msg:
-                        result = message.quote(part, at=message.sender)
-                    elif i == 0 and _quote:
-                        result = message.quote(part)
-                    elif _at_msg:
-                        result = chat.SendMsg(msg=part, at=message.sender if i == 0 else None)
-                    else:
-                        result = chat.SendMsg(msg=part)
+                    result = self._send_group_reply(
+                        chat,
+                        message,
+                        part,
+                        at_sender=_at_msg and i == 0,
+                        quote=_quote and i == 0,
+                    )
 
                 self.msg_replied_count += 1
                 return result
@@ -3341,6 +3462,48 @@ class WXBot:
             log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
         name = self.config.group_prompt_map.get(group_name) or self.config.default_prompt
         return self.config.get_prompt_content(name)
+
+    def _send_group_reply(self, chat, message, content, at_sender=False, quote=False):
+        """发送群聊回复；引用失败时降级为普通发送，避免中断监听回调。"""
+        if quote:
+            try:
+                if at_sender:
+                    result = message.quote(content, at=message.sender)
+                else:
+                    result = message.quote(content)
+                if ReplyCountStore.was_send_success(result):
+                    return result
+                err_msg = ReplyCountStore.send_result_message(result)
+                log(level="WARNING", message=f"群聊引用回复失败，已降级为普通发送：{err_msg}")
+            except Exception as e:
+                log(level="WARNING", message=f"群聊引用回复异常，已降级为普通发送：{e}")
+
+        if at_sender:
+            return chat.SendMsg(msg=content, at=message.sender)
+        return chat.SendMsg(msg=content)
+
+    def _send_keyword_reply(self, chat, message, content, is_group=False):
+        """发送关键词回复；引用开关对私聊/群聊均生效，@仅对群聊生效。"""
+        if is_group:
+            return self._send_group_reply(
+                chat,
+                message,
+                content,
+                at_sender=self.config.group_keyword_reply_at_msg,
+                quote=self.config.keyword_reply_quote,
+            )
+
+        if self.config.keyword_reply_quote:
+            try:
+                result = message.quote(content)
+                if ReplyCountStore.was_send_success(result):
+                    return result
+                err_msg = ReplyCountStore.send_result_message(result)
+                log(level="WARNING", message=f"私聊关键词引用回复失败，已降级为普通发送：{err_msg}")
+            except Exception as e:
+                log(level="WARNING", message=f"私聊关键词引用回复异常，已降级为普通发送：{e}")
+
+        return chat.SendMsg(content)
 
     # ----------------------------------------------------------
     # 拆分多条回复辅助方法
@@ -3471,6 +3634,7 @@ class WXBot:
 
         api_error_reply = False
         api_error_should_mark = False
+        is_keyword = False
         try:
             # wechat_checkin plugin hook: keep business logic outside wxbot_core.py.
             try:
@@ -3485,7 +3649,6 @@ class WXBot:
             except Exception as plugin_error:
                 log(level="ERROR", message=f"wechat_checkin plugin error: {plugin_error}")
 
-            is_keyword = False
             # 私聊关键词优先匹配
             if self.config.chat_keyword_switch:
                 for keyword in self.config.keyword_dict:
@@ -3579,14 +3742,20 @@ class WXBot:
             parts = [reply]
 
         send_success = False
-        for part in parts:
+        for i, part in enumerate(parts):
             self.config.human_delay()   # 每条发送前都延迟（含第一条，与原逻辑等效）
             if len(part) >= 2000:
-                for segment in self.config.split_long_text(part):
-                    result = chat.SendMsg(segment)
+                for j, segment in enumerate(self.config.split_long_text(part)):
+                    if is_keyword and i == 0 and j == 0:
+                        result = self._send_keyword_reply(chat, message, segment)
+                    else:
+                        result = chat.SendMsg(segment)
                     send_success = send_success or ReplyCountStore.was_send_success(result)
             else:
-                result = chat.SendMsg(part)
+                if is_keyword and i == 0:
+                    result = self._send_keyword_reply(chat, message, part)
+                else:
+                    result = chat.SendMsg(part)
                 send_success = send_success or ReplyCountStore.was_send_success(result)
 
         if send_success and api_error_should_mark:
@@ -3704,7 +3873,8 @@ class WXBot:
                 '[/关键词状态] 查看关键词配置及列表\n'
                 '[/开启私聊关键词] / [/关闭私聊关键词]\n'
                 '[/开启群聊关键词] / [/关闭群聊关键词]\n'
-                '[/开启群聊关键词@触发] / [/关闭群聊关键词@触发]'
+                '[/开启群聊关键词@触发] / [/关闭群聊关键词@触发]\n'
+                '群关键词 @ 发言人和引用原消息请在面板配置'
             )
         elif content == "/记忆指令":
             result = chat.SendMsg(
@@ -3781,12 +3951,16 @@ class WXBot:
             priv = "开启" if self.config.chat_keyword_switch else "关闭"
             grp  = "开启" if self.config.group_keyword_switch else "关闭"
             at   = "是"   if self.config.group_keyword_at_only else "否"
+            reply_at = "是" if self.config.group_keyword_reply_at_msg else "否"
+            quote = "是" if self.config.keyword_reply_quote else "否"
             cnt  = len(self.config.keyword_dict)
             keys = ", ".join(self.config.keyword_dict.keys()) if self.config.keyword_dict else "（无）"
             result = chat.SendMsg(
                 f"私聊关键词：{priv}\n"
                 f"群聊关键词：{grp}\n"
                 f"群聊仅@触发：{at}\n"
+                f"群聊关键词回复@发言人：{reply_at}\n"
+                f"关键词回复引用消息：{quote}（私聊/群聊均生效）\n"
                 f"关键词数量：{cnt} 个\n"
                 f"关键词列表：{keys}"
             )
@@ -3960,6 +4134,8 @@ class WXBot:
         send_msg += "当前群聊关键词回复状态：" + ("开启\n" if self.config.group_keyword_switch else "关闭\n")
         if self.config.group_keyword_switch:
             send_msg += "群聊关键词仅@触发：" + ("是\n" if self.config.group_keyword_at_only else "否\n")
+            send_msg += "群聊关键词回复@发言人：" + ("是\n" if self.config.group_keyword_reply_at_msg else "否\n")
+        send_msg += "关键词回复引用消息：" + ("是\n" if self.config.keyword_reply_quote else "否\n")
         send_msg += f"关键词数量：{len(self.config.keyword_dict)} 个\n"
         if self.config.keyword_dict:
             send_msg += "当前关键词：" + ", ".join(self.config.keyword_dict.keys()) + "\n"
@@ -4779,6 +4955,8 @@ class WXBot:
             "chat_keyword_switch":   self.config.chat_keyword_switch,
             "group_keyword_switch":  self.config.group_keyword_switch,
             "group_keyword_at_only": self.config.group_keyword_at_only,
+            "keyword_reply_quote": self.config.keyword_reply_quote,
+            "group_keyword_reply_at_msg": self.config.group_keyword_reply_at_msg,
             "keyword_count":         len(self.config.keyword_dict),
             "memory_switch":         self.config.memory_switch,
             "memory_context_count":  self.config.memory_context_count,
