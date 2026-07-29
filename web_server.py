@@ -1229,6 +1229,78 @@ def start_bot():
         log('ERROR', f'启动机器人失败: {str(e)}')
     return jsonify({'status': 'success', 'message': '机器人启动命令已发送'})
 
+@app.route('/ai_news/send_now', methods=['POST'])
+@login_required
+def ai_news_send_now():
+    """手动触发一次 AI 日报发送（后台线程跑，结果推送到 webhook）。"""
+    log('INFO', 'AI 日报手动发送请求已接收')
+    def run():
+        pythoncom.CoInitialize()
+        try:
+            from plugins.ai_news_note.sender import send_daily_note
+            r = send_daily_note(force=True, source="manual")
+            log('INFO', f'AI 日报手动发送结果：{r}')
+        except Exception as e:
+            log('ERROR', f'AI 日报手动发送异常: {e}')
+        finally:
+            pythoncom.CoUninitialize()
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({'status': 'success', 'message': 'AI 日报发送已触发，结果将推送到飞书'})
+
+@app.route('/ai_news')
+@login_required
+def ai_news_page():
+    """AI 日报配置页（ai_news_note 插件）。独立模板，避免改上游 dashboard.html。"""
+    return render_template('ai_news.html')
+
+@app.route('/ai_news/status')
+@login_required
+def ai_news_status():
+    """返回 AI 日报运行状态 + 配置，供页面渲染。"""
+    try:
+        import importlib, os, json, datetime
+        from plugins.ai_news_note import config as _cfg
+        importlib.reload(_cfg)  # 拿最新 settings
+        last_sent = None
+        lp = os.path.join(os.path.dirname(_cfg.__file__), 'last_sent.txt')
+        if os.path.exists(lp):
+            last_sent = open(lp, encoding='utf-8').read().strip()
+        data_exists = os.path.exists(_cfg.DATA_FILE)
+        data_date, data_count = None, None
+        if data_exists:
+            try:
+                dd = json.load(open(_cfg.DATA_FILE, encoding='utf-8'))
+                data_date, data_count = dd.get('date'), dd.get('count')
+            except Exception:
+                pass
+        _today = datetime.date.today().isoformat()
+        return jsonify({'status': 'success', 'data': {
+            'enabled': _cfg.ENABLED, 'send_time': _cfg.SEND_TIME, 'target': _cfg.TARGET,
+            'last_sent': last_sent, 'sent_today': (last_sent == _today),
+            'data_exists': data_exists, 'data_date': data_date, 'data_count': data_count,
+            'today': _today, 'data_is_today': (data_date == _today),  # 今天日报就绪=数据日期是今天
+        }})
+    except Exception as e:
+        log('ERROR', f'读取 AI 日报状态失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+@app.route('/ai_news/save', methods=['POST'])
+@login_required
+def ai_news_save():
+    """保存 AI 日报配置（开关/时间/目标）到 settings.json。"""
+    try:
+        import importlib
+        from plugins.ai_news_note import config as _cfg
+        cfg = _cfg.save_settings(request.get_json() or {})
+        importlib.reload(_cfg)  # 目标/开关即时生效；时间改动需重启机器人重新注册定时任务
+        log('SUCCESS', f'AI 日报配置已保存：{cfg}')
+        return jsonify({'status': 'success',
+                        'message': '已保存（目标/开关即时生效；发送时间改动需重启机器人）',
+                        'config': cfg})
+    except Exception as e:
+        log('ERROR', f'保存 AI 日报配置失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
 @app.route('/stop_bot', methods=['POST'])
 @login_required
 def stop_bot():
