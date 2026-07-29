@@ -245,7 +245,15 @@ anaconda 自带的 `tests` 包会遮蔽本项目的 `tests/`，`python -m unitte
 cd /Volumes/SiverWXbot_plus-main && PYTHONPATH=. python3 tests/test_ncc_community.py
 ```
 
-### 5.6 凭据
+### 5.6 mac 侧走 SMB 挂载时先设 `core.checkStat minimal`
+`/Volumes/SiverWXbot_plus-main` 是 smbfs 挂载，git 的 stat 缓存（inode/ctime）在网络盘上对不上，
+会误判整个工作区是脏的——表现是 `git status` 显示干净、`git merge` 却报 `fatal: stash failed`。
+在这份 checkout 上执行一次即可（本地配置，不进库）：
+```bash
+cd /Volumes/SiverWXbot_plus-main && git config core.checkStat minimal && git config core.trustctime false
+```
+
+### 5.7 凭据
 `origin` 的 remote URL 里曾明文嵌 GitHub token。**别把 token 写进 remote URL**，用 SSH 或
 credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 
