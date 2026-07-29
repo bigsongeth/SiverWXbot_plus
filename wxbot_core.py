@@ -59,6 +59,17 @@ import webhook_send
 from logger import log
 
 # ============================================================
+# AI 接口专用 HTTP 会话（定制点）
+# ============================================================
+# 这台 Windows 的系统代理（IE 设置）指向局域网的 192.168.3.5:7897，requests 在 Windows
+# 上会自动读注册表跟着走；那台机器一休眠/代理一关，AI 调用就全部 ProxyError 超时，
+# 机器人只能回"在忙，我稍后回复您"（7-25 / 7-26 / 7-27 / 7-29 各栽过一次）。
+# 我们用到的接口要么公网直连可达（key.bigsong.site），要么走 Tailscale（知识库 100.71.x），
+# 本来就不需要代理，所以统一用 trust_env=False 的会话绕开系统代理和 *_PROXY 环境变量。
+HTTP = requests.Session()
+HTTP.trust_env = False
+
+# ============================================================
 # wxautox 全局参数配置
 # 说明：
 #   MESSAGE_HASH         - 是否启用消息哈希辅助判断，开启后稍微影响性能，默认 False
@@ -1399,7 +1410,7 @@ class OpenAIAPI:
             payload = {"model": model, "messages": messages, "stream": False}
             headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
             url = f"{self.base_url}/v1/chat/completions"
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response = HTTP.post(url, headers=headers, json=payload, timeout=60)
 
             if response.status_code != 200:
                 error_detail = response.text[:500]
@@ -1532,7 +1543,7 @@ class DifyAPI:
             payload["files"] = files
 
         try:
-            response = requests.post(url, headers=headers, json=payload)
+            response = HTTP.post(url, headers=headers, json=payload)
             response.raise_for_status()  # 非 2xx 状态码时抛出异常
             if response_mode == "blocking":
                 return response.json()
@@ -1708,7 +1719,7 @@ class DusAPI:
 
     def _stream_claude_text(self, api_endpoint, headers, payload) -> str:
         """Anthropic 流式接收并拼接为完整文本"""
-        response = requests.post(
+        response = HTTP.post(
             api_endpoint,
             headers=headers,
             json=payload,
@@ -1747,7 +1758,7 @@ class DusAPI:
 
     def _stream_gpt_text(self, api_endpoint, headers, payload) -> str:
         """GPT/Responses API 流式接收并拼接为完整文本"""
-        response = requests.post(
+        response = HTTP.post(
             api_endpoint,
             headers=headers,
             json=payload,
@@ -1918,7 +1929,7 @@ class DusAPI:
 
             for attempt in range(max_retries + 1):
                 try:
-                    response = requests.post(api_endpoint, headers=headers, json=payload, timeout=600)
+                    response = HTTP.post(api_endpoint, headers=headers, json=payload, timeout=600)
                     response.raise_for_status()
                     response.encoding = 'utf-8'
                     response_data = response.json()
@@ -2027,7 +2038,7 @@ class DusAPI:
 
             for attempt in range(max_retries + 1):
                 try:
-                    response = requests.post(api_endpoint, headers=headers, json=payload, timeout=600)
+                    response = HTTP.post(api_endpoint, headers=headers, json=payload, timeout=600)
                     response.raise_for_status()
                     response.encoding = 'utf-8'
                     response_data = response.json()
@@ -2057,6 +2068,21 @@ class DusAPI:
 # ============================================================
 # 微信机器人主类
 # ============================================================
+
+class MainWindowChat:
+    """
+    主窗口回落通道：AddListenChat 弹不出独立子窗口时（实测部分会话如"松爸"双击不弹窗），
+    用主窗口 SendMsg(who=...) 回复，消息不丢。
+    鸭子类型兼容 process_message / wx_send_ai 用到的 chat 接口（只有 who 和 SendMsg）。
+    """
+
+    def __init__(self, wx, who):
+        self._wx = wx
+        self.who = who
+
+    def SendMsg(self, msg, *args, **kwargs):
+        return self._wx.SendMsg(msg=msg, who=self.who, exact=True)
+
 
 class WXBot:
     """
@@ -2274,7 +2300,13 @@ class WXBot:
 
     def _add_listen_chat_once(self, nickname, label):
         """执行一次 AddListenChat，并记录基础结果。"""
-        result = self.wx.AddListenChat(nickname=nickname, callback=self.message_handle_callback)
+        try:
+            result = self.wx.AddListenChat(nickname=nickname, callback=self.message_handle_callback)
+        except Exception as e:
+            # 部分会话双击弹不出独立窗口（实测"松爸"两次复现，wxautox 内部拿到 None 后直接抛异常）。
+            # 这里接住返回 None，让上层重试和主窗口回落接手，避免异常炸穿主循环导致消息静默丢弃。
+            log(level="ERROR", message=f"添加{label} {nickname} 监听异常: {repr(e)}")
+            return None
         if result:
             log(message=f"添加{label} {nickname} 监听完成")
         else:
@@ -4659,7 +4691,17 @@ class WXBot:
                                 self._handle_custom_forward(_types.SimpleNamespace(who=chat), msg)
                             except Exception as _fwd_e:
                                 log(level="ERROR", message=f"自定义转发处理出错: {_fwd_e}")
-                        
+
+                        # ncc_community plugin hook: 私聊拉群关键词。全局模式下新私聊的首条
+                        # 消息只走本函数、不经过 message_handle_callback，这里补一个入口；
+                        # 命中后本条不再进监听/AI 流程。
+                        try:
+                            from plugins.ncc_community import handle_friend_message as _ncc_friend
+                            if _ncc_friend(self, MainWindowChat(self.wx, chat), msg):
+                                continue
+                        except Exception as _ncc_err:
+                            log(level="ERROR", message=f"ncc_community plugin error: {_ncc_err}")
+
                         if not self.is_chat_listened(chat):
                             _sub_chat = self.add_chat_to_listen(chat)
                         else:
@@ -4670,7 +4712,9 @@ class WXBot:
                         if _sub_chat:
                             self.process_message(_sub_chat, msg)
                         else:
-                            log(level="ERROR", message=f"{chat} 未获取到子窗口，跳过本次消息处理")
+                            # 弹独立窗口失败时回落主窗口回复，保证消息不丢（如"松爸"会话）
+                            log(level="WARNING", message=f"{chat} 未获取到子窗口，回落主窗口处理本条消息")
+                            self.process_message(MainWindowChat(self.wx, chat), msg)
 
         # ---- 全局监听模式主流程 ----
         # 当前仅启用 get_next_new_message（混合模式中的新消息拉取）
@@ -4868,8 +4912,9 @@ class WXBot:
                     try:
                         last_time = self.ALLListen_mode(last_time=last_time)
                     except Exception as e:
-                        if not self.run_flag:
-                            log(level="ERROR", message=str(e) + "\n全局模式出错！！请检查程序！！")
+                        # 上游原逻辑仅在 run_flag=False 时打日志，运行中的异常会被静默吞掉
+                        # （2026-07-11 松爸签到消息就是这样无声丢失的），改为始终记录
+                        log(level="ERROR", message=f"全局模式处理出错：{repr(e)}\n{traceback.format_exc()}")
 
                 # ---- 定时任务执行（定时消息 / 定时朋友圈 / ai_news_note 日报）----
                 if (self.config.scheduled_msg_switch or self.config.scheduled_moments_switch
