@@ -45,7 +45,7 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_DIR, "data")
 REGISTRY_PATH = os.path.join(DATA_DIR, "registry.json")
 
-_EMPTY = {"synced_at": None, "groupings": {}, "groups": {}}
+_EMPTY = {"synced_at": None, "groupings": {}, "groups": {}, "invite_keywords": {}}
 
 
 # ---------------------------------------------------------------- 读写
@@ -62,6 +62,7 @@ def load() -> dict:
             return copy.deepcopy(_EMPTY)
         data.setdefault("groupings", {})
         data.setdefault("groups", {})
+        data.setdefault("invite_keywords", {})
         return data
 
 
@@ -260,9 +261,10 @@ def record_managed(name: str, page_id: str = None) -> None:
         save(data)
 
 
-def upsert_from_notion(groupings: dict, groups: dict) -> dict:
+def upsert_from_notion(groupings: dict, groups: dict, invite_keywords: dict | None = None) -> dict:
     """用 Notion 拉取结果覆盖分组与群的【人管字段】，保留机器人管的字段
-    （remark_applied / last_seen / status=pending 的发现态）。返回合并后的登记表。"""
+    （remark_applied / last_seen / status=pending 的发现态）。返回合并后的登记表。
+    invite_keywords 为 None 表示本次未拉取「迎新拉群」表，保留原值。"""
     with _LOCK:
         data = load()
         data["groupings"] = groupings
@@ -285,6 +287,8 @@ def upsert_from_notion(groupings: dict, groups: dict) -> dict:
             }
             merged[name] = g
         data["groups"] = merged
+        if invite_keywords is not None:
+            data["invite_keywords"] = invite_keywords
         data["synced_at"] = datetime.now().isoformat(timespec="seconds")
         save(data)
         return data

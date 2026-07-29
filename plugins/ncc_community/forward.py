@@ -44,13 +44,13 @@ STATE_TTL = 600            # 状态闲置超时（秒）
 from .wxlock import WX_LOCK as MAIN_WINDOW_LOCK
 from .wxlock import set_forwarding
 
-# 一次 forward 最多转给几个群（微信"分别转发"多选上限约 9），超过分批
-CHUNK_SIZE = 9
-
+# 转发策略：【一个群一个群转】。多群"分别发送"多选框会把微信卡死
+# （2026-07-09 实证：转 106 群时微信直接未响应）。单个转发走轻量的"发送给"对话框，稳。
 DELAY = {  # 防风控/防卡死延迟（可被 config.forward.delay 覆盖）
-    "chunk_min": 3.0, "chunk_max": 5.0,     # 每次 forward（一批群）之间——放慢连发，防微信卡死
+    "group_min": 2.5, "group_max": 4.5,     # 每个群之间
     "msg_min": 5.0, "msg_max": 8.0,         # 每条消息之间
-    "max_retries": 3,
+    "batch_every": 10, "batch_min": 5.0, "batch_max": 9.0,   # 每 N 群额外歇一会儿
+    "max_retries": 2,
 }
 
 # 收集时忽略的消息类型：只跳真噪音。视频号是 'other'，必须收集。
@@ -134,9 +134,10 @@ def _is_stale(err: str) -> bool:
     return any(h.lower() in e for h in _STALE_HINTS)
 
 
-def _forward_one_shot(cache_box, bot, source, sig, groups, d) -> tuple[bool, str]:
-    """把定位到的消息转发给一批群（可能是整批≤9，也可能回退成单个），带重试。
-    cache_box=[元素]，元素失效时会置 None 并重定位。返回 (成功, 错误)。"""
+def _forward_one_shot(cache_box, bot, source, sig, group, d) -> tuple[bool, str]:
+    """把定位到的消息转发给【单个群】（走轻量的"发送给"对话框，不碰会卡死微信的
+    "分别发送"多选框）。stale 才重定位重试；无结果/失败不重试（单群要么成要么就是没了）。
+    返回 (成功, 错误)。"""
     last = ""
     for _ in range(int(d["max_retries"])):
         with MAIN_WINDOW_LOCK:
@@ -150,46 +151,38 @@ def _forward_one_shot(cache_box, bot, source, sig, groups, d) -> tuple[bool, str
                         cache_box[0].roll_into_view()
                     except Exception:
                         pass
-                    r = cache_box[0].forward(list(groups))
+                    r = cache_box[0].forward(group)   # 单目标字符串
                     if r is None or r:
                         return True, ""
-                    last = _wxresponse_message(r)
+                    return False, _wxresponse_message(r) or "无结果"   # 单群失败 = 该群没了，不重试
                 except Exception as e:
                     last = str(e)
                     if _is_stale(last):
-                        cache_box[0] = None          # 元素失效 → 重定位
-        if _is_gone(last):
-            break                                     # 群没了，别重试
-        time.sleep(2)
+                        cache_box[0] = None           # 元素失效 → 重定位重试
+                    else:
+                        return False, last            # 其它错误（多为无结果）→ 不重试
+        time.sleep(1.5)
     return False, last
 
 
-def _forward_located_message(bot, source, sig, group_chunks, d):
-    """把一条消息（按签名定位）转发给各批群。整批先转；某批失败就【回退逐个转】，
-    揪出"无结果"的群，其余照发。返回 (成功群数, 无结果群列表, 其它失败[str])。
-
-    锁粒度：每次 forward 单独持锁，批间延时在锁外。元素缓存复用，失效才重定位。
-    """
+def _forward_located_message(bot, source, sig, targets, d):
+    """把一条消息（按签名定位）【一个群一个群】转发。无结果的群记下来，其余照发。
+    每 batch_every 个群额外歇一会儿。返回 (成功群数, 无结果群列表, 其它失败[str])。"""
     cache_box = [None]
     ok = 0
     gone = []
     failed = []
-    for cg in group_chunks:
-        success, err = _forward_one_shot(cache_box, bot, source, sig, cg, d)
+    for i, g in enumerate(targets):
+        if i > 0 and i % int(d["batch_every"]) == 0:
+            time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
+        success, err = _forward_one_shot(cache_box, bot, source, sig, g, d)
         if success:
-            ok += len(cg)
+            ok += 1
+        elif "定位不到该消息" in err:
+            failed.append(f"{g}: {err}")            # 源消息定位不到，非群的问题
         else:
-            # 整批失败 → 逐个回退，定位是哪个群"无结果"
-            for g in cg:
-                s1, e1 = _forward_one_shot(cache_box, bot, source, sig, [g], d)
-                if s1:
-                    ok += 1
-                elif "定位不到该消息" in e1:
-                    failed.append(f"{g}: {e1}")     # 源消息定位不到，非群的问题
-                else:
-                    gone.append(g)                  # 单群转发无结果 → 该群不可达
-                time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))
-        time.sleep(random.uniform(d["chunk_min"], d["chunk_max"]))
+            gone.append(g)                          # 单群转发无结果 → 该群不可达
+        time.sleep(random.uniform(d["group_min"], d["group_max"]))
 
     # 保护：整条一个群都没成功 → 判定是这条消息本身转不了，别冤枉群（不标记任何群不可达）
     if ok == 0 and (gone or failed):
@@ -321,15 +314,13 @@ def _deliver(task) -> dict:
             seen.add(s)
             sigs.append(s)
     n_msgs = len(sigs)
-    chunk = max(1, min(CHUNK_SIZE, int(task.get("chunk_size", CHUNK_SIZE))))
-    group_chunks = [targets[i:i + chunk] for i in range(0, len(targets), chunk)]
 
     ok = fail = 0
     gone_all = set()          # 无结果/不可达的群（去重）
     fail_detail = []
 
     for mi, sig in enumerate(sigs):
-        okc, gone, failed = _forward_located_message(bot, admin, sig, group_chunks, d)
+        okc, gone, failed = _forward_located_message(bot, admin, sig, targets, d)
         ok += okc
         fail += len(gone) + len(failed)
         gone_all.update(gone)
@@ -603,7 +594,7 @@ def _do_sync(chat) -> bool:
         from . import notion_sync
         stat = notion_sync.pull()
         reply(chat, f"同步成功 ✅ 分组 {stat['groupings']} 个、群 {stat['groups']} 个"
-                    f"（允许转发 {stat['forward_on']} 个）")
+                    f"（允许转发 {stat['forward_on']} 个）、拉群关键词 {stat.get('invites', 0)} 条")
     except Exception as e:
         reply(chat, f"同步失败：{e}")
         log("ERROR", f"Notion 同步失败: {e}")
@@ -637,7 +628,8 @@ def _format_welcome_invite(cfg) -> str:
             "【迎新】在 Notion『群聊列表』填「迎新推送链接」即开启该群迎新卡片。\n"
             "  文案：设迎新文案 <群名>|<文案>（{name}=新人昵称）\n"
             "  开关：开迎新 <群名> / 关迎新 <群名>；查看：迎新列表\n"
-            "【拉群】设拉群 <关键词>|<目标群>；删拉群 <关键词>；查看：拉群列表\n"
+            "【拉群】关键词维护在 Notion『迎新拉群』表，发「同步」后生效；查看：拉群列表\n"
+            "  本地覆盖：设拉群 <关键词>|<目标群>；删拉群 <关键词>\n"
             "回复 0 退出管理模式。")
 
 
@@ -676,12 +668,19 @@ def _check_groups(bot, chat, name) -> bool:
 # ------------------------------------------------------------------ 拉群 / 迎新（config.json）
 
 def _format_invites(cfg) -> str:
-    kw = cfg.get("invite", {}).get("keywords", {})
-    if not kw:
-        return "还没有拉群关键词。用「设拉群 <关键词>|<目标群>」添加。"
-    lines = ["拉群关键词："]
-    lines.extend(f"◾ {k} → {v}" for k, v in kw.items())
-    lines.append("（用户私聊我或在群里发关键词即可被拉群）")
+    notion_kw = registry.load().get("invite_keywords", {})
+    manual_kw = cfg.get("invite", {}).get("keywords", {})
+    if not notion_kw and not manual_kw:
+        return ("还没有拉群关键词。去 Notion『迎新拉群』表添加后发「同步」，"
+                "或用「设拉群 <关键词>|<目标群>」本地添加。")
+    lines = ["拉群关键词（用户私聊我或在群里发关键词即可被拉群）："]
+    if notion_kw:
+        lines.append(f"— Notion『迎新拉群』表（{len(notion_kw)} 条）—")
+        lines.extend(f"◾ {k} → {v}" + ("　⚠️被本地覆盖" if k in manual_kw else "")
+                     for k, v in notion_kw.items())
+    if manual_kw:
+        lines.append(f"— 本地（设拉群，{len(manual_kw)} 条，同名时优先）—")
+        lines.extend(f"◾ {k} → {v}" for k, v in manual_kw.items())
     return "\n".join(lines)
 
 

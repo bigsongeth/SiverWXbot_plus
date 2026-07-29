@@ -130,17 +130,35 @@ elif event_type is None and 'choices' in data:
 再干别的"。故改为闸门让路的**串行排队**模型：转发独占直到完成，其它按序跟上（不并发、不丢消息，
 代价是大群发期间收到的消息会延后几分钟处理——已与用户确认接受，选 A）。
 
-## 7. 潜在冲突：wxautox4 库内改动（site-packages，★重装/升级必重打）
+## 7. 转发策略：单目标逐群转（★2026-07-09 定型，勿改回多选）
 
-为**放慢转发多选框逐群勾选、防止微信卡死**，改过 wxautox4 内一行（不在本仓库里，
-`pip install/upgrade wxautox4` 会被覆盖，届时需重新改）：
+**血的教训**：曾用 `msg.forward([群1, 群2, …])` 传列表 → 微信弹「分别发送给」**多选框**，
+逐群勾选。实测转 106 群（其中约 100 个机器人已不在、搜索"无结果"）时，微信**直接未响应
+（"Weixin 未响应"）卡死**，用户被迫关掉微信。`OPERATION_WAIT_TIME=1.0` 也救不回来。
+
+**现方案（`plugins/ncc_community/forward.py`）**：`msg.forward(群)` 传**单个字符串** → 走轻量的
+「发送给」对话框，一个群一个群转。核心函数：
+- `_forward_one_shot(cache_box, bot, source, sig, group, d)`：转**单个**群；stale 才重定位重试，
+  其它失败（多为"无结果"=该群没了）**不重试**。
+- `_forward_located_message(bot, source, sig, targets, d)`：`for g in targets` 逐个转，每
+  `batch_every`(=10) 个群额外歇 `batch_min~batch_max`；"无结果"的群收进 `gone` → `mark_unreachable`。
+- `DELAY`：`group_min/max`(群间 2.5-4.5s)、`msg_min/max`(消息间 5-8s)、
+  `batch_every/batch_min/batch_max`(每 10 群歇 5-9s)、`max_retries`。
+- **保护**：整条一个群都没成功 → 判是"这条消息本身转不了"（视频号等），不冤枉群、不标记不可达。
+
+⚠️ **不要改回传列表/多选框**（用户 2026-07-09 明确"改回一个一个吧"），也**不要**加"大范围确认"
+（用户"不用加大范围确认"）。已无 `CHUNK_SIZE`/`group_chunks` 概念。
+
+### 7.1 wxautox4 库内改动（site-packages，★重装/升级必重打）
+
+改过 wxautox4 内一行放慢全局 UI 操作（不在本仓库里，`pip install/upgrade wxautox4` 会被覆盖，
+届时需重新改）：
 
 - 文件：`…/site-packages/wxautox4/uia/uiautomation.py`
 - 改动：全局 `OPERATION_WAIT_TIME = 0.5` → `OPERATION_WAIT_TIME = 1.0`
-  （每次点击/勾选/输入后的等待，翻倍 → 勾群变慢；备份在同目录 `uiautomation.py.nccbak`）
+  （每次点击/输入后的等待翻倍 → UI 操作更稳；备份在同目录 `uiautomation.py.nccbak`）
 - 影响面：全局 UI 操作都变慢约 0.5s（收发消息也稍慢，可接受）。`forward` 本身在
-  `msgs/*.pyd`、多选框在 `ui/*.pyd`，都是编译的，改不了，只能拧这个底层等待。
-- 配合：`plugins/ncc_community/forward.py` 的 `DELAY`（批间 3-5s、消息间 5-8s）进一步降低连发频率。
+  `msgs/*.pyd`、对话框在 `ui/*.pyd`，都是编译的改不了，只能拧这个底层等待。
 
 ## 8. 常见协作任务流程
 1.  **文件修改**：通过文件操作工具编辑代码内容。

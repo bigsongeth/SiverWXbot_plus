@@ -7,7 +7,7 @@
 - remark.py    干净打🐶备注（登记表标志幂等，避免 wxautox 追加坑）
 - discovery.py 被动发现：未登记群一说话 → 打备注 + 入 Notion 待归类 + 提醒
 - welcome.py   分群迎新：新人进群发欢迎语 + 在地化链接卡片
-- invite.py    关键词拉群：私聊/群聊命中关键词后把发送人拉进目标群
+- invite.py    关键词拉群：私聊命中关键词后把发送人拉进目标群（群聊不触发）
 
 权限模型：管理群（进群即管理员）替代旧协议的 wxid 白名单验证。
 wxbot_core.py 只保留三个最小 hook（friend/self/system 三个分支各一处），
@@ -22,9 +22,11 @@ from .welcome import handle_welcome
 
 
 def handle_friend_message(bot, chat, msg) -> bool:
-    """friend 消息入口：管理群走指令/转发；其他群旁路发现新群；私聊/群走拉群关键词。
+    """friend 消息入口：管理群走指令/转发；其他群旁路发现新群；私聊走拉群关键词。
 
     返回 True 表示已处理，核心应跳过后续 AI/转发流程。
+    注意：全局模式下新私聊的首条消息不经过 message_handle_callback，
+    wxbot_core 的 get_next_new_message 里另有一处 hook 调本函数。
     """
     cfg = store.load()
     who = str(getattr(chat, "who", "") or "")

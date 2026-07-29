@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 
-from plugins.ncc_community import store, forward, invite, welcome
+from plugins.ncc_community import store, forward, invite, registry, welcome
 from plugins.ncc_community import handle_friend_message, handle_self_message, handle_system_message
 from plugins.ncc_community.common import REPLY_PREFIX
 
@@ -98,7 +98,11 @@ class NccCommunityTestCase(unittest.TestCase):
         store.CONFIG_PATH = os.path.join(self.tmpdir, "config.json")
         store._cache = None
         store._cache_mtime = None
-        forward._SESSIONS.clear()
+        self._orig_reg_dir = registry.DATA_DIR
+        self._orig_reg_path = registry.REGISTRY_PATH
+        registry.DATA_DIR = self.tmpdir
+        registry.REGISTRY_PATH = os.path.join(self.tmpdir, "registry.json")
+        forward._STATE.clear()
         invite._QUOTA.clear()
         self.bot = FakeBot()
         self.admin_chat = FakeChat(ADMIN_GROUP)
@@ -108,6 +112,8 @@ class NccCommunityTestCase(unittest.TestCase):
         store.CONFIG_PATH = self._orig_config_path
         store._cache = None
         store._cache_mtime = None
+        registry.DATA_DIR = self._orig_reg_dir
+        registry.REGISTRY_PATH = self._orig_reg_path
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     # ---------- store ----------
@@ -132,38 +138,8 @@ class NccCommunityTestCase(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIn("转发", self.admin_chat.sent[0])
 
-    def test_group_list_command(self):
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("分组列表"))
-        self.assertIn("测试组", self.admin_chat.sent[0])
-        self.assertIn("肥肉测试1", self.admin_chat.sent[0])
-
-    def test_forward_unknown_group(self):
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("转发 不存在的组"))
-        self.assertIn("没有「不存在的组」", self.admin_chat.sent[0])
-        self.assertIsNone(forward._get_session("大松"))
-
-    def test_forward_full_flow(self):
-        # 进入收集模式
-        handled = handle_friend_message(self.bot, self.admin_chat, FakeMsg("转发 测试组"))
-        self.assertTrue(handled)
-        self.assertIsNotNone(forward._get_session("大松"))
-        # 发素材（图片消息）→ 被转发到两个群
-        material = FakeMsg("[图片]", mtype="image")
-        handled = handle_friend_message(self.bot, self.admin_chat, material)
-        self.assertTrue(handled)
-        self.assertEqual(material.forwarded_to, [["肥肉测试1", "爱和一切肥肉测试群"]])
-        self.assertIn("2 个群", self.admin_chat.sent[-1])
-        # 结束
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("结束"))
-        self.assertIsNone(forward._get_session("大松"))
-        self.assertIn("成功 2", self.admin_chat.sent[-1])
-
-    def test_forward_failure_reported(self):
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("转发 测试组"))
-        material = FakeMsg("hello", mtype="text")
-        material.forward_ok = False
-        handle_friend_message(self.bot, self.admin_chat, material)
-        self.assertIn("失败", self.admin_chat.sent[-1])
+    # Phase1 的转发流程用例（转发 <组名> / _get_session / config 分组）已随
+    # Phase3 重构删除，现行菜单式转发流程的测试在 tests/test_ncc_engine.py。
 
     def test_sessions_isolated_by_sender(self):
         handle_friend_message(self.bot, self.admin_chat, FakeMsg("转发 测试组", sender="大松"))
@@ -186,29 +162,7 @@ class NccCommunityTestCase(unittest.TestCase):
         handled = handle_self_message(self.bot, self.admin_chat, msg)
         self.assertTrue(handled)
 
-    def test_chunking(self):
-        cfg = store.load()
-        cfg["forward"]["groups"]["大组"] = [f"群{i}" for i in range(10)]
-        cfg["forward"]["chunk_size"] = 4
-        store.save(cfg)
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("转发 大组"))
-        material = FakeMsg("素材", mtype="text")
-        handle_friend_message(self.bot, self.admin_chat, material)
-        self.assertEqual([len(part) for part in material.forwarded_to], [4, 4, 2])
-
-    # ---------- forward: 分组维护 ----------
-
-    def test_group_management(self):
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("新建分组 在地群"))
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("加群 在地群|黄山在地"))
-        cfg = store.load()
-        self.assertEqual(cfg["forward"]["groups"]["在地群"], ["黄山在地"])
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("删群 在地群|黄山在地"))
-        cfg = store.load()
-        self.assertEqual(cfg["forward"]["groups"]["在地群"], [])
-        handle_friend_message(self.bot, self.admin_chat, FakeMsg("删除分组 在地群"))
-        cfg = store.load()
-        self.assertNotIn("在地群", cfg["forward"]["groups"])
+    # ---------- 拉群 / 迎新配置指令 ----------
 
     def test_invite_keyword_management(self):
         handle_friend_message(self.bot, self.admin_chat, FakeMsg("设拉群 灵感食堂|灵感食堂活动群"))
@@ -264,37 +218,33 @@ class NccCommunityTestCase(unittest.TestCase):
 
     # ---------- invite ----------
 
-    def test_invite_from_group(self):
+    def test_invite_not_triggered_in_group(self):
+        # 拉群只在私聊生效：群里发关键词（含 @肥肉 前缀）都不处理
         chat = FakeChat("爱和一切肥肉测试群")
-        msg = FakeMsg("测试拉群", sender="小明")
-        handled = handle_friend_message(self.bot, chat, msg)
-        self.assertTrue(handled)
-        self.assertEqual(self.bot.wx.chatted, ["肥肉测试1"])
-        self.assertEqual(self.bot.wx.added_members, [["小明"]])
-        self.assertIn("已邀请", chat.sent[0])
+        self.assertFalse(handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小明")))
+        self.assertFalse(handle_friend_message(self.bot, chat, FakeMsg("@肥肉 测试拉群", sender="小明")))
+        self.assertEqual(self.bot.wx.added_members, [])
 
     def test_invite_from_private(self):
         chat = FakeChat("小红", chat_type="friend")
         msg = FakeMsg("测试拉群", sender="小红")
         handled = handle_friend_message(self.bot, chat, msg)
         self.assertTrue(handled)
+        self.assertEqual(self.bot.wx.chatted, ["肥肉测试1"])
         self.assertEqual(self.bot.wx.added_members, [["小红"]])
-
-    def test_invite_with_at_prefix(self):
-        chat = FakeChat("爱和一切肥肉测试群")
-        msg = FakeMsg("@肥肉 测试拉群", sender="小明")
-        self.assertTrue(handle_friend_message(self.bot, chat, msg))
+        # 成功时静默拉群，不回话
+        self.assertEqual(chat.sent, [])
 
     def test_invite_failure_reply(self):
         self.bot.wx.add_result = FakeWxResponse(False, "找不到该成员")
-        chat = FakeChat("爱和一切肥肉测试群")
+        chat = FakeChat("陌生人", chat_type="friend")
         msg = FakeMsg("测试拉群", sender="陌生人")
         handled = handle_friend_message(self.bot, chat, msg)
         self.assertTrue(handled)
         self.assertIn("没成功", chat.sent[0])
 
     def test_invite_daily_limit(self):
-        chat = FakeChat("爱和一切肥肉测试群")
+        chat = FakeChat("小明", chat_type="friend")
         for _ in range(3):
             handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小明"))
         msg = FakeMsg("测试拉群", sender="小明")
@@ -304,9 +254,56 @@ class NccCommunityTestCase(unittest.TestCase):
         self.assertEqual(len(self.bot.wx.added_members), 3)
 
     def test_non_keyword_not_handled(self):
-        chat = FakeChat("爱和一切肥肉测试群")
+        chat = FakeChat("小明", chat_type="friend")
         handled = handle_friend_message(self.bot, chat, FakeMsg("今天天气不错", sender="小明"))
         self.assertFalse(handled)
+
+    # ---------- invite: Notion 同步来的关键词（registry.invite_keywords） ----------
+
+    def _seed_registry_invites(self, keywords, groups=None):
+        data = registry.load()
+        data["invite_keywords"] = keywords
+        if groups:
+            data["groups"] = groups
+        registry.save(data)
+
+    def test_invite_keyword_from_registry(self):
+        self._seed_registry_invites({"大理": "NCC的大理朋友们3群"})
+        chat = FakeChat("小红", chat_type="friend")
+        handled = handle_friend_message(self.bot, chat, FakeMsg("大理", sender="小红"))
+        self.assertTrue(handled)
+        self.assertEqual(self.bot.wx.chatted, ["NCC的大理朋友们3群"])
+        self.assertEqual(self.bot.wx.added_members, [["小红"]])
+        self.assertEqual(chat.sent, [])  # 成功静默
+
+    def test_invite_registry_keyword_uses_remark_addressing(self):
+        # 打过🐶备注的群按备注寻址（改群名也锁得住）
+        self._seed_registry_invites(
+            {"大理": "NCC的大理朋友们3群"},
+            groups={"NCC的大理朋友们3群": {
+                "name": "NCC的大理朋友们3群",
+                "remark": "NCC的大理朋友们3群🐶",
+                "remark_applied": True,
+            }},
+        )
+        chat = FakeChat("小红", chat_type="friend")
+        self.assertTrue(handle_friend_message(self.bot, chat, FakeMsg("大理", sender="小红")))
+        self.assertEqual(self.bot.wx.chatted, ["NCC的大理朋友们3群🐶"])
+
+    def test_manual_keyword_overrides_registry(self):
+        self._seed_registry_invites({"测试拉群": "Notion指向的群"})
+        # config.json 默认带 测试拉群 → 肥肉测试1，应覆盖 Notion 的同名关键词
+        chat = FakeChat("小红", chat_type="friend")
+        self.assertTrue(handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小红")))
+        self.assertEqual(self.bot.wx.chatted, ["肥肉测试1"])
+
+    def test_invite_list_shows_both_sources(self):
+        self._seed_registry_invites({"大理": "NCC的大理朋友们3群"})
+        handle_friend_message(self.bot, self.admin_chat, FakeMsg("拉群列表"))
+        out = self.admin_chat.sent[-1]
+        self.assertIn("大理", out)
+        self.assertIn("Notion", out)
+        self.assertIn("测试拉群", out)
 
 
 if __name__ == "__main__":

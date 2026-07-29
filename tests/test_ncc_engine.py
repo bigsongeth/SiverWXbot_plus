@@ -37,12 +37,12 @@ class FakeMsg:
         self.gone_set = set()    # 这些群"无结果"（被踢/解散）
 
     def forward(self, target, **kw):
-        # 新模型：一次转一批群（列表）
+        # 单目标模型：一次转 1 个群（字符串）；容错也接受列表
         groups = target if isinstance(target, list) else [target]
         if not self.forward_ok:
             return FakeWxResponse(False, "转发失败")
         if any(g in self.gone_set for g in groups):
-            return FakeWxResponse(False, "无结果")   # 该批里有没了的群 → 整批失败，触发逐个回退
+            return FakeWxResponse(False, "无结果")   # 该群没了 → 该次失败
         self.forwarded.extend(groups)
         return None
 
@@ -50,7 +50,8 @@ class FakeMsg:
         pass
 
 
-ZERO_DELAY = {"chunk_min": 0, "chunk_max": 0, "msg_min": 0, "msg_max": 0, "max_retries": 1}
+ZERO_DELAY = {"group_min": 0, "group_max": 0, "msg_min": 0, "msg_max": 0,
+              "batch_every": 10, "batch_min": 0, "batch_max": 0, "max_retries": 1}
 
 
 def _prompt():
@@ -320,8 +321,8 @@ class EngineTest(unittest.TestCase):
         handled = handle_friend_message(self.bot, self.admin, FakeMsg("3"))
         self.assertFalse(handled)   # 不劫持普通群聊里的数字
 
-    def test_deliver_chunks_over_9_groups(self):
-        # 12 个群 → 分 2 批（9+3），一条消息 forward 2 次覆盖全部
+    def test_deliver_many_groups_single_target(self):
+        # 12 个群 → 一个群一个群转（单目标），一条消息 forward 12 次覆盖全部
         m = FakeMsg("素材", mtype="text")
         build_timeline(self.bot, m)
         task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
@@ -332,7 +333,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(sorted(m.forwarded), sorted(f"群{i}" for i in range(12)))
 
     def test_deliver_gone_group_marked_and_skipped(self):
-        # 群1 已没了(无结果)：整批失败→逐个回退→只把群1判不可达，其余照发
+        # 群1 已没了(无结果)：单群转发返回无结果→只把群1判不可达，其余照发
         m = FakeMsg("素材", mtype="text"); m.gone_set = {"群1"}
         build_timeline(self.bot, m)
         task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
@@ -460,6 +461,34 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(g["allow_speak"])
         self.assertEqual(g["welcome_url"], "https://x")
         self.assertEqual(g["groupings"], ["大理群"])
+
+    def test_parse_invites(self):
+        group_rows = [
+            {"id": "row1", "properties": {"群名": {"title": [{"plain_text": "NCC大理一家人🐶"}]}}},
+            {"id": "row2", "properties": {"群名": {"title": [{"plain_text": "黄山总部"}]}}},
+        ]
+        invite_rows = [
+            # 标题列名带尾随空格（真实表就是「让对方回复 」），按类型解析不受影响
+            {"properties": {"让对方回复 ": {"title": [{"plain_text": " 大理 "}]},
+                            "拉入群聊": {"relation": [{"id": "row1"}]}}},
+            {"properties": {"让对方回复 ": {"title": [{"plain_text": "黄山"}]},
+                            "拉入群聊": {"relation": [{"id": "row2"}]}}},
+            # 目标群不在群聊列表 → 跳过
+            {"properties": {"让对方回复 ": {"title": [{"plain_text": "火星"}]},
+                            "拉入群聊": {"relation": [{"id": "nowhere"}]}}},
+            # 缺关键词 → 跳过
+            {"properties": {"让对方回复 ": {"title": []},
+                            "拉入群聊": {"relation": [{"id": "row2"}]}}},
+        ]
+        invites = notion_sync.parse_invites(invite_rows, group_rows)
+        self.assertEqual(invites, {"大理": "NCC大理一家人", "黄山": "黄山总部"})
+
+    def test_upsert_invite_keywords(self):
+        # 带 invite_keywords 时写入；下次不带（None）时保留原值
+        registry.upsert_from_notion({}, {}, {"大理": "群A"})
+        self.assertEqual(registry.load()["invite_keywords"], {"大理": "群A"})
+        registry.upsert_from_notion({}, {})
+        self.assertEqual(registry.load()["invite_keywords"], {"大理": "群A"})
 
 
 if __name__ == "__main__":

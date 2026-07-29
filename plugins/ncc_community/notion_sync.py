@@ -2,7 +2,7 @@
 """Notion 同步 —— 引擎的①（拉取分组/权限）和④的一半（回写新发现群）。
 
 真相源是 Notion：
-- pull(): 读「群聊列表」+「转发群聊分组」→ 写本地 registry.json（人管字段以 Notion 为准）
+- pull(): 读「群聊列表」+「转发群聊分组」+「迎新拉群」→ 写本地 registry.json（人管字段以 Notion 为准）
 - push_discovery(): 新发现群 append 到「群聊列表」底部（群名=原群名），让人去归类
 
 token 存 data/secret.json（不进 git）。Notion API 在 win-shukong 可直连（已验证）。
@@ -26,9 +26,10 @@ SECRET_PATH = os.path.join(_DIR, "data", "secret.json")
 NOTION_VERSION = "2022-06-28"
 API = "https://api.notion.com/v1"
 
-# 两个数据库（page id），来自 Notion「NCC 社群管理」页
+# 三个数据库（page id），来自 Notion「NCC 社群管理」页
 DB_GROUPS = "1564e93f56828007b10cd8a5d2fa1f50"      # 群聊列表
 DB_GROUPINGS = "1564e93f568280baa110f5c48b5249b6"   # 转发群聊分组
+DB_INVITES = "1694e93f568280ba9baef81b52ba4afa"     # 迎新拉群（关键词 → 拉入群聊）
 
 
 def _load_secret() -> dict:
@@ -168,6 +169,38 @@ def parse_notion(group_rows: list, grouping_rows: list):
     return groupings, groups
 
 
+def _prop_of_kind(props: dict, kind: str) -> dict:
+    """按类型（title/relation…）找一行里的属性，不按列名找——
+    「迎新拉群」表的关键词列名带尾随空格（「让对方回复 」），按名匹配太脆。"""
+    for prop in (props or {}).values():
+        if isinstance(prop, dict) and kind in prop:
+            return prop
+    return {}
+
+
+def parse_invites(invite_rows: list, group_rows: list):
+    """把「迎新拉群」库解析成 {关键词: 群名}。纯函数，便于单测。
+    目标群是指向「群聊列表」的 relation，群名剥🐶；
+    关键词去首尾空白，缺关键词或目标群不在群聊列表的行跳过。"""
+    id_to_name = {}
+    for row in group_rows:
+        name, _ = _strip_dog(_title(row["properties"].get("群名")))
+        if name:
+            id_to_name[row["id"]] = name
+
+    invites = {}
+    for row in invite_rows:
+        p = row.get("properties", {})
+        keyword = _title(_prop_of_kind(p, "title")).strip()
+        if not keyword:
+            continue
+        rel_ids = _relation_ids(_prop_of_kind(p, "relation"))
+        target = next((id_to_name[i] for i in rel_ids if i in id_to_name), None)
+        if target:
+            invites[keyword] = target
+    return invites
+
+
 def update_title_dog(page_id: str, base_name: str) -> None:
     """把某群在 Notion 的『群名』标题改成「原名🐶」（纳管后回写，让表里可见）。
     幂等：已带🐶就不重复加。"""
@@ -184,10 +217,13 @@ def pull() -> dict:
         raise RuntimeError("缺少 Notion token（data/secret.json）")
     group_rows = _query_all(DB_GROUPS)
     grouping_rows = _query_all(DB_GROUPINGS)
+    invite_rows = _query_all(DB_INVITES)
     groupings, groups = parse_notion(group_rows, grouping_rows)
-    registry.upsert_from_notion(groupings, groups)
+    invites = parse_invites(invite_rows, group_rows)
+    registry.upsert_from_notion(groupings, groups, invites)
     stat = {"groupings": len(groupings), "groups": len(groups),
-            "forward_on": sum(1 for g in groups.values() if g["allow_forward"])}
+            "forward_on": sum(1 for g in groups.values() if g["allow_forward"]),
+            "invites": len(invites)}
     log("INFO", f"Notion 拉取完成：{stat}")
     return stat
 
