@@ -1,13 +1,14 @@
-test.py
-test2.py
-test3.py
+# ============================================================
+# 密钥 / 本机配置（绝对不能进库）
+# ============================================================
 config.json
-wx.png
+/config/
 wxautox_activate.py
-/.gitignore
-CLAUDE.md
+.claude/settings.local.json
 
-.claude/
+# ============================================================
+# 环境与构建产物
+# ============================================================
 .venv
 venv/
 venv2/
@@ -19,25 +20,52 @@ dist/
 __pycache__/
 .pycache_verify/
 /releases/
-/config/
-logs/
-wxauto_logs/
-panel_logs/
-memory/
-backup/
-wxautox文件下载/
-old_wxbot_config/
-docs/admin
-tests/
-
 *.zip
 *.whl
 *.exe
 *.spec
 *.ui
+
+# ============================================================
+# 日志与运行时目录
+# ============================================================
 *.log
-*.png
+logs/
+wxauto_logs/
+panel_logs/
+memory/
+backup/
+old_wxbot_config/
+wxautox文件下载/
+docs/admin
 
-
-# ui_watchdog 插件运行时数据（自启动标记、重启历史）
+# ============================================================
+# 插件运行时数据（真相源在别处，仓库只放代码）
+# ============================================================
+# ui_watchdog：自启动标记、重启历史
 plugins/ui_watchdog/data/
+# wechat_checkin：码池 sqlite + 每日 JSON 备份（真相源在 hkbohai，见 CLAUDE.md 3.3）
+plugins/wechat_checkin/data/
+plugins/wechat_checkin/imports/
+# ncc_community / ncc_kb：群内指令实时写盘的运行配置（见 CLAUDE.md 3.6 / 3.9）
+plugins/ncc_community/data/*.json
+plugins/ncc_kb/data/
+# ai_news_note：抓取数据与已发送标记
+plugins/ai_news_note/data/
+plugins/ai_news_note/last_sent.txt
+
+# ============================================================
+# 临时文件 / 手工备份
+# ============================================================
+# 改核心文件前手动留的 .bak-xxx 副本，属于本机临时物
+*.bak
+*.bak-*
+tmp_*.py
+test.py
+test2.py
+test3.py
+.DS_Store
+wx.png
+*.png
+# 例外：上游文档截图本来就在版本库里
+!docs/img/*.png

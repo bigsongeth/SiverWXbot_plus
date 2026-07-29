@@ -1,0 +1,24 @@
+# 行尾规范
+#
+# 背景：项目实际跑在 Windows（win-shukong），但日常开发常从 mac 通过挂载/SSH 操作，
+# 磁盘上的文件多为 CRLF，而仓库里存的是 LF。没有本文件时 git 会把整份文件判成
+# "全行改动"，README.md 这种会显示改了 1500 行其实一行没动，diff 完全没法看。
+#
+# 规则：仓库内一律存 LF（text=auto 自动规范化），检出时按各平台习惯还原。
+
+* text=auto
+
+# .bat / .cmd 必须 CRLF —— LF 会让 CMD 在错误位置断句（见 CLAUDE.md 第 1 节血泪）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 明确按二进制处理，别做行尾转换、别在 diff 里展开
+*.sqlite3 binary
+*.db      binary
+*.png     binary
+*.jpg     binary
+*.ico     binary
+*.whl     binary
+*.zip     binary
+*.exe     binary
