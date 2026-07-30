@@ -13,7 +13,7 @@ from __future__ import annotations
 import threading
 
 from . import registry, remark
-from .common import log, REPLY_PREFIX
+from .common import log, notify_admin
 
 # 本次运行已处理过的新群，避免同一群每条消息都触发一轮
 _SEEN = set()
@@ -78,10 +78,5 @@ def _registry_name(data: dict, who: str) -> str:
 
 
 def _notify_admin(bot, cfg, text: str) -> None:
-    admin = cfg.get("admin_group")
-    if not admin:
-        return
-    try:
-        bot.wx.SendMsg(msg=f"{REPLY_PREFIX} {text}", who=admin)
-    except Exception as e:
-        log("ERROR", f"提醒管理群失败: {e}")
+    """实现已提到 common.notify_admin（拉群失败也要用），这里保留薄封装。"""
+    notify_admin(bot, cfg, text)

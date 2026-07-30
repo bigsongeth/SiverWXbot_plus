@@ -107,7 +107,9 @@ def _remark_worker(bot, admin, limit):
 
 
 def _apply_one(wx, name, lock):
-    """给单个群打🐶：确认是群→SetGroupRemark→登记表标记。返回 (status, info)。"""
+    """给单个群打🐶：确认窗口就是该群→SetGroupRemark→登记表标记。返回 (status, info)。
+
+    确认不只看 chat_type：模糊搜索可能命中名字相近的另一个群，备注打错清不掉。"""
     data = registry.load()
     g = registry.get_group(data, name)
     if g and g.get("remark_applied"):
@@ -115,10 +117,9 @@ def _apply_one(wx, name, lock):
     try:
         with lock:
             wx.ChatWith(name, exact=False)
-            info = wx.ChatInfo() or {}
-            ctype = str(info.get("chat_type") or "")
-            if ctype != "group":
-                return "skip", f"非群({ctype or '未知'})"
+            ok, why = remark.confirm_group_window(wx, name)
+            if not ok:
+                return "skip", why
             r = wx.SetGroupRemark(name + DOG)
     except Exception as e:
         return "fail", str(e)

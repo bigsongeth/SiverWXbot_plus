@@ -95,12 +95,33 @@ def _delays(cfg):
     return d
 
 
+def _switched(wx, who: str, exact: bool = False) -> bool:
+    """切到某个会话，并【接住返回值】判断到底切成功没有。
+
+    ChatWith 找不到会话是静默失败（返回 falsy WxResponse，不抛异常）。不看返回值就继续
+    操作，等于在"上一个还开着的窗口"上干活：读到别人的消息、把备注/成员改到别的会话上
+    （2026-07-30 拉群故障的根因就是这个，详见 plugins/ncc_community/invite.py 顶部）。
+    wxautox 也有成功返回 None 的先例，所以 None 视为成功。"""
+    try:
+        r = wx.ChatWith(who=who, exact=exact)
+    except Exception as e:
+        log("WARNING", f"切到「{who}」抛异常：{e}")
+        return False
+    if r is None or r:
+        return True
+    log("WARNING", f"切到「{who}」失败：{_wxresponse_message(r)}")
+    return False
+
+
 def _locate(bot, source, sig):
     """（须在 MAIN_WINDOW_LOCK 内调用）滚动定位到 sig 对应消息，返回它当前可见的
     新鲜元素或 None。ChatWith 回最新 → GetHistoryMessage 往上滚，匹配到本条签名就停，
     视图停在它上面 → GetAllMessage 取此刻可见（有效）的同签名元素。"""
     STOP = _stop_sign()
-    bot.wx.ChatWith(source, exact=False)
+    if not _switched(bot.wx, source):
+        # 切不过去就别在别人的窗口里翻消息（ChatWith 静默失败，返回 falsy 不抛异常）
+        log("WARNING", f"定位消息前切到源「{source}」失败，本次放弃定位")
+        return None
     time.sleep(GATHER_SETTLE)
 
     def cb(m, _s=sig):
@@ -229,7 +250,9 @@ def _read_source_messages(bot, source, goback=True):
     （COLLECT_PROMPT）就停。这样即使消息多、超出可见区，也会被滚动加载出来。
     goback=False 时结束后停在收集起点（便于随后从上往下逐条转发，保持元素有效）。"""
     with MAIN_WINDOW_LOCK:
-        bot.wx.ChatWith(source, exact=False)
+        if not _switched(bot.wx, source):
+            log("WARNING", f"读取源群前切到「{source}」失败，本次读到 0 条")
+            return []
         time.sleep(GATHER_SETTLE)
         STOP = _stop_sign()
 
@@ -649,13 +672,10 @@ def _check_groups(bot, chat, name) -> bool:
     ok_list, fail_list = [], []
     wx = getattr(bot, "wx", None)
     for t in targets:
-        try:
-            with MAIN_WINDOW_LOCK:
-                wx.ChatWith(who=t, exact=False)
-            ok_list.append(t)
-        except Exception as e:
-            fail_list.append(t)
-            log("WARNING", f"检查群组 {t} 不可达: {e}")
+        # 以前只捕异常不看返回值，切群静默失败会被报成"可达"，检查等于白做
+        with MAIN_WINDOW_LOCK:
+            reachable = _switched(wx, t, exact=False)
+        (ok_list if reachable else fail_list).append(t)
         time.sleep(0.5)
     lines = [f"检查完成：{len(ok_list)}/{len(targets)} 可达。"]
     if fail_list:

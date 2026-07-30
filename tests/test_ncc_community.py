@@ -64,13 +64,35 @@ class FakeWx:
         self.added_members = []
         self.url_cards = []
         self.add_result = FakeWxResponse(True)
+        self.sent_to = []
+        # 切不过去的会话名（模拟 ChatWith 静默失败：返回 falsy，窗口留在原处）
+        self.fail_names = set()
+        # 会话名 -> chat_type，缺省当群聊
+        self.chat_types = {}
+        # 当前主窗口停在哪个会话
+        self.current_chat = None
 
     def ChatWith(self, who=None, exact=False):
         self.chatted.append(who)
+        if who in self.fail_names:
+            return FakeWxResponse(False, "未找到会话")
+        self.current_chat = who
+        return None          # 真实 wxautox 成功时可能返回 None
+
+    def ChatInfo(self):
+        if self.current_chat is None:
+            return {}
+        return {"chat_name": self.current_chat,
+                "chat_type": self.chat_types.get(self.current_chat, "group"),
+                "remark": ""}
 
     def AddGroupMembers(self, members=None, **kwargs):
         self.added_members.append(list(members))
         return self.add_result
+
+    def SendMsg(self, msg=None, who=None, **kwargs):
+        self.sent_to.append((who, msg))
+        return FakeWxResponse(True)
 
     def SendUrlCard(self, url=None, friends=None, **kwargs):
         self.url_cards.append((url, friends))
@@ -104,10 +126,16 @@ class NccCommunityTestCase(unittest.TestCase):
         registry.REGISTRY_PATH = os.path.join(self.tmpdir, "registry.json")
         forward._STATE.clear()
         invite._QUOTA.clear()
+        invite._FAILS.clear()
+        # 切群重试的等待在单测里没意义，清零省时间
+        self._orig_waits = (invite._SWITCH_WAIT, invite._SETTLE_AFTER_SWITCH)
+        invite._SWITCH_WAIT = 0
+        invite._SETTLE_AFTER_SWITCH = 0
         self.bot = FakeBot()
         self.admin_chat = FakeChat(ADMIN_GROUP)
 
     def tearDown(self):
+        invite._SWITCH_WAIT, invite._SETTLE_AFTER_SWITCH = self._orig_waits
         store.DATA_DIR = self._orig_data_dir
         store.CONFIG_PATH = self._orig_config_path
         store._cache = None
@@ -242,6 +270,76 @@ class NccCommunityTestCase(unittest.TestCase):
         handled = handle_friend_message(self.bot, chat, msg)
         self.assertTrue(handled)
         self.assertIn("没成功", chat.sent[0])
+
+    def test_invite_group_not_found_does_not_touch_members(self):
+        """切群失败（ChatWith 静默返回 falsy）时绝不能去点"添加成员"：
+        那会在残留的私聊窗口上操作，选不到人还可能【新建一个群】。"""
+        self.bot.wx.fail_names = {"肥肉测试1"}
+        self.bot.wx.current_chat = "小红"          # 窗口停在私聊上
+        self.bot.wx.chat_types["小红"] = "friend"
+        chat = FakeChat("小红", chat_type="friend")
+        handled = handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小红"))
+        self.assertTrue(handled)
+        self.assertEqual(self.bot.wx.added_members, [])       # 没碰添加成员
+        self.assertIn("没打开成功", chat.sent[0])              # 不再误报"不是好友"
+        # 管理群收到接手提醒
+        self.assertTrue(any(w == ADMIN_GROUP and "拉群没成功" in (m or "")
+                            for w, m in self.bot.wx.sent_to))
+
+    def test_invite_aborts_when_window_is_private_chat(self):
+        """ChatWith 说切成功了，但 ChatInfo 显示当前是私聊 → 同样早退（防新建群）。"""
+        self.bot.wx.chat_types["肥肉测试1"] = "friend"
+        chat = FakeChat("小红", chat_type="friend")
+        handled = handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小红"))
+        self.assertTrue(handled)
+        self.assertEqual(self.bot.wx.added_members, [])
+        self.assertIn("没打开成功", chat.sent[0])
+
+    def test_invite_falls_back_from_remark_to_group_name(self):
+        """备注名搜不到时回退用群名重试（🐶备注丢了不该让整个关键词报废）。"""
+        self._seed_registry_invites(
+            {"大理": "NCC的大理朋友们3群"},
+            {"NCC的大理朋友们3群": {"name": "NCC的大理朋友们3群",
+                                   "remark": "NCC的大理朋友们3群🐶",
+                                   "remark_applied": True}})
+        self.bot.wx.fail_names = {"NCC的大理朋友们3群🐶"}
+        chat = FakeChat("小红", chat_type="friend")
+        handled = handle_friend_message(self.bot, chat, FakeMsg("大理", sender="小红"))
+        self.assertTrue(handled)
+        self.assertEqual(self.bot.wx.chatted[0], "NCC的大理朋友们3群🐶")   # 先试备注
+        self.assertEqual(self.bot.wx.chatted[-1], "NCC的大理朋友们3群")    # 再回退群名
+        self.assertEqual(self.bot.wx.added_members, [["小红"]])
+        self.assertEqual(chat.sent, [])                                    # 成功不回话
+
+    def test_invite_failure_notifies_admin_once_per_day(self):
+        """同一个人反复试，管理群只被提醒一次（别刷屏）。"""
+        self.bot.wx.add_result = FakeWxResponse(False, "找不到该成员")
+        chat = FakeChat("小明", chat_type="friend")
+        for _ in range(4):
+            handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小明"))
+        notes = [m for w, m in self.bot.wx.sent_to if w == ADMIN_GROUP]
+        self.assertEqual(len(notes), 1)
+
+    def test_invite_failure_refund_is_capped(self):
+        """退配额有上限：狂发关键词不能无限触发切群/选人的 UI 操作。"""
+        self.bot.wx.add_result = FakeWxResponse(False, "找不到该成员")
+        chat = FakeChat("小明", chat_type="friend")
+        for _ in range(10):
+            handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小明"))
+        # daily_limit 3 + 最多退 3 次 = 最多 6 次真正动手
+        self.assertEqual(len(self.bot.wx.added_members), 6)
+        self.assertIn("次数用完", chat.sent[-1])
+
+    def test_invite_failure_refunds_quota(self):
+        """失败不该吃掉当天额度：连失败 3 次后第 4 次仍能尝试。"""
+        self.bot.wx.add_result = FakeWxResponse(False, "找不到该成员")
+        chat = FakeChat("小明", chat_type="friend")
+        for _ in range(3):
+            handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小明"))
+        self.bot.wx.add_result = FakeWxResponse(True)
+        handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小明"))
+        self.assertEqual(len(self.bot.wx.added_members), 4)
+        self.assertNotIn("次数用完", "".join(chat.sent))
 
     def test_invite_daily_limit(self):
         chat = FakeChat("小明", chat_type="friend")

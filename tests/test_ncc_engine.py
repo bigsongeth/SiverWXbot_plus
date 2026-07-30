@@ -75,9 +75,20 @@ class FakeWx:
         self.remarks = {}     # 群名 -> 备注（模拟“追加”行为验证幂等）
         self.sent = []
         self.timeline = []    # 源群消息时间线（_gather_content 现读这个）
+        self.chat_types = {}  # 会话名 -> chat_type，缺省当群聊
 
     def ChatWith(self, who=None, exact=False):
         self.chatted.append(who)
+        return None           # 真实 wxautox 成功时可能返回 None
+
+    def ChatInfo(self):
+        """打备注/加成员前的窗口复核要用（真实 WeChat 有这个方法）。"""
+        last = self.chatted[-1] if self.chatted else None
+        if last is None:
+            return {}
+        return {"chat_name": last,
+                "chat_type": self.chat_types.get(last, "group"),
+                "remark": ""}
 
     def GetSubWindow(self, nickname):
         return None
@@ -375,6 +386,15 @@ class EngineTest(unittest.TestCase):
         self.assertIn("某新群", self.admin.sent[-1])
 
     # ---------- remark ----------
+
+    def test_apply_remark_refuses_when_window_not_the_group(self):
+        """切群静默失败/切歪了就不能打备注——wxautox 的备注是追加且清不掉的。"""
+        seed_registry()
+        self.bot.wx.chat_types["大理A群"] = "friend"   # 窗口其实是个私聊
+        ok, info = remark.apply_remark(self.bot.wx, "大理A群")
+        self.assertFalse(ok)
+        self.assertEqual(self.bot.wx.remarks, {})
+        self.assertIn("切到该群失败", info)
 
     def test_apply_remark_idempotent(self):
         seed_registry()

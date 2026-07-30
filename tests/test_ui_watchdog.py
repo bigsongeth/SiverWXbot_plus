@@ -214,6 +214,26 @@ class UIWatchdogTest(unittest.TestCase):
         clock.advance(301)
         self.assertFalse(dog.check_once())
 
+    # ---- schtasks 定位（2026-07-30 03:20 真实哑火：schtasks not found） ----
+
+    def test_schtasks_exe_uses_absolute_path_on_windows(self):
+        """计划任务/服务上下文的 PATH 可能没有 System32，必须走 %SystemRoot% 绝对路径。"""
+        import tempfile
+        from unittest import mock
+        tmp = tempfile.mkdtemp(prefix='wd_sysroot_')
+        sys32 = os.path.join(tmp, 'System32')
+        os.makedirs(sys32, exist_ok=True)
+        exe = os.path.join(sys32, 'schtasks.exe')
+        open(exe, 'w').close()
+        with mock.patch.object(wd.sys, 'platform', 'win32'), \
+             mock.patch.dict(os.environ, {'SystemRoot': tmp}):
+            self.assertEqual(wd._schtasks_exe(), exe)
+
+    def test_schtasks_exe_falls_back_to_bare_name(self):
+        from unittest import mock
+        with mock.patch.object(wd.sys, 'platform', 'linux'):
+            self.assertEqual(wd._schtasks_exe(), 'schtasks')
+
 
 if __name__ == '__main__':
     unittest.main()

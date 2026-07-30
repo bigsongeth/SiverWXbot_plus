@@ -81,12 +81,16 @@ HTTP.trust_env = False
 #   DEFAULT_MESSAGE_XBIAS     (int)  : 头像到消息 X 偏移量，默认 51
 #   LISTEN_INTERVAL           (int)  : 监听消息时间间隔（秒），默认 1
 #   LISTENER_EXCUTOR_WORKERS  (int)  : 监听执行器线程池大小，默认 4
-#   SEARCH_CHAT_TIMEOUT       (int)  : 搜索聊天对象超时时间（秒），默认 5
 # ============================================================
 WxParam.MESSAGE_HASH = True         # 启用消息哈希，辅助消息去重判断
 WxParam.FORCE_MESSAGE_XBIAS = True  # 每次启动强制重新获取 X 偏移量
 WxParam.CHAT_WINDOW_SIZE = (1500, 6000)
 WxParam.DEFAULT_MESSAGE_YBIAS = 40
+# 搜索聊天对象超时：wxautox 40.1.15 的默认值只有 2 秒（不是文档里的 5）。ChatWith 在会话
+# 列表里找不到目标就走搜索框，微信搜索结果常常 2 秒内还没渲染出来，于是静默返回
+# failure("未找到会话")——2026-07-29/30 的拉群连挂两次就是这么来的（详见
+# plugins/ncc_community/invite.py 顶部复盘）。放宽到 5 秒。
+WxParam.SEARCH_CHAT_TIMEOUT = 5
 
 # ============================================================
 # 拆分多条回复常量

@@ -116,6 +116,22 @@ class BatchTest(unittest.TestCase):
         data = registry.load()
         self.assertFalse(data["groups"]["某人"]["remark_applied"])
 
+    def test_apply_one_skips_when_window_is_another_group(self):
+        """模糊搜索命中了名字相近的另一个群 → 绝不能在它头上打备注（备注是追加、清不掉）。"""
+        seed(["群甲"])
+
+        class DriftWx(FakeWx):
+            def ChatWith(self, who=None, exact=False):
+                self.chatted.append(who)
+                self._cur = "另一个群"        # 切歪了
+
+        wx = DriftWx({"群甲": "group", "另一个群": "group"})
+        status, info = batch._apply_one(wx, "群甲", threading.Lock())
+        self.assertEqual(status, "skip")
+        self.assertEqual(wx.remarks, {})       # 谁的备注都没动
+        self.assertIn("另一个群", info)
+        self.assertFalse(registry.load()["groups"]["群甲"]["remark_applied"])
+
     def test_apply_one_idempotent(self):
         seed()
         registry.mark_remark_applied("群甲", "群甲🐶")

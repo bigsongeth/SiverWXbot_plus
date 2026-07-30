@@ -134,7 +134,9 @@ if handled and checkin_reply:
 - 运行配置在 `plugins/ncc_community/data/config.json`（分组/迎新/拉群关键词），群内指令实时写盘；**别提交该文件的运行时变更**。
 - 机器人程序化回复统一带 `🤖` 前缀，指令层据此忽略自己的消息防自触发循环——别去掉这个前缀。
 - **wxautox4 40.1.15 实测 `msg.forward()` 成功时返回 None**（与文档 WxResponse 不符），`forward.py` 里已按此处理，升级 wxautox 后留意这行为。
-- 单测：`python -m unittest tests.test_ncc_community`（24 个，纯 mock 不碰微信）。
+- **`ChatWith` 找不到会话是【静默失败】**：返回 falsy WxResponse、不抛异常，窗口留在原处。不接返回值就继续操作 = 在上一个窗口上干活。2026-07-29/30 拉群连挂两次就是这样：切群失败后照样调 `AddGroupMembers`，在残留的私聊窗口上点"添加成员"，报出误导人的"未选择任何新增成员"（万一选中了人还会**新建一个群**）。现在 `invite.py` / `remark.py` / `batch.py` / `forward.py` 一律"接返回值 + `ChatInfo()` 复核当前窗口"两道都过才动手，`forward._switched()` 是统一入口。**新写任何 ChatWith 调用都照这个来。**
+- 拉群还有：备注名搜不到会回退用群名重试、切群重试 3 次（微信搜索结果常常不是第一时间出来）、失败按"群没找到/人没选到"分流文案、失败退配额（最多退 3 次）、当天首次失败给管理群推提醒。
+- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（27 个，纯 mock 不碰微信）。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
 知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），355 篇公众号文章 2175 块，端点 `http://100.71.182.5:8434`（Tailscale，OpenAI 兼容）。
@@ -181,6 +183,22 @@ if handled and checkin_reply:
 机器人只会回"在忙，我稍后回复您"（7-25/26/27/29 各栽一次）。
 所以模块顶层建了 `HTTP = requests.Session(); HTTP.trust_env = False`，
 OpenAIAPI / DifyAPI / DusAPI 的请求全部走它。**合并上游后确认这些 `HTTP.post` 没被改回 `requests.post`。**
+注意这个修复是 2026-07-30 03:19（commit 9facfe9）才落地的，**机器人进程不重启就还在走代理**。
+
+### 3.13 UI 看门狗插件 `plugins/ui_watchdog/`
+wxautox 的 UI 操作带全局 `@uilock`，内部循环一卡死锁永不释放，同进程所有微信操作永久阻塞，
+Python 层杀不掉线程 —— 唯一出路是整进程重启。插件监控主循环心跳（停滞 300 秒判定卡死），
+触发计划任务 `SWXPanelRestart`，重启后 `web_server.py` 读自启动标记自动拉起机器人。
+- hook 3 处：`wxbot_core.py` 主循环 `heartbeat()` / 退出时 `disarm()`，`web_server.py` 启动时 `consume_autostart_flag()`。
+- **`schtasks` 必须用 `%SystemRoot%\System32\schtasks.exe` 绝对路径**：面板进程的 PATH 里可能没有
+  System32，裸名字 `Popen` 直接 FileNotFoundError —— 2026-07-30 03:20 它就是这么哑火的
+  （日志：`触发重启失败: schtasks not found`），看门狗白装了一晚。
+- 单测：`PYTHONPATH=. python3 tests/test_ui_watchdog.py`（16 个）。
+
+### 3.14 wxautox 参数 `SEARCH_CHAT_TIMEOUT`（`wxbot_core.py`）
+40.1.15 装出来的默认值是 **2 秒**（不是文档说的 5）。`ChatWith` 在会话列表里找不到目标就走
+搜索框，微信搜索结果常常 2 秒内还没渲染完，于是静默返回 `failure("未找到会话")`。
+我们改成 5 秒。**合并上游 / 升级 wxautox 后确认这行还在。**
 
 ---
 

@@ -30,5 +30,22 @@ def reply(chat, text: str):
         return None
 
 
+def notify_admin(bot, cfg, text: str) -> None:
+    """给管理群推一条带前缀的提醒（没配管理群或发送失败只记日志，不抛出）。
+
+    用于"用户侧已经回过话、但需要人接手"的场景（拉群失败、发现新群…），
+    避免用户在私聊里干等着问"管理员在哪啊"。"""
+    try:
+        admin = (cfg or {}).get("admin_group")
+    except Exception:
+        admin = None
+    if not admin:
+        return
+    try:
+        bot.wx.SendMsg(msg=f"{REPLY_PREFIX} {text}", who=admin)
+    except Exception as e:
+        log("ERROR", f"提醒管理群失败: {e}")
+
+
 def is_bot_reply(text: str) -> bool:
     return (text or "").strip().startswith(REPLY_PREFIX)

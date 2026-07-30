@@ -67,12 +67,26 @@ def _load_config():
     return cfg
 
 
+def _schtasks_exe():
+    """schtasks 的绝对路径。
+
+    2026-07-30 03:20 看门狗判定主循环卡死要重启，结果哑火在
+    `触发重启失败: schtasks not found`——面板/计划任务的进程环境里 PATH 可能没有
+    System32，裸名字 Popen 直接 FileNotFoundError。所以走 %SystemRoot% 绝对路径，
+    只在文件确实不存在时才退回裸名字（非 Windows 环境/单测）。"""
+    if sys.platform != 'win32':
+        return 'schtasks'
+    root = os.environ.get('SystemRoot') or r'C:\Windows'
+    exe = os.path.join(root, 'System32', 'schtasks.exe')
+    return exe if os.path.exists(exe) else 'schtasks'
+
+
 def _default_trigger(task_name):
     """触发计划任务整进程重启（restart_panel.bat 只杀 web_server 的 python）。"""
     kwargs = {}
     if sys.platform == 'win32':
         kwargs['creationflags'] = 0x08000000  # CREATE_NO_WINDOW
-    subprocess.Popen(['schtasks', '/run', '/tn', task_name], **kwargs)
+    subprocess.Popen([_schtasks_exe(), '/run', '/tn', task_name], **kwargs)
 
 
 def _default_notify(title, content):
