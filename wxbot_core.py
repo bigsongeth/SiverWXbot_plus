@@ -1066,7 +1066,15 @@ class MemoryManager:
             with open(path, 'r', encoding='utf-8') as f:
                 messages = json.load(f)
             if isinstance(messages, list):
-                return messages[-count:]
+                recent = messages[-count:]
+                # context_guard plugin hook：清掉系统时间戳条目/API 兜底文案/[NO_REPLY]，
+                # 只影响送给模型的副本，记忆文件本身不动。
+                try:
+                    from plugins.context_guard import filter_history
+                    recent = filter_history(recent)
+                except Exception as _cg_err:
+                    log(level="ERROR", message=f"context_guard history hook error: {_cg_err}")
+                return recent
         except Exception:
             pass
         return []
@@ -3438,6 +3446,16 @@ class WXBot:
                 return self.api_cache[idx]
         return self.api
 
+    def _guard_prompt(self, base_prompt):
+        """context_guard plugin hook：给人设补"今天几号 + 你没联网"的边界声明。
+        不加这段的话模型会拿训练时的年份当今天、并自认为能联网，进而编造新闻和模型版本号。"""
+        try:
+            from plugins.context_guard import augment_prompt
+            return augment_prompt(base_prompt)
+        except Exception as _cg_err:
+            log(level="ERROR", message=f"context_guard prompt hook error: {_cg_err}")
+            return base_prompt
+
     def _get_chat_prompt(self, user_name):
         """获取私聊用户对应的 prompt 内容（知识库开启时用 NCC 人设 > 白名单 chat_prompt_map > default_prompt）"""
         # ncc_kb plugin hook
@@ -3445,14 +3463,14 @@ class WXBot:
             from plugins.ncc_kb import kb_prompt_for
             _kb_p = kb_prompt_for(self, user_name, False)
             if _kb_p:
-                return _kb_p
+                return self._guard_prompt(_kb_p)
         except Exception as _kb_err:
             log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
         if not self.config.AllListen_switch:
             name = self.config.chat_prompt_map.get(user_name) or self.config.default_prompt
         else:
             name = self.config.default_prompt
-        return self.config.get_prompt_content(name)
+        return self._guard_prompt(self.config.get_prompt_content(name))
 
     def _get_group_prompt(self, group_name):
         """获取群组对应的 prompt 内容（知识库开启时用 NCC 人设 > group_prompt_map > default_prompt）"""
@@ -3461,11 +3479,11 @@ class WXBot:
             from plugins.ncc_kb import kb_prompt_for
             _kb_p = kb_prompt_for(self, group_name, True)
             if _kb_p:
-                return _kb_p
+                return self._guard_prompt(_kb_p)
         except Exception as _kb_err:
             log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
         name = self.config.group_prompt_map.get(group_name) or self.config.default_prompt
-        return self.config.get_prompt_content(name)
+        return self._guard_prompt(self.config.get_prompt_content(name))
 
     def _send_group_reply(self, chat, message, content, at_sender=False, quote=False):
         """发送群聊回复；引用失败时降级为普通发送，避免中断监听回调。"""

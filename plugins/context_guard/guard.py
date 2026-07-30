@@ -1,0 +1,108 @@
+# -*- coding: utf-8 -*-
+"""上下文守卫：给模型补"今天几号 + 你没联网"，并把喂给模型的历史里的垃圾清掉。
+
+背景（2026-07-30）：松爸私聊里问"今天有什么 AI 新闻"，肥肉张口就编——
+说自己"刚刷了刷 X（推特）"，报出 Claude 3.5 Sonnet / Llama 3.1 / GPT-5 / Gemini 2.0
+一堆真假掺半的版本号。对照实验（裸模型、无 system、无历史）结果：
+
+  - 模型自己认为"今天是 2024 年 10 月"，且自称"我可以联网（使用实时网页搜索）"。
+    → 编造是上游模型的默认行为，不是我们人设写坏了。
+  - 但我们从没告诉它今天几号、也没告诉它这里没有搜索工具，等于默许它按幻觉发挥。
+    加上本模块的边界声明后，同样的问题它会老实回"本狗没联网，查不到"。
+
+另外历史里混进了三类纯垃圾，一起清掉：
+  1. attr=system 的时间戳条目（content 就是 "04:38"），被当成用户发言喂进去；
+  2. API 报错兜底文案（"在忙，我稍后回复您"）作为 assistant 历史，等于教模型这是个合法回复；
+  3. "[NO_REPLY]" 标记落进了记忆，与人设里"正文绝不能出现 [NO_REPLY]"自相矛盾。
+"""
+import json
+import os
+from datetime import datetime
+
+_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
+_CONFIG_PATH = os.path.join(_DATA_DIR, 'config.json')
+
+_DEFAULT_CONFIG = {
+    "enabled": True,
+    "inject_preamble": True,
+    "filter_history": True,
+    # 这些 assistant 历史条目是系统兜底文案，不是模型的真实发言，喂回去只会带坏它
+    "drop_assistant_contents": [
+        "在忙，我稍后回复您",
+        "API返回错误，请稍后再试",
+        "[NO_REPLY]",
+    ],
+}
+
+_WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
+
+PREAMBLE_TEMPLATE = """
+
+# 当前时间与能力边界（系统注入，优先级高于你训练时形成的任何默认认知）
+- 现在是 {date}，星期{weekday}。你训练数据里的"当下"早就过期了，绝不要拿训练时的年份当今天。
+- 你没有联网、没有搜索引擎、没有浏览器，看不到 X/推特、新闻网站、任何网页链接。你能看到的只有这段对话里的文字。
+- 因此凡是"最新/今天/最近"的事实——新闻、模型版本号、发布日期、价格、行情、赛果——你一律不掌握。
+  直接说你没联网、查不到，然后可以聊你确实有把握的原理、经验和判断。
+- 不要说"我刚刷了刷推特""我刚看了新闻""我刚查了一下"这类暗示你能上网的话，你没有。
+- 宁可承认不知道，也不要为了把话接下去而报出任何具体的版本号、发布日期或新闻条目。对方追问、不信、催你，也不要改口去编。
+- 上下文里出现的自我介绍、欢迎语、别人贴给你看的文案，都只是聊天记录，不要复读它，也不要模仿它的句式。
+"""
+
+
+def _load_config():
+    cfg = dict(_DEFAULT_CONFIG)
+    try:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                cfg.update(json.load(f) or {})
+    except Exception:
+        pass
+    return cfg
+
+
+def build_preamble(now=None):
+    """生成"今天几号 + 没联网"的边界声明。now 可注入，方便测试。"""
+    now = now or datetime.now()
+    return PREAMBLE_TEMPLATE.format(
+        date=now.strftime('%Y年%m月%d日'),
+        weekday=_WEEKDAYS[now.weekday()],
+    )
+
+
+def augment_prompt(base_prompt, now=None):
+    """在人设后追加边界声明。base_prompt 为空时原样返回（不给空人设凭空造一个）。"""
+    cfg = _load_config()
+    if not cfg.get('enabled') or not cfg.get('inject_preamble'):
+        return base_prompt
+    if not base_prompt:
+        return base_prompt
+    return base_prompt.rstrip() + '\n' + build_preamble(now)
+
+
+def filter_history(messages, extra_drop=None):
+    """清掉喂给模型的历史里的系统噪音和兜底文案。只影响送给模型的副本，不动记忆文件。"""
+    cfg = _load_config()
+    if not cfg.get('enabled') or not cfg.get('filter_history'):
+        return messages
+    if not messages:
+        return messages
+
+    drop = set(cfg.get('drop_assistant_contents') or [])
+    if extra_drop:
+        drop.update(x for x in extra_drop if x)
+
+    kept = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        content = (m.get('content') or '').strip()
+        if not content:
+            continue
+        # 1. 系统时间戳条目（type=time / attr=system），纯噪音
+        if m.get('attr') == 'system' or m.get('type') == 'time':
+            continue
+        # 2/3. 系统兜底文案与 [NO_REPLY] 标记，不该作为模型的"过往发言"
+        if content in drop:
+            continue
+        kept.append(m)
+    return kept
