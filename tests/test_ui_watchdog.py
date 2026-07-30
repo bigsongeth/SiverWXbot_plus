@@ -24,7 +24,7 @@ class FakeClock:
 
 
 def make_watchdog(clock, tmp_files, **cfg_overrides):
-    """构造不起后台线程、trigger/notify 全 mock 的看门狗。"""
+    """构造不起后台线程、trigger/notify 全 mock 的看门狗（日志目录指向临时目录）。"""
     cfg = {
         'enabled': True,
         'stall_seconds': 300,
@@ -32,6 +32,7 @@ def make_watchdog(clock, tmp_files, **cfg_overrides):
         'restart_task_name': 'SWXPanelRestart',
         'max_restarts_per_hour': 3,
         'flag_valid_seconds': 600,
+        'wxauto_log_dir': tmp_files,
     }
     cfg.update(cfg_overrides)
     triggered = []
@@ -213,6 +214,154 @@ class UIWatchdogTest(unittest.TestCase):
         dog.heartbeat()
         clock.advance(301)
         self.assertFalse(dog.check_once())
+
+    # ---- 日志「消息解析失败」检测（2026-07-30 RDP 断连故障，心跳检测抓不到） ----
+
+    FAIL_LINE = ('2026-07-30 14:25:35 [wxautox4(40.1.15)] [DEBUG] [chatbox.py:743]  '
+                 '[True|56]消息解析失败（失败1次，连续失败1次）')
+    OK_LINE = ('2026-07-30 04:38:07 [wxautox4(40.1.15)] [DEBUG] [wx.py:385]  '
+               '[friend]获取到新消息：松爸 - 早')
+
+    def _append_log(self, dog, lines, newline_at_end=True):
+        """往看门狗当前监控的日志文件追加行。"""
+        path = dog._log_monitor._log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as f:
+            for i, line in enumerate(lines):
+                last = (i == len(lines) - 1)
+                f.write(line + ('' if last and not newline_at_end else '\n'))
+        return path
+
+    def test_log_parse_fail_triggers_restart(self):
+        clock = FakeClock()
+        dog, triggered, notified = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())  # 注册日志文件，尚无内容
+        self._append_log(dog, [self.FAIL_LINE] * 3)
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertTrue(dog.check_once())
+        self.assertEqual(triggered, ['SWXPanelRestart'])
+        self.assertTrue(os.path.exists(wd._FLAG_FILE))  # 重启后要自动拉起机器人
+        self.assertIn('消息解析连续失败 3 次', notified[0][1])
+
+    def test_log_success_line_resets_counter(self):
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        # 失败×2 → 成功一条 → 失败×2：期间有成功解析，不算 UIA 层坏死
+        self._append_log(dog, [self.FAIL_LINE] * 2 + [self.OK_LINE] + [self.FAIL_LINE] * 2)
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self.assertEqual(triggered, [])
+        # 再来一条失败凑满 3 条连续失败，应触发
+        self._append_log(dog, [self.FAIL_LINE])
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertTrue(dog.check_once())
+        self.assertEqual(triggered, ['SWXPanelRestart'])
+
+    def test_log_backlog_ignored_on_first_scan(self):
+        """进程启动前日志里的历史失败不算数（首次打开从文件末尾 tail）。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        self._append_log(dog, [self.FAIL_LINE] * 5)  # 启动前已有的失败日志
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self.assertEqual(triggered, [])
+
+    def test_log_window_expiry(self):
+        """失败超出窗口期（600 秒）后不再计入。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self._append_log(dog, [self.FAIL_LINE] * 2)
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        clock.advance(700)  # 前两条滑出窗口
+        dog.heartbeat()
+        self._append_log(dog, [self.FAIL_LINE])
+        self.assertFalse(dog.check_once())
+        self.assertEqual(triggered, [])
+
+    def test_log_fire_cooldown(self):
+        """触发后冷却期内不重复触发（重启生效前主循环还在产失败日志）。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self._append_log(dog, [self.FAIL_LINE] * 3)
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertTrue(dog.check_once())
+        # 冷却期内又攒了 3 条失败：不触发
+        self._append_log(dog, [self.FAIL_LINE] * 3)
+        clock.advance(60)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        # 冷却期过后仍在失败：再次触发
+        clock.advance(300)
+        dog.heartbeat()
+        self._append_log(dog, [self.FAIL_LINE] * 3)
+        self.assertTrue(dog.check_once())
+        self.assertEqual(triggered, ['SWXPanelRestart', 'SWXPanelRestart'])
+
+    def test_log_check_disabled(self):
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp, log_check_enabled=False)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self._append_log(dog, [self.FAIL_LINE] * 5)
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self.assertEqual(triggered, [])
+
+    def test_log_no_fire_when_not_armed(self):
+        """机器人没在跑（未武装）时不做日志检测。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        self._append_log(dog, [self.FAIL_LINE] * 5)
+        self.assertFalse(dog.check_once())
+        self.assertEqual(triggered, [])
+
+    def test_log_partial_line_not_counted(self):
+        """未写完的半行（无换行符）留到下次扫描，不提前计数。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())
+        self._append_log(dog, [self.FAIL_LINE] * 3, newline_at_end=False)
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertFalse(dog.check_once())  # 只有 2 条完整行
+        self._append_log(dog, [''])  # 补上换行，第 3 条完整了
+        clock.advance(30)
+        dog.heartbeat()
+        self.assertTrue(dog.check_once())
+        self.assertEqual(triggered, ['SWXPanelRestart'])
+
+    def test_log_day_rollover(self):
+        """跨天后自动切到新日志文件，从头读。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        old_path = dog._log_monitor._log_path()
+        self.assertFalse(dog.check_once())
+        clock.advance(86400 * 2)  # 无论时区，日期必然变了
+        dog.heartbeat()
+        new_path = dog._log_monitor._log_path()
+        self.assertNotEqual(old_path, new_path)
+        self._append_log(dog, [self.FAIL_LINE] * 3)
+        self.assertTrue(dog.check_once())
+        self.assertEqual(triggered, ['SWXPanelRestart'])
 
     # ---- schtasks 定位（2026-07-30 03:20 真实哑火：schtasks not found） ----
 

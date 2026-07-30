@@ -187,13 +187,21 @@ OpenAIAPI / DifyAPI / DusAPI 的请求全部走它。**合并上游后确认这�
 
 ### 3.13 UI 看门狗插件 `plugins/ui_watchdog/`
 wxautox 的 UI 操作带全局 `@uilock`，内部循环一卡死锁永不释放，同进程所有微信操作永久阻塞，
-Python 层杀不掉线程 —— 唯一出路是整进程重启。插件监控主循环心跳（停滞 300 秒判定卡死），
-触发计划任务 `SWXPanelRestart`，重启后 `web_server.py` 读自启动标记自动拉起机器人。
+Python 层杀不掉线程 —— 唯一出路是整进程重启。插件两种检测，都触发计划任务
+`SWXPanelRestart`，重启后 `web_server.py` 读自启动标记自动拉起机器人：
+1. **主循环心跳停滞**（300 秒判定卡死）——针对 @uilock 死锁类卡死。
+2. **wxauto 日志「消息解析失败」连续出现**（2026-07-30 加）——针对 RDP 会话断开/重连后微信
+   UIA 层异常：主循环活着、每 3 秒正常轮询（心跳正常，检测 1 抓不到），但每条真实消息的
+   发送者属性都解析失败（`chatbox.py:743`），消息被静默丢弃，表现为"卡住不回复"，
+   机器人线程重启无效。判定：窗口期（600 秒）内 ≥3 条「消息解析失败」且期间无成功解析的
+   `[friend]获取到新消息`/`[self]获取到新消息`（成功一条即清零）。增量 tail
+   `wxauto_logs/app_YYYYMMDD.log`，首次从文件末尾读起（历史日志不算）、跨天自动换文件、
+   触发后有 300 秒冷却防止重启生效前重复触发。跑在看门狗自己的后台线程里，无额外 hook。
 - hook 3 处：`wxbot_core.py` 主循环 `heartbeat()` / 退出时 `disarm()`，`web_server.py` 启动时 `consume_autostart_flag()`。
 - **`schtasks` 必须用 `%SystemRoot%\System32\schtasks.exe` 绝对路径**：面板进程的 PATH 里可能没有
   System32，裸名字 `Popen` 直接 FileNotFoundError —— 2026-07-30 03:20 它就是这么哑火的
   （日志：`触发重启失败: schtasks not found`），看门狗白装了一晚。
-- 单测：`PYTHONPATH=. python3 tests/test_ui_watchdog.py`（16 个）。
+- 单测：`PYTHONPATH=. python3 tests/test_ui_watchdog.py`（25 个）。
 
 ### 3.15 上下文守卫插件 `plugins/context_guard/`（2026-07-30 加）★ 治"模型一本正经胡编"
 起因：松爸私聊问"今天有什么 AI 新闻"，肥肉张口就编，还说自己"刚刷了刷 X（推特）"，
