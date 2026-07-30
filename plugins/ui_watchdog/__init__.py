@@ -138,6 +138,18 @@ class LogParseFailMonitor:
         self._fail_times = []  # 每条失败日志被观察到的时间（本进程时钟）
 
     def _log_path(self):
+        """优先跟踪目录里最新修改的 app_*.log。
+
+        wxautox 的日志文件名取自进程启动日，跨天后仍写旧文件名（实测 2026-07-31
+        00:08 还在写 app_20260730.log）——按当天日期拼文件名会在午夜后盯错文件，
+        检测变瞎。目录里还没有任何日志时才退回按当天日期拼。"""
+        try:
+            candidates = [os.path.join(self.log_dir, n) for n in os.listdir(self.log_dir)
+                          if n.startswith('app_') and n.endswith('.log')]
+            if candidates:
+                return max(candidates, key=os.path.getmtime)
+        except OSError:
+            pass
         day = time.strftime('%Y%m%d', time.localtime(self._now()))
         return os.path.join(self.log_dir, f'app_{day}.log')
 

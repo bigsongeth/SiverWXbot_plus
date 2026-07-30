@@ -348,6 +348,21 @@ class UIWatchdogTest(unittest.TestCase):
         self.assertTrue(dog.check_once())
         self.assertEqual(triggered, ['SWXPanelRestart'])
 
+    def test_log_follows_newest_file_across_midnight(self):
+        """wxautox 日志文件名取自进程启动日，跨天后仍写旧文件；监控按 mtime 跟最新文件。"""
+        clock = FakeClock()
+        dog, triggered, _ = make_watchdog(clock, self._tmp)
+        dog.heartbeat()
+        path = self._append_log(dog, [self.OK_LINE])  # "昨天"的文件已存在
+        self.assertFalse(dog.check_once())            # 注册并跳到文件末尾
+        clock.advance(86400 * 2)                      # 日期已变，wxautox 仍写同一个文件
+        dog.heartbeat()
+        with open(path, 'a', encoding='utf-8') as f:
+            for _ in range(3):
+                f.write(self.FAIL_LINE + '\n')
+        self.assertTrue(dog.check_once())
+        self.assertEqual(triggered, ['SWXPanelRestart'])
+
     def test_log_day_rollover(self):
         """跨天后自动切到新日志文件，从头读。"""
         clock = FakeClock()
