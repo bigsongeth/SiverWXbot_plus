@@ -244,14 +244,47 @@ def _click(ctrl, hwnd, label=""):
     return True
 
 
-def _close_all_editors():
+def _list_editors():
+    """当前所有笔记编辑器窗口（Chrome_WidgetWin_0）的 hwnd 集合。"""
+    out = set()
     for w in list(auto.GetRootControl().GetChildren()):
         try:
             if w.ClassName == "Chrome_WidgetWin_0":
-                win32gui.PostMessage(w.NativeWindowHandle, win32con.WM_CLOSE, 0, 0)
+                out.add(w.NativeWindowHandle)
+        except Exception:
+            pass
+    return out
+
+
+def _close_all_editors():
+    """关掉遗留的笔记编辑器窗口，并确认真的关干净了。返回 (ok, msg)。
+
+    2026-08-01 教训（日报断供 7-31 ~ 8-1 两天）：原来这里只 PostMessage(WM_CLOSE) 就走人，
+    从不校验。一旦有窗口关不掉（未保存确认框之类），后面 _top("Chrome_WidgetWin_0","笔记")
+    会抓到这个关不掉的旧窗口当成"新建的笔记"，往一个不可编辑的窗口里粘 —— 粘贴校验必然
+    读回哨兵串，失败后又留下一个窗口，**下次接着抓到它，自锁**。表现就是连续 5 次
+    "内容没粘进笔记编辑器（试了 3 次）"，而环境本身完全正常（同期独立进程里怎么测都通）。
+    现在关不干净就直接中止，不在脏状态上硬着头皮往下走。"""
+    for hwnd in _list_editors():
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
         except Exception:
             pass
     time.sleep(2.0)
+    left = _list_editors()
+    if left:
+        log(f"still {len(left)} 个编辑器窗口没关掉，再关一次：{sorted(left)}")
+        for hwnd in left:
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            except Exception:
+                pass
+        time.sleep(2.5)
+        left = _list_editors()
+    if left:
+        return False, (f"有 {len(left)} 个笔记编辑器窗口关不掉（多半弹了未保存确认框），"
+                       f"再往下走会粘进旧窗口，已中止。去桌面上手动关掉它们")
+    return True, ""
 
 
 def _desktop_usable():
@@ -323,12 +356,28 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
     cell = _find_in(wx, _is_new_note)
     if not cell:
         return False, "新建笔记入口未找到"
+    # 点之前先记下已有的编辑器窗口。点完只认「新冒出来的」那个 —— 只按 class+name 找的话，
+    # 会把上一次失败留下的旧窗口当成新笔记（2026-08-01 自锁事故，见 _close_all_editors 注释）。
+    before = _list_editors()
     if not _click(cell, hwnd, "新建笔记"):
         return False, "新建笔记入口被别的窗口挡住，点不到"
-    time.sleep(3.0)
 
-    note = _top("Chrome_WidgetWin_0", "笔记")
+    note = None
+    for _ in range(16):          # 最多等 8 秒，编辑器冷启动有时候慢
+        time.sleep(0.5)
+        for wd in list(auto.GetRootControl().GetChildren()):
+            try:
+                if (wd.ClassName == "Chrome_WidgetWin_0" and (wd.Name or "") == "笔记"
+                        and wd.NativeWindowHandle not in before):
+                    note = wd
+                    break
+            except Exception:
+                pass
+        if note:
+            break
     if not note:
+        if _list_editors() & before:
+            return False, "笔记编辑器没新开出来（只剩点击前就存在的旧窗口），已中止"
         return False, "笔记编辑器未打开"
     r = note.BoundingRectangle
     nh = note.NativeWindowHandle
@@ -343,7 +392,19 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
     # 粘贴 + 硬校验：点完正文，编辑器（Chromium）拿到输入焦点要时间，
     # 早年写死 sleep 0.6s，机器一慢焦点还没到，Ctrl+V 落空 -> 存出空笔记，
     # 后面还会误发历史笔记。所以粘完必须 Ctrl+A/Ctrl+C 读回来比对，不通过就重来。
-    cx, cy = (r.left + r.right) // 2, r.top + 130
+    #
+    # 落点：按正文 DocumentControl 的实时 rect 取中心，别再用「窗口顶部 + 固定像素」。
+    # 2026-08-01 实测（编辑器 701x641）：正文顶部往下 60px 处点不进去（那是标题行，
+    # 不可编辑，Ctrl+V 落空），89px 开始才行 —— 而老代码的 r.top+130 正好落在 89px，
+    # 离失效边界只剩 29px。窗口被拖动或微信记住新尺寸就会翻车，跟屏幕分辨率是否固定无关。
+    doc = _find_in(note, lambda c: c.ControlTypeName == "DocumentControl")
+    if doc:
+        db = doc.BoundingRectangle
+        cx, cy = (db.left + db.right) // 2, (db.top + db.bottom) // 2
+        log(f"笔记编辑器 hwnd={nh} rect={r} 正文={db} 落点=({cx},{cy})")
+    else:
+        cx, cy = (r.left + r.right) // 2, r.top + 130
+        log(f"笔记编辑器 hwnd={nh} rect={r} 找不到正文控件，回落老坐标 ({cx},{cy})")
     ok_paste = False
     for attempt in range(1, 4):
         _clip_html(cf_bytes, plain)
@@ -571,7 +632,9 @@ def send_daily_note(bot=None, force=False, source="scheduled"):
             return done(f"❌ 发送失败（环境）：{why}")
 
         _close_update_windows()   # 发送前清掉微信更新弹窗，防止挡住流程
-        _close_all_editors()
+        ok, why = _close_all_editors()
+        if not ok:
+            return done(f"❌ 发送失败（环境）：{why}")
         ok, msg = _create_note_from_clipboard(cf_bytes, title, title_kw)
         if not ok:
             return done(f"❌ 发送失败（建笔记）：{msg}")
