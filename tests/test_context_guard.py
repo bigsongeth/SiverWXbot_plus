@@ -18,10 +18,16 @@ class TestPreamble(unittest.TestCase):
         self.assertIn('2026年07月30日', p)
         self.assertIn('星期四', p)
 
-    def test_声明没有联网能力(self):
+    def test_要求真搜到才说而不是断言没有联网(self):
+        """2026-08-03 改：原来写死"你没有联网"，把 grok 这类真有搜索能力的模型也摁死了
+        （松爸问推特被答"我没法联网"，其实 grok 搜得到）。现在改成能力无关的说法，
+        对有搜索和没搜索的模型都成立，机器人侧不必猜最终用的是哪个模型。"""
         p = build_preamble(datetime(2026, 7, 30))
-        self.assertIn('没有联网', p)
-        self.assertIn('推特', p)
+        self.assertNotIn('你没有联网', p)      # 不再断言模型没有这个能力
+        self.assertIn('先用搜索工具查一遍', p)  # 有工具就得真搜（祈使句，别写成"如果配了工具"的条件句，
+                                              # 条件句会让 grok 自认为没工具，绕过搜索直接编）
+        self.assertIn('查不到', p)             # 没工具/没搜到就得承认
+        self.assertIn('推特', p)               # "没真搜就别说刚刷了推特"这条要留着
 
     def test_禁止复读上下文文案(self):
         self.assertIn('不要复读', build_preamble(datetime(2026, 7, 30)))
