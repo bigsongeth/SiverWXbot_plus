@@ -139,18 +139,79 @@ if handled and checkin_reply:
 - 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（27 个，纯 mock 不碰微信）。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
-知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），355 篇公众号文章 2175 块，端点 `http://100.71.182.5:8434`（Tailscale，OpenAI 兼容）。
-**话题闸门**（2026-07-05 加）：rag_proxy 用向量检索最高分判定是否 NCC 话题——达标（默认 `KB_SCORE_THRESHOLD=0.38`）才挂知识库+facts；非 NCC 提问（写代码/闲聊/时事）跳过检索，纯人设正常问答，也更快。实测分布 NCC 0.43~0.52 / 通用 0.20~0.35，日志里有每次 `[gate]` 决策。改阈值后 `launchctl kickstart -k gui/501/com.ncc.ragproxy`。
-固定事实（据点/主理人/联系方式）在 `mac-mini:~/ncc-kb/facts.md`，命中 NCC 话题时随上下文注入，改完即时生效（2026-07-05 已填真实内容：大理/黄山黟县黑多岛/三亚崖州三据点、主理人大曹 ShariCao、小助手 nccxiaozhushou 等，含时效声明）。
-补语料：md 丢进 corpus/ 跑 `venv/bin/python ncc_ingest.py`。健康检查 `curl http://100.71.182.5:8434/health`（含当前阈值）。
+知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），469 篇公众号文章 2175 块，
+语料覆盖 2023-04 ~ 2026-05，端点 `http://100.71.182.5:8434`（Tailscale，OpenAI 兼容）。
+改完 `launchctl kickstart -k gui/501/com.ncc.ragproxy`，健康检查 `curl http://100.71.182.5:8434/health`。
+补语料：md 丢进 corpus/ 跑 `venv/bin/python ncc_ingest.py`。
+
+**话题闸门**：判定这次提问要不要挂知识库。非 NCC 提问（写代码/闲聊/时事）跳过检索，
+纯人设正常问答，也更快。日志里每次都有 `[gate]` 决策行。
+
+- **纯阈值闸门是错的，别退回去（2026-08-03 血泪）**：原设计只看向量最高分 ≥ `KB_SCORE_THRESHOLD`(0.38)。
+  当初取样用的是长句问题，真实群聊全是短句，而**短 query 与长 chunk 的余弦相似度天然偏低**，
+  两类分布重叠到没法用单一阈值切开——实测「主理人是谁」0.277、「崖州那边环境如何」0.203，
+  比「怎么减肥」0.348、「写一封辞职信」0.382 还低。后果是最该答对的核心事实问题
+  （据点/主理人/怎么加入）**全被挡在知识库外面**，模型转头拿幻觉硬答，
+  实测会反问"NCC 是指哪个组织"。知识库看着健康（/health 全绿、points 正常），实则半瘫了 4 周。
+- **现在是两路触发**：① `kb_keywords.txt` 关键词命中（高精度）→ 无条件走 KB，不看分数；
+  ② 否则向量分 ≥ 0.32（下调过）兜底（高召回）。误召代价只是多注入一段上下文
+  （人设已交代"无关就忽略"），漏召代价是编造据点和微信号——**非对称，一律偏向宽松**。
+- `kb_keywords.txt` 每次请求重读，加词保存即生效，不用改代码不用重启。**关掉的据点也要留在词表里**
+  （昆山/崖州），否则"三亚还能去吗"会走通用问答，读不到 facts 里"已结束"那条。
+- 回归脚本思路：直接 import `ncc_rag_proxy` 调 `retrieve()`，只验闸门判定不调 LLM；
+  验通用问题时把 `P.rerank` 短路掉（`lambda q,d: list(range(len(d)))`），否则每条都要打一次
+  OpenRouter，30 条能跑超 2 分钟。
+
+**固定事实清单** `mac-mini:~/ncc-kb/facts.md`，命中 NCC 话题时随上下文注入，改完即时生效。
+- **facts 必须显式写"已结束"，光删不够（2026-08-03）**：三亚崖州 2026 年前已停止运营，
+  但知识库里有 100+ 篇三亚文章（《三亚NCC内测招募》《登岛指南》这种召集帖）。
+  把三亚从 facts 里删掉后，检索片段的份量会盖过沉默，肥肉照样热情招呼人去一个关掉的据点。
+  现在 facts 有专门的「❌ 已结束」小节，`RAG_SYS` 里也写明**固定事实清单优先级高于检索片段**、
+  冲突一律以清单为准。**以后关闭任何据点都照这个来。**
+- 据点现状（2026-08-03 大松确认）：自营共居=大理、黄山黟县黑多岛；自营共同办公=上海虹桥
+  （偏 co-working，不是共居，答"能不能住"要说清）；已结束=三亚崖州、昆山；
+  合作站点（普吉岛/西安/中山/千岛湖等）非自营，走**游牧岛小程序**订住宿，
+  具体清单以小程序实时列表为准，别凭文章罗列。待补：大曹那边的小程序打通内容。
+- **rag_proxy 和 facts.md 不在本版本库里**（真相源在 mac-mini），改之前先
+  `cp xxx xxx.bak-<日期>`。值得考虑哪天把 ncc-kb 也纳入版本控制。
+
+**问答日志与复盘**（2026-08-03 加）：知识库要持续优化，燃料就是真实问题，
+但 `ragproxy.log` 只有 `[gate]` 分数、没有问题原文，光看它什么也复盘不了。
+- 现在每次请求落一行 JSON 到 `mac-mini:~/ncc-kb/logs/qa-YYYYMMDD.jsonl`：
+  问题原文 / 是否挂了知识库 / 触发方式（关键词·相似度·未命中）/ 命中的词 / top 分 /
+  引用了哪几篇文章 / 回答全文 / 耗时。流式与非流式都记（流式在 `gen()` 里累积 delta）。
+  写盘失败一律吞掉，绝不拖垮问答链路。`QA_LOG=0` 可整个关掉。
+- 复盘：`cd ~/ncc-kb && python3 qa_review.py`（可加 `--days 7` 或某天 `20260803`）。
+  四个视角对应四种动作：**未命中的问题**→加关键词或补语料；**擦边球**（分数临界）→
+  阈值对不对看这里；**高频问题**→值得写进 facts.md 当固定事实；**引用分布**→
+  哪些语料在扛事、哪些从没被用过。
+- 闸门回归脚本也放在 `~/ncc-kb/`：`regress.py`（NCC 问题，会真调 rerank，慢）、
+  `regress2.py`（通用问题，短路 rerank）。改闸门后必跑。
+- 微信侧另有一份聊天流水存档：`memory/<wxid>/<会话>/<会话>_memory.json`，
+  **每会话上限 `memory_max_count`=3000 条，超了丢最旧的**。2026-08-03 实测 55 个会话
+  共 2448 条、最大会话 1202 条，离上限还远没丢过数据。但它是流水不是问答对，
+  也不知道哪条走了知识库——提取 Q&A 用上面的 qa jsonl，别用它。
+
+**延迟**（2026-08-03 实测，问「黑多岛现在还能去吗」）：合计 21s = LLM(gpt-5.5) 13.2s
++ rerank 5.9s + embed 1.9s + qdrant 检索 0.01s，注入上下文 8703 字符。
+群聊里等 20 秒体验是有问题的。想提速优先动 rerank（OpenRouter 免费模型，占 6s，
+去掉或换本地重排最省事）和 LLM 选型，检索本身不是瓶颈。
 
 ### 3.9 知识库开关插件 `plugins/ncc_kb/`（2026-07-06 加）★ 让群聊/私聊可选接入知识库
 不再靠 `config.json` 的 api_configs 索引挂知识库（面板保存 api_configs 会把它冲掉，踩过），改由本插件独占 KB 路由，自带端点，抗面板改动。
 - **原理**：`wxbot_core.py` 四个 getter（`_get_group_api`/`_get_chat_api`/`_get_group_prompt`/`_get_chat_prompt`）各加一段最小 hook，先问插件"这会话开知识库了吗"——开了返回 KB 接口实例 + `NCC肥肉` 人设；没开走上游原逻辑。复用上游整条 AI 链路（历史/分段/图片），只换"用哪个接口+人设"。合并上游后确认这 4 处 hook 还在。
 - **开=走 KB 端点+NCC肥肉人设；关=回落到该会话原本的 group_api_map/默认接口**（所以测试群已从 group_api_map 移除，靠插件路由；否则"关"会因残留 index 仍连 KB）。
-- 配置 `plugins/ncc_kb/data/config.json`（endpoint / prompt_name / enabled_groups / enabled_chats），面板 `/ncc_kb` 页可视化增删，改动下一条消息即生效，无需重启。**别提交该文件的运行时变更**。
-- **面板**：独立模板 `templates/ncc_kb.html` + `web_server.py` 三个新路由（`/ncc_kb`、`/ncc_kb/config`、`/ncc_kb/save`）+ dashboard.html 侧栏一行链接（都是新增，冲突面极小）。
-- 单测：`python -m unittest tests.test_ncc_kb`（9 个，纯 mock）。私聊在全局模式也能开（补齐上游 chat_api_map 只在白名单模式生效的空缺）。
+- 配置 `plugins/ncc_kb/data/config.json`（endpoint / prompt_name / enabled_groups / enabled_chats
+  / excluded_groups / excluded_chats），面板 `/ncc_kb` 页可视化增删，**改配置**下一条消息即生效，
+  无需重启；**改插件代码**（`__init__.py`/`store.py`）要整进程重启才加载。
+  **别提交该文件的运行时变更**。
+- **通配 `*`**（2026-08-03 加）：`enabled_chats` 写 `"*"` = 所有私聊全开（私聊一直在新增，
+  逐个列名字维护不动）；`excluded_*` 是排除名单，**优先级高于通配**，
+  这样"全开但某几个不要"不用退回逐个列举。当前：群=两个测试群，私聊=`*`（排除文件传输助手）。
+- ⚠️ **开 KB 会连人设一起换成 `NCC肥肉`**。私聊原本走 `default_prompt`=`AI极客`，
+  私聊全开后所有私聊人设都变成肥肉。不想要就把该私聊加进 `excluded_chats`。
+- **面板**：独立模板 `templates/ncc_kb.html` + `web_server.py` 三个新路由（`/ncc_kb`、`/ncc_kb/config`、`/ncc_kb/save`）+ dashboard.html 侧栏一行链接（都是新增，冲突面极小）。面板保存是"读全量 cfg 再改写"，不会抹掉它不认识的 `excluded_*`。
+- 单测：`PYTHONPATH=. python3 tests/test_ncc_kb.py`（12 个，纯 mock）。私聊在全局模式也能开（补齐上游 chat_api_map 只在白名单模式生效的空缺）。
 
 ### 3.10 回复清洗与接话闸门（2026-07-08 加，改在 `wxbot_core.py`）
 两个小机制，合并上游后确认还在：

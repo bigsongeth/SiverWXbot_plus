@@ -23,10 +23,24 @@ def _norm(s) -> str:
     return str(s or "").strip()
 
 
+WILDCARD = "*"
+
+
 def kb_enabled(who, is_group) -> bool:
+    """该会话是否开了知识库。
+
+    名单里写 "*" 表示该类会话（群/私聊）全开——私聊数量多且一直在新增，
+    逐个列名字维护不动。全开时仍受 excluded_groups/excluded_chats 排除名单约束，
+    排除优先级高于通配（这样"全开但某几个不要"不用退回逐个列举）。
+    """
     cfg = store.load()
+    who_n = _norm(who)
+    ex_key = "excluded_groups" if is_group else "excluded_chats"
+    if who_n in {_norm(x) for x in cfg.get(ex_key, []) or []}:
+        return False
     key = "enabled_groups" if is_group else "enabled_chats"
-    return _norm(who) in {_norm(x) for x in cfg.get(key, [])}
+    items = {_norm(x) for x in cfg.get(key, []) or []}
+    return WILDCARD in items or who_n in items
 
 
 def _build_api(endpoint):

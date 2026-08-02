@@ -22,10 +22,13 @@ DEFAULT_CONFIG = {
     },
     # 接入知识库时套用的人设 prompt 名（面板里已有的 prompt）。留空则不改人设。
     "prompt_name": "NCC肥肉",
-    # 接入知识库的群聊名列表
+    # 接入知识库的群聊名列表。写 "*" 表示所有群全开。
     "enabled_groups": ["肥肉测试1", "爱和一切肥肉测试群"],
-    # 接入知识库的私聊对象名（who）列表
+    # 接入知识库的私聊对象名（who）列表。写 "*" 表示所有私聊全开。
     "enabled_chats": [],
+    # 排除名单：即使上面写了 "*" 也不接知识库。排除优先于通配。
+    "excluded_groups": [],
+    "excluded_chats": [],
 }
 
 _cache = None

@@ -81,6 +81,34 @@ class NccKbTestCase(unittest.TestCase):
         ncc_kb.toggle("张三", False, False)
         self.assertIsNone(ncc_kb.kb_api_for(self.bot, "张三", False))
 
+    def test_wildcard_enables_all_private_chats(self):
+        """enabled_chats 写 "*" 时任意私聊都算开启（私聊一直在新增，逐个列名字维护不动）。"""
+        cfg = ncc_kb.get_config()
+        cfg["enabled_chats"] = ["*"]
+        ncc_kb.save_config(cfg)
+        for who in ("松爸", "从没见过的新朋友", "Zz.酱🐳"):
+            self.assertTrue(ncc_kb.kb_enabled(who, False), who)
+        # 通配符按会话类型隔离：私聊全开不影响群聊
+        self.assertFalse(ncc_kb.kb_enabled("某个没开的群", True))
+
+    def test_excluded_beats_wildcard(self):
+        """排除名单优先于通配，这样"全开但某几个不要"不用退回逐个列举。"""
+        cfg = ncc_kb.get_config()
+        cfg["enabled_chats"] = ["*"]
+        cfg["excluded_chats"] = ["文件传输助手"]
+        ncc_kb.save_config(cfg)
+        self.assertFalse(ncc_kb.kb_enabled("文件传输助手", False))
+        self.assertIsNone(ncc_kb.kb_api_for(self.bot, "文件传输助手", False))
+        self.assertTrue(ncc_kb.kb_enabled("别人", False))
+
+    def test_excluded_beats_explicit_name(self):
+        """显式列名的会话也能被排除名单否掉。"""
+        cfg = ncc_kb.get_config()
+        cfg["enabled_groups"] = ["肥肉测试1"]
+        cfg["excluded_groups"] = ["肥肉测试1"]
+        ncc_kb.save_config(cfg)
+        self.assertFalse(ncc_kb.kb_enabled("肥肉测试1", True))
+
     def test_prompt_override_when_enabled(self):
         self.assertEqual(ncc_kb.kb_prompt_for(self.bot, "肥肉测试1", True), "你是肥肉，NCC助手。")
         self.assertIsNone(ncc_kb.kb_prompt_for(self.bot, "没开的群", True))
