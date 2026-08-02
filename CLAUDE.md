@@ -21,7 +21,7 @@ C:\Users\Admin\SiverWXbot_plus-main
 
 - 上游：`https://github.com/SiverKing/SiverWXbot_plus.git`（remote 名 `upstream`）
 - 我们的 fork：`https://github.com/bigsongeth/SiverWXbot_plus.git`（remote 名 `origin`）
-- 长期自用分支：`custom/webhook-integration-20260506`（当前工作分支）
+- 工作分支：**`main`**（2026-08-03 起统一到主干，生产工作树也检出在这个分支）
 
 ---
 
@@ -399,14 +399,21 @@ hook 3 处，合并上游后逐个确认：
 之前的状态是"代码在生产机上跑着，版本库里没有"——`plugins/ai_news_note/` 整个插件写了三周半没进库，
 `wxbot_core.py` 的代理修复也一直躺在工作区。这一节是为了别再发生。
 
-### 5.1 三条分支
+### 5.1 分支：2026-08-03 起统一到主干
 | 分支 | 角色 |
 |------|------|
-| `origin/main` | **我们的定制主线**，日常提交推这里 |
-| `custom/webhook-integration-20260506` | 历史遗留的长期分支名，与 main 同步 |
+| `main` | **唯一的开发分支**，生产工作树（`C:\Users\Admin\SiverWXbot_plus-main` / mac 侧 `/Volumes/SiverWXbot_plus-main`）就检出在这里，日常提交推 `origin/main` |
 | `upstream/main` | 上游只读，通过 merge 进来 |
 
+**别再切回 `custom/webhook-integration-20260506`**——它是历史遗留名，已于 2026-08-03 合进 main 后停用。
+之前"生产跑 custom、提交推 main"的两头状态制造过一次分叉：custom 上的 ncc_kb 私聊通配和
+rag_proxy 分流两个功能只在本地、既没进 main 也没推 GitHub，差点在切分支时被漏掉。
+
 `master` / `feat/webhook-notifications` / `update-upstream-b59692f` 是早期僵尸分支，别在上面干活。
+`claude/*` 是各次会话的 worktree 分支，合进 main 后即可忽略。
+
+**多会话同时干活时**：生产工作树是共享的，切分支/合并前先 `git status` 确认干净，
+看到不是自己的未提交改动就停下来问，别 stash 也别覆盖——那多半是另一个会话正在写。
 
 ### 5.2 行尾：不要手动折腾
 `.gitattributes` 已声明 `* text=auto`（仓库统一存 LF）+ `*.bat/*.cmd/*.ps1 eol=crlf`。
