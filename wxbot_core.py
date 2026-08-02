@@ -396,6 +396,8 @@ class WXBotConfig:
                         {"sdk": "", "key": "", "url": "", "model": ""},
                     ],
                     "api_index": 0,
+                    "fallback_switch": False,   # 接口失败自动换下一个模型（plugins/model_fallback）
+                    "fallback_chain": [],       # 备用接口索引，有序，从前往后试
                     "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",
                     "admin": "文件传输助手",
                     "AllListen_switch": False,
@@ -2272,7 +2274,23 @@ class WXBot:
         else:
             return OpenAIAPI(tmp)
 
+    def _with_fallback(self, api, session_name=""):
+        """model_fallback plugin hook：给接口实例套一层故障转移（业务逻辑见 plugins/model_fallback/）。
+
+        接口挂了（500/403/529/超时）时自动换 fallback_chain 上的下一个模型重答同一个问题，
+        而不是直接回"在忙，我稍后回复您"。开关没开时原样返回，等于没装这个插件。"""
+        try:
+            from plugins.model_fallback import wrap
+            return wrap(self, api, session_name)
+        except Exception as _fb_err:
+            log(level="ERROR", message=f"model_fallback api hook error: {_fb_err}")
+            return api
+
     def _get_group_api(self, group_name):
+        """群聊 AI 接口入口：按原逻辑选出接口后，套一层故障转移。"""
+        return self._with_fallback(self._resolve_group_api(group_name), group_name)
+
+    def _resolve_group_api(self, group_name):
         """
         获取群聊对应的 AI 接口实例。
         - 若该群开启了知识库（ncc_kb 插件），返回知识库接口
@@ -3429,6 +3447,10 @@ class WXBot:
         return result
 
     def _get_chat_api(self, user_name):
+        """私聊 AI 接口入口：按原逻辑选出接口后，套一层故障转移（见 _with_fallback）。"""
+        return self._with_fallback(self._resolve_chat_api(user_name), user_name)
+
+    def _resolve_chat_api(self, user_name):
         """获取私聊用户对应的 AI 接口实例（知识库开关优先 > 白名单 chat_api_map > 默认接口）"""
         # ncc_kb plugin hook: 私聊知识库开关（在全局模式下也生效，补齐上游的空缺）
         try:

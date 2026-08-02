@@ -614,6 +614,8 @@ def dashboard():
         {"sdk": "", "key": "", "url": "", "model": ""},
     ])
     config.setdefault('api_index', 0)
+    config.setdefault('fallback_switch', False)              # 接口失败自动切备用模型总开关
+    config.setdefault('fallback_chain', [])                  # 备用接口索引（有序，从前往后试）
 
     # —— 新增字段默认值（关键）——
     config.setdefault('group_api_map', {})                   # 群组专属接口映射
@@ -797,6 +799,7 @@ def _coerce_bool_fields(merged_config):
         'group_split_reply_switch',         # 群聊拆分多条回复开关
         'siver_panel_enabled',
         'api_error_reply_once',             # API错误只回复一次
+        'fallback_switch',                  # 接口失败自动切备用模型开关
         'chat_max_round_switch',            # 单用户最大回复轮数限制开关
         'chat_max_round_reply_once',        # 超限后只回复一次
     ]
@@ -2001,6 +2004,8 @@ def main():
                     {"sdk": "", "key": "", "url": "", "model": ""},
                 ],
                 "api_index": 0,
+                "fallback_switch": False,   # 接口失败自动换下一个模型（plugins/model_fallback）
+                "fallback_chain": [],       # 备用接口索引，有序，从前往后试
                 "prompt": "你是一个ai回复助手，请根据用户的问题给出回答,回复尽量保持在30字以内",
                 "admin": "文件传输助手",
                 "AllListen_switch": False,

@@ -259,6 +259,32 @@ hook 3 处，合并上游后逐个确认：
 搜索框，微信搜索结果常常 2 秒内还没渲染完，于是静默返回 `failure("未找到会话")`。
 我们改成 5 秒。**合并上游 / 升级 wxautox 后确认这行还在。**
 
+### 3.16 模型故障转移插件 `plugins/model_fallback/`（2026-08-03 加）★ 一个模型挂了自动换下一个
+面板原来只能"选一个接口用"，挂了就直接回"在忙，我稍后回复您"。本插件让接口失败时
+自动沿备用链换模型、拿同样的上下文重答同一个问题，用户不用重发。
+
+- **原理**：`FallbackAPI` 包装器，对外暴露与四个 API 类一致的 `.chat()` 签名，内部按顺序试。
+  历史/人设/分段/图片/接话闸门全走上游原链路，只换"这次用哪个接口"。
+- **hook 2 处**，在 `wxbot_core.py` 的 `_get_group_api` / `_get_chat_api`：原逻辑（含 ncc_kb hook）
+  整体挪进 `_resolve_group_api` / `_resolve_chat_api`，入口函数只剩一行 `_with_fallback(...)`。
+  这么拆是为了让上游改接口选择逻辑时，冲突落在函数体内部、diff 上下文一致，merge 能自动过。
+  **合并上游后确认这两个入口和 `_with_fallback` 还在。**
+- **失败判定**：底层四个 API 类把异常吞成固定串 `"API返回错误，请稍后再试"`（7 个 return 点），
+  **状态码根本没往上传**，所以第一版不分 500/403/529，凡失败就切下一个。代价是 403（key 废了）
+  也会白试一次备用。要精确分流就得改那 7 个 return 点，冲突面变大，暂不值当。
+  判定失败 = 抛异常 / 返回那个固定串 / 返回空白。全链失败时**交回同一个固定串**，
+  上层照旧走 `api_error_reply`，行为与没装插件时完全一致。
+- **配置在 `config/config.json`**（不是插件自带文件）：`fallback_switch` + `fallback_chain`
+  （api_configs 的索引数组，有序）。面板就在原来的「API 接口配置」卡片里勾「备用」，
+  索引由前端与 `api_configs` **同一次遍历**生成，增删接口不会错位。
+  **和改 api_configs 一样，改完要重启机器人线程才生效。**
+- 顺带处理了两个坑：备用接口签名不兼容时按 `inspect.signature` 裁掉多余 kwarg
+  （Dify/Coze 的 `chat()` 没有 `image_path`，原样透传会 TypeError 白费一个备用）；
+  按 `(base_url, 模型, key 前 8 位)` 去重，避免链上和当前会话用的是同一个接口时重复试。
+- 单测：`PYTHONPATH=. python3 tests/test_model_fallback.py`（26 个，纯 mock 不发请求）。
+  `chain.py` 刻意不 import `wxbot_core`（会连带拉起 wxautox），所以 mac 上能裸跑。
+- 设计与决策记录：`plugins/model_fallback/SPEC.md`。
+
 ---
 
 ## 4. 同步上游的标准流程
