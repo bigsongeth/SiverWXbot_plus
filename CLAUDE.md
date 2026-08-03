@@ -136,7 +136,28 @@ if handled and checkin_reply:
 - **wxautox4 40.1.15 实测 `msg.forward()` 成功时返回 None**（与文档 WxResponse 不符），`forward.py` 里已按此处理，升级 wxautox 后留意这行为。
 - **`ChatWith` 找不到会话是【静默失败】**：返回 falsy WxResponse、不抛异常，窗口留在原处。不接返回值就继续操作 = 在上一个窗口上干活。2026-07-29/30 拉群连挂两次就是这样：切群失败后照样调 `AddGroupMembers`，在残留的私聊窗口上点"添加成员"，报出误导人的"未选择任何新增成员"（万一选中了人还会**新建一个群**）。现在 `invite.py` / `remark.py` / `batch.py` / `forward.py` 一律"接返回值 + `ChatInfo()` 复核当前窗口"两道都过才动手，`forward._switched()` 是统一入口。**新写任何 ChatWith 调用都照这个来。**
 - 拉群还有：备注名搜不到会回退用群名重试、切群重试 3 次（微信搜索结果常常不是第一时间出来）、失败按"群没找到/人没选到"分流文案、失败退配额（最多退 3 次）、当天首次失败给管理群推提醒。
-- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（27 个，纯 mock 不碰微信）。
+- ★ **群名是寻址主键，Notion 标题里一个空格就能造出"幽灵群"（2026-08-03）**：
+  有人把标题打成「⎵NCC的朋友们17群🐶」（前导一个空格），`_title()` 当时不 strip，
+  同步下来就多一条 key 带空格的登记条目，跟真群**并存**——而且它也带着
+  `allow_forward=True`、挂在同一个分组下，于是每次群发都多转发一次、**必然报"群不存在"**。
+  现在 `_strip_dog` 首尾空白一律剥掉（🐶前后的都剥），空名拒绝回写 Notion。
+  **凡是拿群名当 key / 寻址串的新代码，都要先过 `_strip_dog`。**
+- ★ **群在 Notion 改名后靠 `notion_page_id` 认人，不是靠群名**：
+  `upsert_from_notion` 按 page_id 找到老条目、继承它的 `remark`（**微信里真实存在的那个
+  备注**）再删老 key。不这么做的话新 key 会另起一条，remark 变成「新名🐶」而微信备注
+  还是「老名🐶」，寻址必然落空——"打上🐶后群名再改也锁得住"这句设计初衷，
+  之前其实只在 key 不变时才成立。没打过备注的群不继承，跟新名走。
+  同一个 page_id 只保留本次 Notion 认可的那个 key，过期重名残留一律清掉；
+  Notion 行被删的孤儿 pid 没人认领，不受影响会保留。改名迁移会在「同步」的回复里列出来，不静默。
+- **查"群发时群不存在"的两把工具**：管理群发「检查群组 全部」逐个 ChatWith 复核可达性
+  （在 bot 进程内跑，105 个群要几分钟，会占用微信主窗口）；离线核对则拿每个群的
+  `notion_page_id` 去 Notion 查当前标题，跟登记表 key 比对，能在不碰微信的情况下
+  把改名/空格/孤儿全揪出来。
+- ⚠️ `remark_applied=True` 有两个来源：本地真打成功过，**或 Notion 标题带🐶**
+  （`upsert_from_notion` 的兜底，为的是本地 registry 重置后能恢复）。所以**人在 Notion 里
+  手动敲一个🐶上去，会让登记表误以为微信已打备注**，寻址用「群名🐶」而微信里根本没这备注。
+  要加🐶请走「批量打🐶」指令，别手敲。
+- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（42 个，纯 mock 不碰微信）。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
 知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），469 篇公众号文章 2175 块，
