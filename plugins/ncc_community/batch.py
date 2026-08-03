@@ -114,20 +114,26 @@ def _apply_one(wx, name, lock):
     g = registry.get_group(data, name)
     if g and g.get("remark_applied"):
         return "ok", "已打过"
+    target = name + DOG
     try:
         with lock:
             wx.ChatWith(name, exact=False)
-            ok, why = remark.confirm_group_window(wx, name)
+            ok, why = remark.confirm_group_window(wx, name, expect_remark=target)
             if not ok:
                 return "skip", why
-            r = wx.SetGroupRemark(name + DOG)
+            r = wx.SetGroupRemark(target)
+            if not remark.wxresponse_ok(r):
+                return "fail", f"SetGroupRemark 返回 {r!r}"
+            # 打完必须在同一把锁里回读复核，否则中间可能被别的 UI 操作切走窗口
+            ok2, why2 = remark.verify_remark(wx, name, target)
+        if not ok2:
+            log("WARNING", f"批量打🐶复核不通过 {name}: {why2}")
+            return "fail", f"打完复核不通过（{why2}）"
     except Exception as e:
         return "fail", str(e)
-    if remark.wxresponse_ok(r):
-        registry.mark_remark_applied(name, name + DOG)
-        log("INFO", f"批量打🐶：{name}")
-        return "ok", name + DOG
-    return "fail", f"SetGroupRemark 返回 {r!r}"
+    registry.mark_remark_applied(name, target)
+    log("INFO", f"批量打🐶：{name}")
+    return "ok", target
 
 
 # ---------------------------------------------------------------- ② 回写 Notion 标题
