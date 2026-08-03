@@ -642,7 +642,7 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|探面板|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
@@ -651,6 +651,7 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
             "修备注": lambda: _fix_remarks(bot, chat, name),
             "看群": lambda: _inspect_chat(bot, chat, name),
             "看会话": lambda: _inspect_sessions(bot, chat, name),
+            "探面板": lambda: _inspect_panel(bot, chat, name),
             "开迎新": lambda: _toggle_welcome(chat, cfg, name, True),
             "关迎新": lambda: _toggle_welcome(chat, cfg, name, False),
             "删拉群": lambda: _delete_invite(chat, cfg, name),
@@ -876,6 +877,71 @@ def _inspect_sessions(bot, chat, arg) -> bool:
                 attrs[k] = v
         out.append(f"  · {type(s).__name__} {attrs!r}"[:400])
     reply(chat, "\n".join(out))
+    return True
+
+
+def _dump_control(ctrl, depth=0, max_depth=3, out=None):
+    """把一棵 uiautomation 控件树摊平成文本，只读。"""
+    out = out if out is not None else []
+    if ctrl is None or depth > max_depth:
+        return out
+    try:
+        name = (ctrl.Name or "")[:40]
+        out.append(f"{'  ' * depth}{ctrl.ControlTypeName} '{name}'")
+        for c in ctrl.GetChildren():
+            _dump_control(c, depth + 1, max_depth, out)
+    except Exception as e:
+        out.append(f"{'  ' * depth}<读控件失败 {e}>")
+    return out
+
+
+def _inspect_panel(bot, chat, arg) -> bool:
+    """「探面板 <群名>」：切到群、打开"聊天信息"面板，把里面的控件摊出来。只读。
+
+    目的：SetGroupRemark 对已有备注是【追加】，因为它输入前不清空。要自己实现
+    "清空再写"，就得先摸到备注那一栏的控件长什么样、能不能编辑。"""
+    wx = getattr(bot, "wx", None)
+    name = (arg or "").strip()
+    lines = []
+    with MAIN_WINDOW_LOCK:
+        if name and not _switched(wx, name, exact=False):
+            reply(chat, f"切不到「{name}」")
+            return True
+        try:
+            lines.append(f"wx 属性：{sorted(k for k in vars(wx) if not k.startswith('__'))}")
+        except Exception as e:
+            lines.append(f"读 wx 属性失败：{e}")
+        box = None
+        for attr in ("chatbox", "_chatbox", "core", "_core", "chat_box"):
+            box = getattr(wx, attr, None)
+            if box is not None:
+                lines.append(f"chatbox 在 wx.{attr} = {type(box).__name__}")
+                break
+        if box is None:
+            reply(chat, "\n".join(lines) + "\n没找到 chatbox，下面的探测做不了")
+            return True
+        try:
+            from wxautox4.ui.component import ChatMoreInfoWnd
+            wnd = ChatMoreInfoWnd(box)
+            lines.append(f"ChatMoreInfoWnd 实例属性：{ {k: type(v).__name__ for k, v in vars(wnd).items()} }")
+            for item in ("备注", "群聊名称", "我在本群的昵称", "群公告", "备注名"):
+                try:
+                    c = wnd.get_item_control(item)
+                    lines.append(f"  get_item_control({item!r}) -> {c!r}")
+                except Exception as e:
+                    lines.append(f"  get_item_control({item!r}) 抛错：{e}")
+            root = None
+            for k, v in vars(wnd).items():
+                if hasattr(v, "GetChildren"):
+                    root = v
+                    lines.append(f"面板控件树（从 wnd.{k} 起）：")
+                    break
+            if root is not None:
+                lines.extend(_dump_control(root, 1, 3))
+        except Exception as e:
+            import traceback
+            lines.append(f"打开面板失败：{e}\n{traceback.format_exc()}")
+    reply(chat, "\n".join(lines))
     return True
 
 
