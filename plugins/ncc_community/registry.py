@@ -269,13 +269,30 @@ def upsert_from_notion(groupings: dict, groups: dict, invite_keywords: dict | No
         data = load()
         data["groupings"] = groupings
         merged = data.get("groups", {})
+        # page_id → 旧 key。群在 Notion 里改了名（含手滑多打空格）时按 page_id 认人，
+        # 把老条目连同【微信里那个真实存在的备注】一起继承过来，再删掉老 key。
+        # 不这么做就会另起一条：新条目的 remark 是「新名🐶」，而微信里的备注还是
+        # 「老名🐶」，寻址必然落空 —— 群发时报"群不存在"，且新老两条并存重复转发
+        # （2026-08-03 踩到：「 NCC的朋友们17群」前导空格幽灵条目）。
+        old_by_pid = {g["notion_page_id"]: k for k, g in merged.items()
+                      if g.get("notion_page_id")}
+        renamed = []
         for name, incoming in groups.items():
-            old = merged.get(name, {})
+            old = merged.get(name)
+            if old is None:
+                prev_key = old_by_pid.get(incoming.get("notion_page_id"))
+                # prev_key 也在本次 Notion 结果里 = 它自己是个有效群，不能当改名删掉
+                if prev_key is not None and prev_key not in groups:
+                    old = merged[prev_key]
+                    renamed.append((prev_key, name))
+            old = old or {}
             # 人管字段以 Notion 为准；remark_applied 取「本地已标记 或 Notion 标题带🐶」
             applied = old.get("remark_applied", False) or bool(incoming.get("notion_marked"))
             g = {
                 "name": name,
-                "remark": old.get("remark") or (name + DOG),
+                # 打过备注才继承老 remark（那是微信里真实存在的会话名，改名后靠它寻址）；
+                # 没打过就跟着新名走，等 apply_remark 去打
+                "remark": (old.get("remark") if applied else "") or (name + DOG),
                 "remark_applied": applied,   # 机器人管 + Notion🐶标记兜底
                 "notion_page_id": incoming.get("notion_page_id"),
                 "allow_forward": incoming.get("allow_forward", False),
@@ -286,7 +303,17 @@ def upsert_from_notion(groupings: dict, groups: dict, invite_keywords: dict | No
                 "last_seen": old.get("last_seen"),
             }
             merged[name] = g
+        # 一个 Notion 行只该对应一条登记。pid 已被本次结果里的某个 key 认领、
+        # 自己又不在本次结果里 = 过期重名残留（改名迁移的老 key，或手滑空格留下的
+        # 幽灵条目），删掉。幽灵条目最毒的地方是它也带着 allow_forward=True，
+        # 会跟真群并存在同一个分组里，每次群发都多转发一次并报"群不存在"。
+        incoming_pids = {g.get("notion_page_id") for g in groups.values()
+                         if g.get("notion_page_id")}
+        for k in [k for k, g in merged.items()
+                  if k not in groups and g.get("notion_page_id") in incoming_pids]:
+            merged.pop(k, None)
         data["groups"] = merged
+        data["renamed_last_sync"] = [{"from": a, "to": b} for a, b in renamed]
         if invite_keywords is not None:
             data["invite_keywords"] = invite_keywords
         data["synced_at"] = datetime.now().isoformat(timespec="seconds")
