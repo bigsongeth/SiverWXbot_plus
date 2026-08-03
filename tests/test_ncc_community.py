@@ -864,6 +864,21 @@ class FixRemarkPlanTests(unittest.TestCase):
                   "NCC上海WAIC现场见", "🏜️AI 及其代理人联邦"):
             self.assertFalse(audit.looks_spliced(n), n)
 
+    def test_oversized_remark_is_refused(self):
+        """微信备注上限 48 字节。超了硬打会被截断，重跑还会再追加一截——
+        2026-08-03 「AI+社区：我们到底需要什么样的社区」就是这么被打成
+        「AI+社区：我们到底AI+社区：我们到底」的。"""
+        for n in ("AI+社区：我们到底需要什么样的社区", "游牧岛｜游牧护照持有者（会员群）"):
+            v, d = audit.plan_remark(n, self.KNOWN)
+            self.assertEqual(v, audit.FIX_SKIP, n)
+            self.assertIn("字节", d)
+
+    def test_longest_known_good_remark_still_passes(self):
+        """已经成功打上的里面最长的那个正好卡在 48 字节，不能被新规则误杀。"""
+        n = "黄山NCC-黑多岛《老友记》总部👯"
+        self.assertEqual(len((n + audit.DOG).encode("utf-8")), 48)
+        self.assertEqual(audit.plan_remark(n, self.KNOWN)[0], audit.FIX_APPLY)
+
     def test_expectation_never_comes_from_outside(self):
         """核心回归：要打的备注只由当前窗口显示名决定，跟"我们以为它是谁"无关。
         所以切歪了顶多给另一个群打上它自己的正确备注，不会复现 A 打到 B 的错打。"""
