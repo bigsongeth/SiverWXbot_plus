@@ -983,6 +983,7 @@ def _do_set_remark(wx, real_name, want_remark) -> tuple[bool, str]:
         return False, str(e)
     if not remark_mod.wxresponse_ok(r):
         return False, f"SetGroupRemark 返回 {r!r}"
+    time.sleep(1.0)            # 等窗口标题刷成新备注，不然回读到的还是旧显示名
     ok2, why2 = remark_mod.verify_remark(wx, real_name, want_remark)
     if not ok2:
         log("WARNING", f"修备注复核不过 {real_name}: {why2}")

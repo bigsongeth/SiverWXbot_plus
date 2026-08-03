@@ -850,6 +850,20 @@ class FixRemarkPlanTests(unittest.TestCase):
     def test_empty_is_skipped(self):
         self.assertEqual(audit.plan_remark("", self.KNOWN)[0], audit.FIX_SKIP)
 
+    def test_spliced_name_is_conflict(self):
+        """现场：「【大理】春节串门一【大理】春节串」——同一段名字重复两次，
+        是早年打的不带🐶的备注被追加过，真群名是「【大理】春节串门一起玩！」。"""
+        v, d = audit.plan_remark("【大理】春节串门一【大理】春节串", self.KNOWN)
+        self.assertEqual(v, audit.FIX_CONFLICT)
+        self.assertIn("重复", d)
+
+    def test_normal_names_are_not_flagged_as_spliced(self):
+        """误报会让正常群白白跳过，拿真实群名兜一遍。"""
+        for n in ("NCC的朋友们16群", "数字游民交流群1", "黄山NCC黑多岛·好朋友们1️⃣",
+                  "AI+社区：我们到底需要什么样的社区", "游牧岛｜游牧护照持有者（会员群）",
+                  "NCC上海WAIC现场见", "🏜️AI 及其代理人联邦"):
+            self.assertFalse(audit.looks_spliced(n), n)
+
     def test_expectation_never_comes_from_outside(self):
         """核心回归：要打的备注只由当前窗口显示名决定，跟"我们以为它是谁"无关。
         所以切歪了顶多给另一个群打上它自己的正确备注，不会复现 A 打到 B 的错打。"""
