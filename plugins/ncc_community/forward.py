@@ -937,10 +937,12 @@ def _inspect_panel(bot, chat, arg) -> bool:
             return True
         # 面板得先点开，直接构造 ChatMoreInfoWnd 拿到的 control 是 None
         try:
+            from wxautox4.ui.component import ChatMoreInfoWnd
+            root = getattr(ChatMoreInfoWnd(box), "root", None)
             btns = []
-            _collect_buttons(getattr(box, "control", None) or getattr(box, "root", None), 0, 6, btns)
-            lines.append(f"chatbox 里的按钮：{[b[0] for b in btns][:40]}")
-            for cand in ("聊天信息", "聊天详情", "更多"):
+            _collect_buttons(getattr(root, "control", None) or root, 0, 8, btns)
+            lines.append(f"主窗口按钮：{[b[0] for b in btns][:60]}")
+            for cand in ("聊天信息", "聊天详情", "更多", "设置"):
                 hit = next((b for b in btns if b[0] == cand), None)
                 if hit:
                     lines.append(f"点「{cand}」")
