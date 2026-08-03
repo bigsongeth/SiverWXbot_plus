@@ -2,7 +2,15 @@
 # 密钥 / 本机配置（绝对不能进库）
 # ============================================================
 config.json
-/config/
+# config/ 下几乎全是密钥和本机状态：config.json 及其 .bak 备份、panel_secret.key、
+# admin.json、email.txt、webhook.json、reply_count.json —— 一律挡住。
+# 唯独放行人设 config/prompt/*.md：那是纯文本、不含任何密钥，而且是产品的脸，
+# 只存在生产机上迟早会丢（2026-08-03 融合人设时发现版本库里一个都没有）。
+# gitignore 的规矩：父目录被排除后，子文件的 ! 例外不生效，所以只能逐层放行。
+/config/*
+!/config/prompt/
+/config/prompt/*
+!/config/prompt/*.md
 wxautox_activate.py
 .claude/settings.local.json
 
