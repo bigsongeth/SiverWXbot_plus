@@ -642,7 +642,7 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|探面板|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
@@ -651,7 +651,7 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
             "修备注": lambda: _fix_remarks(bot, chat, name),
             "看群": lambda: _inspect_chat(bot, chat, name),
             "看会话": lambda: _inspect_sessions(bot, chat, name),
-            "探面板": lambda: _inspect_panel(bot, chat, name),
+            "试改备注": lambda: _try_edit_remark(bot, chat, name),
             "开迎新": lambda: _toggle_welcome(chat, cfg, name, True),
             "关迎新": lambda: _toggle_welcome(chat, cfg, name, False),
             "删拉群": lambda: _delete_invite(chat, cfg, name),
@@ -895,86 +895,40 @@ def _dump_control(ctrl, depth=0, max_depth=3, out=None):
     return out
 
 
-def _collect_buttons(ctrl, depth=0, max_depth=6, acc=None):
-    """收集控件树里所有有名字的按钮，返回 [(名字, 控件)]。只读。"""
-    acc = acc if acc is not None else []
-    if ctrl is None or depth > max_depth:
-        return acc
-    try:
-        if "Button" in ctrl.ControlTypeName and (ctrl.Name or "").strip():
-            acc.append((ctrl.Name.strip(), ctrl))
-        for c in ctrl.GetChildren():
-            _collect_buttons(c, depth + 1, max_depth, acc)
-    except Exception:
-        pass
-    return acc
+def _try_edit_remark(bot, chat, arg) -> bool:
+    """「试改备注 <群名>|<新备注>」：用 EditFriendInfo 改备注，看它到底是替换还是追加。
 
-
-def _inspect_panel(bot, chat, arg) -> bool:
-    """「探面板 <群名>」：切到群、打开"聊天信息"面板，把里面的控件摊出来。只读。
-
-    目的：SetGroupRemark 对已有备注是【追加】，因为它输入前不清空。要自己实现
-    "清空再写"，就得先摸到备注那一栏的控件长什么样、能不能编辑。"""
+    背景：SetGroupRemark 对已有备注是【追加】、传空串也清不掉，所以打错的备注
+    只能人工清。但 wxautox 还有另一条路 —— EditFriendInfo(remark=...)，
+    它走的是 EditRemarkWindow（有 set_remark + confirm），而微信改备注那个弹窗
+    是预填+全选的，很可能是替换语义。这条指令就是拿测试群把它验掉。"""
     wx = getattr(bot, "wx", None)
-    name = (arg or "").strip()
-    lines = []
+    parts = [p.strip() for p in (arg or "").split("|")]
+    if len(parts) != 2 or not parts[0]:
+        reply(chat, "用法：试改备注 <群名>|<新备注>")
+        return True
+    name, want = parts
+    out = []
     with MAIN_WINDOW_LOCK:
-        if name and not _switched(wx, name, exact=False):
+        if not _switched(wx, name, exact=False):
             reply(chat, f"切不到「{name}」")
             return True
         try:
-            lines.append(f"wx 属性：{sorted(k for k in vars(wx) if not k.startswith('__'))}")
+            out.append(f"改前：{wx.ChatInfo()!r}")
         except Exception as e:
-            lines.append(f"读 wx 属性失败：{e}")
-        box = None
-        for attr in ("ChatBox", "chatbox", "_chatbox", "core", "_core", "chat_box"):
-            box = getattr(wx, attr, None)
-            if box is not None:
-                lines.append(f"chatbox 在 wx.{attr} = {type(box).__name__}")
-                break
-        if box is None:
-            reply(chat, "\n".join(lines) + "\n没找到 chatbox，下面的探测做不了")
-            return True
-        # 面板得先点开，直接构造 ChatMoreInfoWnd 拿到的 control 是 None
+            out.append(f"改前读不到：{e}")
         try:
-            from wxautox4.ui.component import ChatMoreInfoWnd
-            root = getattr(ChatMoreInfoWnd(box), "root", None)
-            btns = []
-            _collect_buttons(getattr(root, "control", None) or root, 0, 8, btns)
-            lines.append(f"主窗口按钮：{[b[0] for b in btns][:60]}")
-            for cand in ("聊天信息", "聊天详情", "更多", "设置"):
-                hit = next((b for b in btns if b[0] == cand), None)
-                if hit:
-                    lines.append(f"点「{cand}」")
-                    hit[1].Click(simulateMove=False)
-                    time.sleep(1.2)
-                    break
-            else:
-                lines.append("没找到打开面板的按钮")
-        except Exception as e:
-            lines.append(f"点开面板失败：{e}")
-        try:
-            from wxautox4.ui.component import ChatMoreInfoWnd
-            wnd = ChatMoreInfoWnd(box)
-            lines.append(f"ChatMoreInfoWnd 实例属性：{ {k: type(v).__name__ for k, v in vars(wnd).items()} }")
-            for item in ("备注", "群聊名称", "我在本群的昵称", "群公告", "备注名"):
-                try:
-                    c = wnd.get_item_control(item)
-                    lines.append(f"  get_item_control({item!r}) -> {c!r}")
-                except Exception as e:
-                    lines.append(f"  get_item_control({item!r}) 抛错：{e}")
-            root = None
-            for k, v in vars(wnd).items():
-                if hasattr(v, "GetChildren"):
-                    root = v
-                    lines.append(f"面板控件树（从 wnd.{k} 起）：")
-                    break
-            if root is not None:
-                lines.extend(_dump_control(root, 1, 3))
+            r = wx.EditFriendInfo(remark=want)
+            out.append(f"EditFriendInfo(remark={want!r}) -> {r!r}")
         except Exception as e:
             import traceback
-            lines.append(f"打开面板失败：{e}\n{traceback.format_exc()}")
-    reply(chat, "\n".join(lines))
+            out.append(f"EditFriendInfo 抛错：{e}\n{traceback.format_exc()[-600:]}")
+        time.sleep(1.5)
+        try:
+            out.append(f"改后：{wx.ChatInfo()!r}")
+        except Exception as e:
+            out.append(f"改后读不到：{e}")
+    reply(chat, "\n".join(out))
     return True
 
 
