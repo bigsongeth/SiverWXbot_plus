@@ -483,6 +483,22 @@ rag_proxy 分流两个功能只在本地、既没进 main 也没推 GitHub，差
 `*.bak-*` 手工备份、日志、`config/config.json`。
 改 `.gitignore` 后用 `git ls-files -i -c --exclude-standard` 查有没有"已跟踪但按规则该忽略"的漏网之鱼。
 
+**例外：人设 `config/prompt/*.md` 进库（2026-08-03 起）。** 原来整个 `/config/` 被排除，
+版本库里一个人设文件都没有——人设是产品的脸，改错了没法回退、机器一还原就没了。
+但 `config/` 下几乎全是密钥和本机状态（`config.json` 及其 `.bak`、`panel_secret.key`、
+`admin.json`、`email.txt`、`webhook.json`、`reply_count.json`），所以只精确放行 `.md`：
+```
+/config/*
+!/config/prompt/
+/config/prompt/*
+!/config/prompt/*.md
+```
+**gitignore 的规矩是父目录被排除后子文件的 `!` 例外不生效**，只能像上面这样逐层放行，
+末尾用 `!*.md` 收口（以后 prompt/ 下出现 `.bak` 之类也不会误入库）。
+往库里放 `config/` 下任何东西之前，先跑这三步验一遍：
+`git check-ignore -v` 逐个确认密钥文件仍被挡住 → `git add --dry-run` 看实际会加哪些 →
+grep 一遍 `sk-` / `api_key` / `Bearer` / `password` 确认文本里没夹带密钥。
+
 ### 5.4 提交节奏
 - **一件事一个 commit**，标题写清楚"改了什么"，正文写"为什么"——尤其是踩坑改的，把日期和现象写进去
   （这个库的 commit message 就是事故档案）。
