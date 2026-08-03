@@ -183,7 +183,46 @@ if handled and checkin_reply:
   （`upsert_from_notion` 的兜底，为的是本地 registry 重置后能恢复）。所以**人在 Notion 里
   手动敲一个🐶上去，会让登记表误以为微信已打备注**，寻址用「群名🐶」而微信里根本没这备注。
   要加🐶请走「批量打🐶」指令，别手敲。
-- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（66 个，纯 mock 不碰微信）。
+- ★★ **`ChatInfo()` 读不到"真实群名"，也没有 remark 字段（2026-08-03 实测钉死）**：
+  真机返回的就三个键 —— `{'chat_type','chat_name','group_member_count'}`。
+  `chat_name` 是**当前显示名**：群一旦有备注，显示的就是备注本身
+  （「NCC的朋友们16群🐶」），而不是群名。**所以微信侧根本无从知道一个群真名叫什么。**
+  在此之前 `audit.classify` / `remark.confirm_group_window` 里那套"chat_name 是真名、
+  remark 是备注"是上一个会话推的、从没碰过微信，全错。后果：
+  ① 旧 `plan_remark` 把 97 个已打🐶的群判成"没备注"，计划打成「群名🐶🐶」——
+  是「修备注 预览」挡下来的，**这类不可逆操作永远先跑预览**；
+  ② `verify_remark` 只认 remark 字段，在真机上永远判失败，复核形同虚设。
+  现在判据改成：**显示名带🐶=打过了，不带=没打过、此时显示名就是真名**，
+  对不对拿 Notion 同步来的群名集合去核。
+- ★ **微信群备注上限 48 字节（16 个汉字），超了会截断、重跑还会再追加一截**：
+  给「AI+社区：我们到底需要什么样的社区🐶」（52 字节）打备注，`SetGroupRemark`
+  报成功、回读还是原名（判"失败"）；重跑一次就变成
+  「AI+社区：我们到底AI+社区：我们到底」——第一次其实写进去了一截。
+  「游牧岛｜游牧护照持有者（会员群）🐶」同样下场。**这两个群是这次实跑打坏的，
+  只能人工清空，且清完也打不上。** 已成功的里面最长的
+  「黄山NCC-黑多岛《老友记》总部👯🐶」正好 48 字节。现在 `audit.REMARK_MAX_BYTES`
+  卡住，超了报人工。
+- **`GetAllRecentGroups()` → `List[Tuple[str, int]]` = (会话显示名, 成员数)**，
+  显示名会被截断（约 16 字），完整的要切过去读 `ChatInfo`。它只覆盖"最近"会话，
+  每轮扫到 95–102 个不等（会话列表滚动位置不同），**不是全量群列表**——
+  所以「修备注」要多跑几轮才能覆盖到冷群。
+- **「修备注 预览 / 全部」**（`forward._fix_remarks` + `audit.plan_remark`）：
+  从微信侧遍历所有群，备注不是「群名🐶」就修，完事回写 Notion。
+  安全性靠"期望值就地取材"——要打的备注 = 当前窗口读到的显示名 + 🐶，
+  不是我们手上那个名字，所以切歪了顶多给另一个群打上它自己的正确备注。
+  另有 `looks_spliced`：显示名里有一段重复出现（「【大理】春节串门一【大理】春节串」）
+  就判疑似"早年不带🐶的备注被追加过"，报人工——拿 118 个真实群名兜过，零误报。
+  只读诊断：「扫群」（看 GetAllRecentGroups 返回结构）、「看群 A|B」（打 ChatInfo 全字段）。
+- ★ **后台任务触发器 `task_runner.py`：运维指令不必真有人在管理群里发**。
+  微信操作必须在 bot 进程内跑，可 bot 平时只听微信消息。现在往
+  `data/task_request.txt` 写一行指令，bot 每 10 秒消费一次、后台线程执行，
+  回复逐条写进 `data/task_result.txt`（`FileSink` 冒充 chat，指令层一行不改就能复用）。
+  只认直接文本指令（进不了转发状态机、发不出群发消息），请求超 30 分钟当陈旧丢弃，
+  执行期间举 `set_forwarding` 闸门让主循环让路。hook 在 `wxbot_core.py` 定时任务
+  注册处 + 主循环 `run_pending` 的条件，共 2 处。
+  ⚠️ mac 侧走 SMB 读 `task_result.txt` **有读缓存**，看到的可能是上一轮的旧内容，
+  拿结果一律 `ssh win-shukong` 从 Windows 侧读。
+- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（92 个，纯 mock 不碰微信）。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
 知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），469 篇公众号文章 2175 块，
