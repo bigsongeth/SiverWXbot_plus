@@ -24,7 +24,17 @@ hook 2 处，都在 wxbot_core.py：`_build_split_prompt` 与 `_parse_split_repl
 """
 from __future__ import annotations
 
+import re
+
 from . import store
+
+# 代码块（``` 围栏 / ` 行内）整段保护起来，里面的符号一个都不许动。
+_CODE_RE = re.compile(r'(```.*?```|`[^`\n]+`)', re.S)
+_BOLD_RE = re.compile(r'\*\*(.+?)\*\*', re.S)               # **加粗**
+_HEADING_RE = re.compile(r'^[ \t]{0,3}#{1,6}[ \t]+', re.M)   # # 标题
+# 分隔线：一整行只有同一个符号重复三次以上。`^-\s` 的列表项不会命中（只有一个 -）。
+_HR_RE = re.compile(r'^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$', re.M)
+_BLANKS_RE = re.compile(r'\n{3,}')
 
 EXTRA_RULE = """
 【每条都要有信息量】
@@ -77,6 +87,34 @@ def merge_thin_parts(parts, max_chars):
         out[1] = out[0] + "\n" + out[1]
         out.pop(0)
     return out
+
+
+def _strip_md_segment(seg: str) -> str:
+    seg = _BOLD_RE.sub(r'\1', seg)
+    seg = _HEADING_RE.sub('', seg)
+    seg = _HR_RE.sub('', seg)
+    return seg
+
+
+def strip_markdown(text: str) -> str:
+    """剥掉微信渲染不了的 Markdown 标记。
+
+    微信是纯文本的，模型写的 `**大理**` 会原样显示成一堆星号，看着像乱码。
+    人设里写了"不要用 Markdown"也管不住——实测散文式回答很干净，一到分类罗列
+    （据点清单那种）就破戒，这是模型组织结构化信息时的本能。所以要在发送前兜一道。
+
+    只剥三样：**加粗**、# 标题、--- 分隔线。
+    留着不动的：
+    - 行首的 `- ` 列表符号——当纯文本读也清楚，剥了反而分不清层次；
+    - 代码块——肥肉会讲技术，围栏剥了代码就糊成一坨，块内的符号也一律不碰
+      （`__init__` 这种别被当成 Markdown 处理掉）。
+    """
+    if not store.enabled() or not text:
+        return text
+    parts = _CODE_RE.split(text)
+    # split 带捕获组：偶数下标是普通文本，奇数下标是被保护的代码块
+    out = [seg if i % 2 else _strip_md_segment(seg) for i, seg in enumerate(parts)]
+    return _BLANKS_RE.sub('\n\n', ''.join(out)).strip()
 
 
 def get_config() -> dict:

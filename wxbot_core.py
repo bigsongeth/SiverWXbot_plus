@@ -3586,6 +3586,14 @@ class WXBot:
     def _clean_reply_for_send(self, reply):
         """按配置清洗即将发送给用户的 AI 回复。"""
         reply = strip_leading_timestamp(reply)  # 时间戳剥离不受清洗开关控制
+        # reply_shape plugin hook：剥 Markdown 标记。微信不渲染 Markdown，模型写的
+        # **加粗** 会原样显示成星号。同样不受清洗开关控制——这个转换对微信永远成立。
+        # 挂在这里是因为它在分条之前，且群聊/私聊两条发送路径都过这个方法。
+        try:
+            from plugins.reply_shape import strip_markdown
+            reply = strip_markdown(reply)
+        except Exception as _rs_err:
+            log(level="ERROR", message=f"reply_shape markdown hook error: {_rs_err}")
         if not self.config.clean_ai_reply_switch:
             return reply
         cleaned = clean_ai_reply_text(reply)

@@ -87,6 +87,64 @@ class TestMergeThinParts(Base):
         self.assertEqual(len(out), 1)
 
 
+class TestStripMarkdown(Base):
+    # 2026-08-03 融合版人设实测的真实输出：人设里明写了"不要用 Markdown"，
+    # 散文式回答很干净，一到分类罗列就破戒。prompt 管不住，得在发送前兜一道。
+    据点回答 = (
+        "汪！肥肉我趴在这儿呢，正好给你说说。\n\n"
+        "NCC 的据点分三类哈：\n\n"
+        "**一、自营共居据点（可以长住）：**\n"
+        "- 云南大理 —— NCC 的起点，宠物友好。\n"
+        "- 黄山黟县（黑多岛）—— 安徽那边。\n\n"
+        "---\n\n"
+        "想去的话加小助手：nccxiaozhushou 🐶"
+    )
+
+    def test_剥掉加粗星号(self):
+        out = reply_shape.strip_markdown(self.据点回答)
+        self.assertNotIn("**", out)
+        self.assertIn("一、自营共居据点（可以长住）：", out)   # 文字本身一个不少
+
+    def test_剥掉分隔线(self):
+        out = reply_shape.strip_markdown(self.据点回答)
+        self.assertNotIn("---", out)
+
+    def test_保留列表符号(self):
+        """行首的 - 当纯文本读也清楚，剥了反而分不清层次。"""
+        out = reply_shape.strip_markdown(self.据点回答)
+        self.assertIn("- 云南大理", out)
+
+    def test_剥掉标题井号(self):
+        out = reply_shape.strip_markdown("# 大标题\n### 小标题\n正文")
+        self.assertEqual(out, "大标题\n小标题\n正文")
+
+    def test_代码块内部原样不动(self):
+        """肥肉会讲技术。围栏剥了代码会糊成一坨，块内符号也一律不碰。"""
+        src = "看这个：\n```python\ndef __init__(self):\n    x = a ** 2\n```\n就这样"
+        out = reply_shape.strip_markdown(src)
+        self.assertIn("```python", out)
+        self.assertIn("a ** 2", out)          # 代码里的 ** 是乘方，不是加粗
+        self.assertIn("__init__", out)
+
+    def test_行内代码不动(self):
+        out = reply_shape.strip_markdown("用 `a ** b` 算乘方")
+        self.assertIn("`a ** b`", out)
+
+    def test_列表项不会被当成分隔线(self):
+        out = reply_shape.strip_markdown("- 大理\n- 黄山")
+        self.assertEqual(out, "- 大理\n- 黄山")
+
+    def test_关掉开关就原样返回(self):
+        cfg = reply_shape.get_config()
+        cfg["enabled"] = False
+        reply_shape.save_config(cfg)
+        self.assertEqual(reply_shape.strip_markdown(self.据点回答), self.据点回答)
+
+    def test_空输入不炸(self):
+        self.assertEqual(reply_shape.strip_markdown(""), "")
+        self.assertIsNone(reply_shape.strip_markdown(None))
+
+
 class TestAugmentSplitPrompt(Base):
     上游模板 = ("【回复格式要求】\n你可以自行决定是否将回复拆分为多条消息。\n"
                 "【以下是你的角色设定】\n你是肥肉。")
