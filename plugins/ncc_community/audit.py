@@ -68,6 +68,15 @@ FIX_SKIP = "fix_skip"          # 切不过去 / 读不到会话名 / 没群名�
 FIX_FAILED = "fix_failed"      # 打了但没成/复核不过
 FIX_UNKNOWN = "fix_unknown"    # 有🐶备注但登记表里没这个名字（改名？错打？）
 
+# ★ 微信群备注的长度上限，2026-08-03 实测出来的（血的教训，见下）：
+# 给「AI+社区：我们到底需要什么样的社区」（+🐶 共 52 字节）打备注，SetGroupRemark
+# 报成功、回读却还是原名；重跑一次后备注变成了「AI+社区：我们到底AI+社区：我们到底」
+# ——超长的那次其实写进去了一截（被截断），第二次又追加了一截。
+# 「游牧岛｜游牧护照持有者（会员群）」（同样 52 字节）一模一样的下场。
+# 而已经成功打上的里面最长的「黄山NCC-黑多岛《老友记》总部👯🐶」正好 48 字节。
+# 所以：算 UTF-8 字节、超过 48 的一律不碰，这类只能改短群名或者干脆不打🐶。
+REMARK_MAX_BYTES = 48
+
 
 def looks_spliced(name: str, min_len: int = 4) -> bool:
     """显示名里有一段【重复出现】= 多半是备注被追加过，不是真群名。
@@ -127,7 +136,13 @@ def plan_remark(display, known_names=()) -> tuple[str, str]:
     if "、" in name and name not in known:
         return FIX_SKIP, f"没有群名的群（微信显示成员名「{name}」），要不要打备注请人来定"
 
-    return FIX_APPLY, name + DOG
+    want = name + DOG
+    nbytes = len(want.encode("utf-8"))
+    if nbytes > REMARK_MAX_BYTES:
+        return FIX_SKIP, (f"「{want}」有 {nbytes} 字节，超过微信备注上限 "
+                          f"{REMARK_MAX_BYTES} 字节，硬打会被截成垃圾——"
+                          f"要么改短群名，要么这个群就不打🐶了")
+    return FIX_APPLY, want
 
 
 def extract_group_names(raw) -> list:
