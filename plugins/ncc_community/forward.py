@@ -25,7 +25,7 @@ import random
 import threading
 from queue import Queue
 
-from . import store, registry
+from . import store, registry, audit
 from .common import REPLY_PREFIX, is_bot_reply, log, reply
 
 NOTION_BACKEND_URL = "https://bigsong.notion.site/NCC-1564e93f5682805d9a2ff0519c24738b"
@@ -64,7 +64,10 @@ MAIN_MENU = (
     "3 👈 查看 Notion 后台\n"
     "4 👈 待归类新群\n"
     "5 👈 迎新 / 拉群设置\n"
-    "0 👈 退出管理模式"
+    "0 👈 退出管理模式\n"
+    "\n体检指令（直接发）：\n"
+    "  检查群组 全部 —— 群还在不在（可达性）\n"
+    "  核对备注 全部 —— 🐶备注有没有打错群"
 )
 
 COLLECT_PROMPT = (
@@ -634,11 +637,12 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain == "迎新列表":
         reply(chat, _format_welcomes(cfg)); return True
 
-    m = re.match(r"^(检查群组|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
             "检查群组": lambda: _check_groups(bot, chat, name),
+            "核对备注": lambda: _audit_remarks(bot, chat, name),
             "开迎新": lambda: _toggle_welcome(chat, cfg, name, True),
             "关迎新": lambda: _toggle_welcome(chat, cfg, name, False),
             "删拉群": lambda: _delete_invite(chat, cfg, name),
@@ -733,6 +737,59 @@ def _check_groups(bot, chat, name) -> bool:
         lines.append("不可达（可能改了群名/退群，去 Notion 更新）：")
         lines.extend(f" - {t}" for t in fail_list)
     reply(chat, "\n".join(lines))
+    return True
+
+
+def _select_groups(data, scope):
+    """按范围选出 [(群名, 群条目)]。scope = 全部 / 分组名。选不出时返回 None。"""
+    groups = data.get("groups", {})
+    if scope in ("全部", "所有", "all"):
+        return sorted(groups.items())
+    if scope in data.get("groupings", {}):
+        return sorted((n, g) for n, g in groups.items() if scope in (g.get("groupings") or []))
+    return None
+
+
+def _probe_remark(wx, query):
+    """切到 query 并读回当前窗口信息。切不过去 / 读不到都返回 None。"""
+    if not _switched(wx, query, exact=False):
+        return None
+    try:
+        info = wx.ChatInfo() or {}
+    except Exception as e:
+        log("WARNING", f"核对备注读窗口信息失败「{query}」：{e}")
+        return None
+    return info if isinstance(info, dict) and info else None
+
+
+def _audit_remarks(bot, chat, scope) -> bool:
+    """核对「群名🐶」这个备注到底挂在谁头上——查 A 的备注被打到 B 上的情况。
+
+    不能复用「检查群组」：错打时 ChatWith 是【成功】的（切到了被错打的那个群），
+    可达性检查一律报 ✅，错打对它完全隐形。这里改成拿备注串去搜、再读回真实群名比对。
+    """
+    data = registry.load()
+    items = _select_groups(data, scope)
+    if items is None:
+        reply(chat, f"没有「{scope}」这个分组。发「分组列表」看看，或用「核对备注 全部」。")
+        return True
+    if not items:
+        reply(chat, "该分组下没有群可核对。")
+        return True
+
+    known = set(data.get("groups", {}))
+    reply(chat, f"开始核对 {len(items)} 个群的备注归属，逐个切窗口，大约 {max(1, len(items) * 2 // 60)} 分钟…")
+    wx = getattr(bot, "wx", None)
+    results = []
+    for name, _g in items:
+        with MAIN_WINDOW_LOCK:
+            info = _probe_remark(wx, name + audit.DOG)
+        verdict, detail = audit.classify(name, info, known)
+        results.append((name, verdict, detail))
+        if verdict in (audit.MISAPPLIED, audit.NOT_GROUP):
+            log("WARNING", f"备注核对：{detail}")
+        time.sleep(0.5)
+    reply(chat, audit.summarize(results))
     return True
 
 

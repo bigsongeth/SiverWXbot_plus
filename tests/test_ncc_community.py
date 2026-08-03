@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 
-from plugins.ncc_community import store, forward, invite, registry, welcome, notion_sync
+from plugins.ncc_community import store, forward, invite, registry, welcome, notion_sync, audit
 from plugins.ncc_community import handle_friend_message, handle_self_message, handle_system_message
 from plugins.ncc_community.common import REPLY_PREFIX
 
@@ -576,6 +576,94 @@ class RenameMigrationTests(unittest.TestCase):
         self._seed("A群", "pid-1", applied=False)
         data = registry.upsert_from_notion({}, self._incoming("A群", "pid-1", marked=True))
         self.assertTrue(data["groups"]["A群"]["remark_applied"])
+
+
+
+# ---------------------------------------------------------------- 备注名实核对
+
+class RemarkAuditTests(unittest.TestCase):
+    """查"A 群的🐶备注被打到 B 群头上"。可达性检查对这类错误完全隐形：
+    错打时 ChatWith 是成功的，只不过切到的是被错打的那个群。"""
+
+    KNOWN = {"肥肉测试1", "泰国清迈旅居交流1群", "爱和未来"}
+
+    def _info(self, chat_name, remark="", chat_type="group"):
+        return {"chat_name": chat_name, "remark": remark, "chat_type": chat_type}
+
+    def test_misapplied_remark_detected(self):
+        """线上实到的形态：肥肉测试1🐶 打到了泰国清迈旅居交流1群头上。"""
+        info = self._info("泰国清迈旅居交流1群", remark="肥肉测试1🐶")
+        verdict, detail = audit.classify("肥肉测试1", info, self.KNOWN)
+        self.assertEqual(verdict, audit.MISAPPLIED)
+        self.assertIn("肥肉测试1🐶", detail)
+        self.assertIn("泰国清迈旅居交流1群", detail)
+
+    def test_correct_remark_is_ok(self):
+        info = self._info("肥肉测试1", remark="肥肉测试1🐶")
+        self.assertEqual(audit.classify("肥肉测试1", info, self.KNOWN)[0], audit.OK)
+
+    def test_unknown_chat_name_reads_as_rename_not_misapply(self):
+        """切到的群不在册 → 多半只是改了名，不该误报成错打。"""
+        info = self._info("大理新群名", remark="肥肉测试1🐶")
+        self.assertEqual(audit.classify("肥肉测试1", info, self.KNOWN)[0], audit.RENAMED)
+
+    def test_remark_landed_on_friend(self):
+        info = self._info("松爸", remark="肥肉测试1🐶", chat_type="friend")
+        verdict, detail = audit.classify("肥肉测试1", info, self.KNOWN)
+        self.assertEqual(verdict, audit.NOT_GROUP)
+        self.assertIn("松爸", detail)
+
+    def test_missing_remark(self):
+        verdict, _ = audit.classify("肥肉测试1", None, self.KNOWN)
+        self.assertEqual(verdict, audit.MISSING)
+
+    def test_inconclusive_when_real_name_unreadable(self):
+        """wxautox 把备注串塞进 chat_name、remark 又是空的时候，判不了真名。"""
+        info = self._info("肥肉测试1🐶", remark="")
+        self.assertEqual(audit.classify("肥肉测试1", info, self.KNOWN)[0], audit.INCONCLUSIVE)
+
+    def test_chat_name_equals_remark_but_remark_present_is_ok(self):
+        info = self._info("肥肉测试1🐶", remark="肥肉测试1🐶")
+        self.assertEqual(audit.classify("肥肉测试1", info, self.KNOWN)[0], audit.OK)
+
+    def test_summarize_flags_misapplied_first_and_warns(self):
+        results = [
+            ("爱和未来", audit.OK, ""),
+            ("肥肉测试1", audit.MISAPPLIED, "备注「肥肉测试1🐶」实际打在了群「泰国清迈旅居交流1群」头上"),
+            ("某群", audit.RENAMED, "改名了"),
+        ]
+        out = audit.summarize(results)
+        self.assertIn("名实相符 1 个", out)
+        self.assertIn("🔴", out)
+        self.assertLess(out.index("🔴"), out.index("🟡"))   # 高危排在前面
+        self.assertIn("追加", out)                          # 提示清备注的坑
+
+    def test_summarize_all_ok_has_no_warning(self):
+        out = audit.summarize([("爱和未来", audit.OK, "")])
+        self.assertIn("名实相符 1 个", out)
+        self.assertNotIn("🔴", out)
+
+
+class SelectGroupsTests(unittest.TestCase):
+    DATA = {
+        "groupings": {"肥肉自测": {}},
+        "groups": {
+            "肥肉测试1": {"groupings": ["肥肉自测"]},
+            "爱和未来": {"groupings": ["肥肉自测"]},
+            "清迈群": {"groupings": ["合作社群群"]},
+        },
+    }
+
+    def test_all(self):
+        self.assertEqual(sorted(n for n, _ in forward._select_groups(self.DATA, "全部")),
+                         sorted(["爱和未来", "肥肉测试1", "清迈群"]))
+
+    def test_by_grouping(self):
+        self.assertEqual(sorted(n for n, _ in forward._select_groups(self.DATA, "肥肉自测")),
+                         sorted(["爱和未来", "肥肉测试1"]))
+
+    def test_unknown_scope_returns_none(self):
+        self.assertIsNone(forward._select_groups(self.DATA, "不存在的分组"))
 
 
 if __name__ == "__main__":
