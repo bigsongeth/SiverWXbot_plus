@@ -661,8 +661,14 @@ def _do_sync(chat) -> bool:
     try:
         from . import notion_sync
         stat = notion_sync.pull()
-        reply(chat, f"同步成功 ✅ 分组 {stat['groupings']} 个、群 {stat['groups']} 个"
-                    f"（允许转发 {stat['forward_on']} 个）、拉群关键词 {stat.get('invites', 0)} 条")
+        msg = (f"同步成功 ✅ 分组 {stat['groupings']} 个、群 {stat['groups']} 个"
+               f"（允许转发 {stat['forward_on']} 个）、拉群关键词 {stat.get('invites', 0)} 条")
+        # 改名迁移不能静默：寻址仍走微信里的老备注，人得知道表里名字变了
+        renamed = stat.get("renamed") or []
+        if renamed:
+            msg += f"\n检测到 {len(renamed)} 个群在 Notion 改了名（寻址仍用原备注，不影响转发）："
+            msg += "".join(f"\n  「{r['from']}」→「{r['to']}」" for r in renamed)
+        reply(chat, msg)
     except Exception as e:
         reply(chat, f"同步失败：{e}")
         log("ERROR", f"Notion 同步失败: {e}")

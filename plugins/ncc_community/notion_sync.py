@@ -125,11 +125,17 @@ DOG = "\U0001f436"  # 🐶
 def _strip_dog(title: str):
     """Notion『群名』标题末尾的🐶是"已纳管"标记。返回 (原群名, 是否已标记)。
     这样表里标题带不带🐶都能正确解析，且🐶本身就是"已打备注"的持久记录，
-    即便本地 registry 被重置也能从 Notion 恢复。"""
-    t = title or ""
+    即便本地 registry 被重置也能从 Notion 恢复。
+
+    首尾空白一律剥掉（🐶前后的也剥）——群名是寻址主键，人在 Notion 里手滑多打一个
+    空格就会凭空造出一个「幽灵群」：登记表里多一条 key 带空格的条目，寻址串
+    「 群名🐶」在微信里根本不存在，每次群发都报"群不存在"。
+    2026-08-03 实测踩到：「 NCC的朋友们17群🐶」前导空格，幽灵条目还带着
+    allow_forward=True 混在「朋友X群」分组里，跟真群并存了两条。"""
+    t = (title or "").strip()
     marked = t.endswith(DOG)
     if marked:
-        t = t[: -len(DOG)]
+        t = t[: -len(DOG)].strip()
     return t, marked
 
 
@@ -204,9 +210,12 @@ def parse_invites(invite_rows: list, group_rows: list):
 def update_title_dog(page_id: str, base_name: str) -> None:
     """把某群在 Notion 的『群名』标题改成「原名🐶」（纳管后回写，让表里可见）。
     幂等：已带🐶就不重复加。"""
+    base, _ = _strip_dog(base_name)   # 顺带把人手滑打进标题的首尾空格洗掉
+    if not base:
+        raise ValueError(f"群名为空，拒绝回写：{base_name!r}")
     if not _token():
         raise RuntimeError("缺少 Notion token")
-    new_title = base_name if base_name.endswith(DOG) else base_name + DOG
+    new_title = base + DOG
     _api("PATCH", f"/pages/{page_id}",
          {"properties": {"群名": {"title": [{"text": {"content": new_title}}]}}})
 
@@ -220,10 +229,11 @@ def pull() -> dict:
     invite_rows = _query_all(DB_INVITES)
     groupings, groups = parse_notion(group_rows, grouping_rows)
     invites = parse_invites(invite_rows, group_rows)
-    registry.upsert_from_notion(groupings, groups, invites)
+    data = registry.upsert_from_notion(groupings, groups, invites)
+    renamed = data.get("renamed_last_sync") or []
     stat = {"groupings": len(groupings), "groups": len(groups),
             "forward_on": sum(1 for g in groups.values() if g["allow_forward"]),
-            "invites": len(invites)}
+            "invites": len(invites), "renamed": renamed}
     log("INFO", f"Notion 拉取完成：{stat}")
     return stat
 
@@ -233,7 +243,7 @@ def pull() -> dict:
 def find_page_by_name(name: str):
     """按群名在「群聊列表」里找已有行（同时匹配「原名」和「原名🐶」，保证幂等），
     返回 page_id 或 None。"""
-    base = name[: -len(DOG)] if name.endswith(DOG) else name
+    base, _ = _strip_dog(name)
     for candidate in (base, base + DOG):
         d = _api("POST", f"/databases/{DB_GROUPS}/query",
                  {"filter": {"property": "群名", "title": {"equals": candidate}}, "page_size": 1})
@@ -248,7 +258,7 @@ def push_discovery(name: str, with_dog: bool = False) -> str:
     with_dog=True 时标题直接写「原名🐶」。分组/权限留给人在 Notion 里归类。"""
     if not _token():
         raise RuntimeError("缺少 Notion token")
-    base = name[: -len(DOG)] if name.endswith(DOG) else name
+    base, _ = _strip_dog(name)
     existing = find_page_by_name(base)
     if existing:
         return existing

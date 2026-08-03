@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 
-from plugins.ncc_community import store, forward, invite, registry, welcome
+from plugins.ncc_community import store, forward, invite, registry, welcome, notion_sync
 from plugins.ncc_community import handle_friend_message, handle_self_message, handle_system_message
 from plugins.ncc_community.common import REPLY_PREFIX
 
@@ -402,6 +402,180 @@ class NccCommunityTestCase(unittest.TestCase):
         self.assertIn("大理", out)
         self.assertIn("Notion", out)
         self.assertIn("测试拉群", out)
+
+
+
+# ---------------------------------------------------------------- Notion 解析 / 改名迁移
+
+def _title_prop(text):
+    return {"title": [{"plain_text": text}]} if text is not None else {"title": []}
+
+
+def _group_row(pid, title, forward=True, speak=True, url="", grouping_ids=()):
+    return {
+        "id": pid,
+        "properties": {
+            "群名": _title_prop(title),
+            "允许转发": {"checkbox": forward},
+            "允许发言": {"checkbox": speak},
+            "迎新推送链接（填写后视为开启）": {"url": url},
+            "转发群聊分组": {"relation": [{"id": i} for i in grouping_ids]},
+        },
+    }
+
+
+def _grouping_row(pid, name, number=1, enabled=True):
+    return {
+        "id": pid,
+        "properties": {
+            "组名": _title_prop(name),
+            "分组编号": {"number": number},
+            "是否转发": {"checkbox": enabled},
+        },
+    }
+
+
+class NotionParseTests(unittest.TestCase):
+    """群名是寻址主键，解析时必须把人手滑打进 Notion 的空白洗掉。"""
+
+    def test_strip_dog_variants(self):
+        self.assertEqual(notion_sync._strip_dog("A群🐶"), ("A群", True))
+        self.assertEqual(notion_sync._strip_dog("A群"), ("A群", False))
+        self.assertEqual(notion_sync._strip_dog(""), ("", False))
+        self.assertEqual(notion_sync._strip_dog(None), ("", False))
+
+    def test_strip_dog_removes_surrounding_whitespace(self):
+        # 2026-08-03 线上实到的形态：标题前导一个空格
+        self.assertEqual(notion_sync._strip_dog(" NCC的朋友们17群🐶"), ("NCC的朋友们17群", True))
+        self.assertEqual(notion_sync._strip_dog("A群 🐶"), ("A群", True))
+        self.assertEqual(notion_sync._strip_dog("  A群🐶  "), ("A群", True))
+        self.assertEqual(notion_sync._strip_dog("  A群  "), ("A群", False))
+
+    def test_parse_notion_no_ghost_group_from_stray_space(self):
+        """带空格的标题不能再解析出第二个"幽灵群"——它的寻址串在微信里不存在。"""
+        rows = [_group_row("pid-17", " NCC的朋友们17群🐶")]
+        _, groups = notion_sync.parse_notion(rows, [])
+        self.assertEqual(list(groups), ["NCC的朋友们17群"])
+        self.assertTrue(groups["NCC的朋友们17群"]["notion_marked"])
+
+    def test_parse_notion_skips_blank_titles(self):
+        rows = [_group_row("pid-a", ""), _group_row("pid-b", "   "), _group_row("pid-c", "真群🐶")]
+        _, groups = notion_sync.parse_notion(rows, [])
+        self.assertEqual(list(groups), ["真群"])
+
+    def test_parse_notion_grouping_relation(self):
+        grouping_rows = [_grouping_row("g1", "大理群", number=4)]
+        rows = [_group_row("pid-1", "A群🐶", grouping_ids=["g1"])]
+        groupings, groups = notion_sync.parse_notion(rows, grouping_rows)
+        self.assertEqual(groupings["大理群"]["number"], 4)
+        self.assertEqual(groups["A群"]["groupings"], ["大理群"])
+
+    def test_parse_invites_strips_whitespace(self):
+        group_rows = [_group_row("pid-1", " 目标群🐶 ")]
+        invite_rows = [{"properties": {
+            "关键词": _title_prop("  大理  "),
+            "目标群": {"relation": [{"id": "pid-1"}]},
+        }}]
+        invites = notion_sync.parse_invites(invite_rows, group_rows)
+        self.assertEqual(invites, {"大理": "目标群"})
+
+    def test_update_title_dog_rejects_blank(self):
+        with self.assertRaises(ValueError):
+            notion_sync.update_title_dog("pid", "   ")
+
+
+class RenameMigrationTests(unittest.TestCase):
+    """群在 Notion 改名后，寻址必须继续用微信里那个真实存在的老备注。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="ncc_rename_")
+        self._orig_dir = registry.DATA_DIR
+        self._orig_path = registry.REGISTRY_PATH
+        registry.DATA_DIR = self.tmpdir
+        registry.REGISTRY_PATH = os.path.join(self.tmpdir, "registry.json")
+
+    def tearDown(self):
+        registry.DATA_DIR = self._orig_dir
+        registry.REGISTRY_PATH = self._orig_path
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _seed(self, name, pid, remark=None, applied=True):
+        registry.save({"groupings": {}, "invite_keywords": {}, "groups": {name: {
+            "name": name, "remark": remark or (name + "🐶"), "remark_applied": applied,
+            "notion_page_id": pid, "allow_forward": True, "allow_speak": True,
+            "welcome_url": "", "groupings": ["朋友X群"], "status": "active",
+            "last_seen": "2026-07-07T13:10:59",
+        }}})
+
+    def _incoming(self, name, pid, marked=True):
+        return {name: {"notion_page_id": pid, "allow_forward": True, "allow_speak": True,
+                       "welcome_url": "", "groupings": ["朋友X群"], "notion_marked": marked}}
+
+    def test_rename_drops_old_key_and_keeps_wechat_remark(self):
+        self._seed("老名", "pid-1")
+        data = registry.upsert_from_notion({}, self._incoming("新名", "pid-1"))
+        self.assertEqual(list(data["groups"]), ["新名"])          # 老 key 不再残留
+        self.assertEqual(data["groups"]["新名"]["remark"], "老名🐶")  # 寻址仍指向真实会话
+        self.assertEqual(registry.target(data["groups"]["新名"]), "老名🐶")
+        self.assertEqual(data["renamed_last_sync"], [{"from": "老名", "to": "新名"}])
+
+    def test_rename_carries_last_seen(self):
+        self._seed("老名", "pid-1")
+        data = registry.upsert_from_notion({}, self._incoming("新名", "pid-1"))
+        self.assertEqual(data["groups"]["新名"]["last_seen"], "2026-07-07T13:10:59")
+
+    def test_rename_without_remark_follows_new_name(self):
+        """没打过备注的群按群名寻址，改名后就该跟新名走。"""
+        self._seed("老名", "pid-1", applied=False)
+        data = registry.upsert_from_notion({}, self._incoming("新名", "pid-1", marked=False))
+        self.assertEqual(data["groups"]["新名"]["remark"], "新名🐶")
+        self.assertEqual(registry.target(data["groups"]["新名"]), "新名")
+
+    def test_no_migration_when_old_key_still_present_in_notion(self):
+        """老 key 自己也是本次 Notion 里的有效群时，绝不能被当成改名删掉。"""
+        self._seed("A群", "pid-1")
+        incoming = {}
+        incoming.update(self._incoming("A群", "pid-1"))
+        incoming.update(self._incoming("B群", "pid-2"))
+        data = registry.upsert_from_notion({}, incoming)
+        self.assertEqual(sorted(data["groups"]), ["A群", "B群"])
+        self.assertEqual(data["renamed_last_sync"], [])
+
+    def test_ghost_entry_removed_when_real_key_already_exists(self):
+        """线上实到的形态：真群和带空格的幽灵条目并存，pid 相同。
+        Notion 标题洗干净后，这一条必须被清掉——不能靠"新 key 不存在"那条路。"""
+        registry.save({"groupings": {}, "invite_keywords": {}, "groups": {
+            "NCC的朋友们17群": {"name": "NCC的朋友们17群", "remark": "NCC的朋友们17群🐶",
+                                "remark_applied": True, "notion_page_id": "pid-17",
+                                "allow_forward": True, "groupings": [], "status": "active"},
+            " NCC的朋友们17群": {"name": " NCC的朋友们17群", "remark": " NCC的朋友们17群🐶",
+                                 "remark_applied": True, "notion_page_id": "pid-17",
+                                 "allow_forward": True, "groupings": ["朋友X群"], "status": "active"},
+        }})
+        data = registry.upsert_from_notion({}, self._incoming("NCC的朋友们17群", "pid-17"))
+        self.assertEqual(list(data["groups"]), ["NCC的朋友们17群"])
+        self.assertNotIn(" NCC的朋友们17群🐶", registry.all_forward_targets(data))
+
+    def test_orphan_with_unknown_pid_is_kept(self):
+        """Notion 行被删的孤儿不在本次结果里，但 pid 也没被谁认领——不该顺手删掉。"""
+        registry.save({"groupings": {}, "invite_keywords": {}, "groups": {
+            "已删群": {"name": "已删群", "remark": "已删群🐶", "remark_applied": True,
+                       "notion_page_id": "pid-gone", "allow_forward": False,
+                       "groupings": [], "status": "active"},
+        }})
+        data = registry.upsert_from_notion({}, self._incoming("别的群", "pid-1"))
+        self.assertIn("已删群", data["groups"])
+
+    def test_plain_update_preserves_remark_applied(self):
+        self._seed("A群", "pid-1")
+        data = registry.upsert_from_notion({}, self._incoming("A群", "pid-1", marked=False))
+        self.assertTrue(data["groups"]["A群"]["remark_applied"])
+        self.assertEqual(data["renamed_last_sync"], [])
+
+    def test_notion_dog_marks_applied_without_local_record(self):
+        self._seed("A群", "pid-1", applied=False)
+        data = registry.upsert_from_notion({}, self._incoming("A群", "pid-1", marked=True))
+        self.assertTrue(data["groups"]["A群"]["remark_applied"])
 
 
 if __name__ == "__main__":
