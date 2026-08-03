@@ -895,6 +895,21 @@ def _dump_control(ctrl, depth=0, max_depth=3, out=None):
     return out
 
 
+def _collect_buttons(ctrl, depth=0, max_depth=6, acc=None):
+    """收集控件树里所有有名字的按钮，返回 [(名字, 控件)]。只读。"""
+    acc = acc if acc is not None else []
+    if ctrl is None or depth > max_depth:
+        return acc
+    try:
+        if "Button" in ctrl.ControlTypeName and (ctrl.Name or "").strip():
+            acc.append((ctrl.Name.strip(), ctrl))
+        for c in ctrl.GetChildren():
+            _collect_buttons(c, depth + 1, max_depth, acc)
+    except Exception:
+        pass
+    return acc
+
+
 def _inspect_panel(bot, chat, arg) -> bool:
     """「探面板 <群名>」：切到群、打开"聊天信息"面板，把里面的控件摊出来。只读。
 
@@ -920,6 +935,22 @@ def _inspect_panel(bot, chat, arg) -> bool:
         if box is None:
             reply(chat, "\n".join(lines) + "\n没找到 chatbox，下面的探测做不了")
             return True
+        # 面板得先点开，直接构造 ChatMoreInfoWnd 拿到的 control 是 None
+        try:
+            btns = []
+            _collect_buttons(getattr(box, "control", None) or getattr(box, "root", None), 0, 6, btns)
+            lines.append(f"chatbox 里的按钮：{[b[0] for b in btns][:40]}")
+            for cand in ("聊天信息", "聊天详情", "更多"):
+                hit = next((b for b in btns if b[0] == cand), None)
+                if hit:
+                    lines.append(f"点「{cand}」")
+                    hit[1].Click(simulateMove=False)
+                    time.sleep(1.2)
+                    break
+            else:
+                lines.append("没找到打开面板的按钮")
+        except Exception as e:
+            lines.append(f"点开面板失败：{e}")
         try:
             from wxautox4.ui.component import ChatMoreInfoWnd
             wnd = ChatMoreInfoWnd(box)
