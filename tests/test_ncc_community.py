@@ -879,6 +879,24 @@ class FixRemarkPlanTests(unittest.TestCase):
         self.assertEqual(len((n + audit.DOG).encode("utf-8")), 48)
         self.assertEqual(audit.plan_remark(n, self.KNOWN)[0], audit.FIX_APPLY)
 
+    def test_override_wins_over_everything(self):
+        """群名顶到 16 个汉字的群加🐶必超上限，只能人工指定一个短备注。"""
+        ov = {"AI+社区：我们到底需要什么样的社区": "AI+社区：我们到底需要什么样的🐶"}
+        v, want = audit.plan_remark("AI+社区：我们到底需要什么样的社区", self.KNOWN, ov)
+        self.assertEqual(v, audit.FIX_APPLY)
+        self.assertEqual(want, "AI+社区：我们到底需要什么样的🐶")
+        self.assertLessEqual(len(want.encode("utf-8")), audit.REMARK_MAX_BYTES)
+
+    def test_override_itself_must_fit(self):
+        ov = {"某群": "这个指定的备注也长得离谱一二三四五六七八九十🐶"}
+        self.assertEqual(audit.plan_remark("某群", self.KNOWN, ov)[0], audit.FIX_SKIP)
+
+    def test_applied_override_is_recognized_as_done(self):
+        """打上人工指定的备注后，下次扫到不能再判成"备注对不上"要人看。"""
+        ov = {"AI+社区：我们到底需要什么样的社区": "AI+社区：我们到底需要什么样的🐶"}
+        v, _ = audit.plan_remark("AI+社区：我们到底需要什么样的🐶", self.KNOWN, ov)
+        self.assertEqual(v, audit.FIX_OK)
+
     def test_expectation_never_comes_from_outside(self):
         """核心回归：要打的备注只由当前窗口显示名决定，跟"我们以为它是谁"无关。
         所以切歪了顶多给另一个群打上它自己的正确备注，不会复现 A 打到 B 的错打。"""

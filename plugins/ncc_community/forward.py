@@ -657,11 +657,12 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
             "删拉群": lambda: _delete_invite(chat, cfg, name),
         }[m.group(1)]()
 
-    m = re.match(r"^(设拉群|设迎新文案|设迎新链接)\s*(.+?)\s*\|\s*(.*)$", text, re.S)
+    m = re.match(r"^(设拉群|设迎新文案|设迎新链接|设备注)\s*(.+?)\s*\|\s*(.*)$", text, re.S)
     if m:
         cmd, a, b = m.group(1), m.group(2).strip(), m.group(3).strip()
         return {
             "设拉群": lambda: _set_invite(chat, cfg, a, b),
+            "设备注": lambda: _set_remark_override(chat, cfg, a, b),
             "设迎新文案": lambda: _set_welcome_field(chat, cfg, a, "text", b),
             "设迎新链接": lambda: _set_welcome_field(chat, cfg, a, "url", b),
         }[cmd]()
@@ -983,6 +984,7 @@ def _fix_remarks(bot, chat, scope) -> bool:
     skip_names = _admin_group_names(store.load())
     names = [n for n in names if n not in skip_names and n.rstrip(audit.DOG) not in skip_names]
     known = set(registry.load().get("groups", {}))
+    overrides = (store.load().get("remark_overrides") or {})
     reply(chat, f"扫到 {len(names)} 个群（已排除管理群），开始逐个核对备注"
                 f"{'（预览模式，只看不改）' if dry else ''}，大约 {max(1, len(names) * 3 // 60)} 分钟…")
 
@@ -1003,7 +1005,7 @@ def _fix_remarks(bot, chat, scope) -> bool:
                 time.sleep(0.4)
                 continue          # 截断名重复切到同一个群，不重复处理
             seen.add(real)
-            verdict, detail = audit.plan_remark(real, known)
+            verdict, detail = audit.plan_remark(real, known, overrides)
             if verdict == audit.FIX_APPLY and not dry:
                 ok, why = _do_set_remark(wx, real, detail)
                 if not ok:
@@ -1110,6 +1112,35 @@ def _format_invites(cfg) -> str:
         lines.append(f"— 本地（设拉群，{len(manual_kw)} 条，同名时优先）—")
         lines.extend(f"◾ {k} → {v}" for k, v in manual_kw.items())
     return "\n".join(lines)
+
+
+def _set_remark_override(chat, cfg, group_name, remark) -> bool:
+    """「设备注 <群名>|<备注>」：给某个群手工指定要打的备注，「修备注」照它打。
+
+    为什么需要：群名顶到 16 个汉字的群，加🐶必然超过 48 字节上限，硬打会被微信
+    截成垃圾（2026-08-03 打坏过两个）。这类只能人来定一个短备注，比如
+    「AI+社区：我们到底需要什么样的社区」→「AI+社区：我们到底需要什么样的🐶」。
+    留空则取消指定。"""
+    if not group_name:
+        reply(chat, "格式：设备注 <群名>|<备注>（备注留空=取消指定）")
+        return True
+    ov = cfg.setdefault("remark_overrides", {})
+    if not remark:
+        ov.pop(group_name, None)
+        store.save(cfg)
+        reply(chat, f"已取消「{group_name}」的指定备注，恢复按「群名🐶」打")
+        return True
+    nbytes = len(remark.encode("utf-8"))
+    if nbytes > audit.REMARK_MAX_BYTES:
+        reply(chat, f"「{remark}」有 {nbytes} 字节，超过微信备注上限 "
+                    f"{audit.REMARK_MAX_BYTES} 字节，打上去会被截成垃圾，换短点的")
+        return True
+    ov[group_name] = remark
+    store.save(cfg)
+    reply(chat, f"已指定：「{group_name}」的备注打成「{remark}」（{nbytes} 字节）。\n"
+                f"注意这个群现在如果还有旧备注，得先人工清空——SetGroupRemark 是追加。\n"
+                f"清完发「修备注 全部」。")
+    return True
 
 
 def _set_invite(chat, cfg, keyword, target) -> bool:

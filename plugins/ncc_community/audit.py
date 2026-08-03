@@ -93,7 +93,7 @@ def looks_spliced(name: str, min_len: int = 4) -> bool:
     return False
 
 
-def plan_remark(display, known_names=()) -> tuple[str, str]:
+def plan_remark(display, known_names=(), overrides=None) -> tuple[str, str]:
     """给一个群定"该怎么办"。纯函数。
 
     ★ 2026-08-03 实测把设计前提改掉了：`ChatInfo()` 返回的只有
@@ -113,12 +113,24 @@ def plan_remark(display, known_names=()) -> tuple[str, str]:
         return FIX_SKIP, "读不到会话名"
     known = set(known_names or ())
 
+    # 人工指定的备注（「设备注 <群名>|<备注>」）优先于一切规则。
+    # 用途：群名顶到 16 个汉字、加🐶必超 48 字节上限的群，只能人来定一个短备注。
+    ov = (overrides or {}).get(name)
+    if ov:
+        ov = ov.strip()
+        nb = len(ov.encode("utf-8"))
+        if nb > REMARK_MAX_BYTES:
+            return FIX_SKIP, f"指定的备注「{ov}」有 {nb} 字节，超过上限 {REMARK_MAX_BYTES}"
+        return FIX_APPLY, ov
+
     if name.endswith(DOG):
         base = name[:-len(DOG)].strip()
         if DOG in base:
             return FIX_CONFLICT, f"备注是追加出来的垃圾「{name}」，只能人工清空重打"
         if not base:
             return FIX_SKIP, "备注只有一个🐶，读不出群名"
+        if overrides and name in set((overrides or {}).values()):
+            return FIX_OK, name          # 已经是人工指定的那个备注了
         if base in known:
             return FIX_OK, name
         return FIX_UNKNOWN, (f"备注「{name}」剥掉🐶后「{base}」不在登记表里——"
@@ -141,7 +153,7 @@ def plan_remark(display, known_names=()) -> tuple[str, str]:
     if nbytes > REMARK_MAX_BYTES:
         return FIX_SKIP, (f"「{want}」有 {nbytes} 字节，超过微信备注上限 "
                           f"{REMARK_MAX_BYTES} 字节，硬打会被截成垃圾——"
-                          f"要么改短群名，要么这个群就不打🐶了")
+                          f"用「设备注 {name}|<短一点的备注🐶>」指定一个，或者这个群不打🐶")
     return FIX_APPLY, want
 
 
