@@ -69,6 +69,21 @@ FIX_FAILED = "fix_failed"      # 打了但没成/复核不过
 FIX_UNKNOWN = "fix_unknown"    # 有🐶备注但登记表里没这个名字（改名？错打？）
 
 
+def looks_spliced(name: str, min_len: int = 4) -> bool:
+    """显示名里有一段【重复出现】= 多半是备注被追加过，不是真群名。
+
+    SetGroupRemark 对已有备注是追加，所以重打同一个群会长成「名字名字」。
+    带🐶的那种一眼能看出来，早年打的不带🐶的就只能靠这个：现场
+    「【大理】春节串门一【大理】春节串」= 同一个群名的两段残片拼在一起，
+    而登记表里那个群叫「【大理】春节串门一起玩！」。
+    误报的代价只是跳过 + 报人工，所以宁可宽一点。"""
+    n = (name or "").strip()
+    for k in range(len(n) // 2, min_len - 1, -1):
+        if n[:k] in n[k:]:
+            return True
+    return False
+
+
 def plan_remark(display, known_names=()) -> tuple[str, str]:
     """给一个群定"该怎么办"。纯函数。
 
@@ -102,6 +117,10 @@ def plan_remark(display, known_names=()) -> tuple[str, str]:
 
     if DOG in name:
         return FIX_CONFLICT, f"备注是追加出来的垃圾「{name}」，只能人工清空重打"
+
+    if looks_spliced(name):
+        return FIX_CONFLICT, (f"「{name}」里有一段重复出现，多半是当年打的不带🐶的备注"
+                              f"被追加过，先人工看一眼、清掉再打")
 
     # 没设过群名的群，微信显示成成员名拼接（「松爸、大曹、睿南…」），
     # 这种"名字"会随成员变化，拿它当群名打备注、写进 Notion 都没意义
