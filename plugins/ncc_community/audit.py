@@ -59,6 +59,130 @@ def classify(expect_name: str, info, known_names) -> tuple[str, str]:
     return RENAMED, f"备注「{want}{DOG}」所在的群现名「{chat_name}」，登记表里没有这个名字"
 
 
+# ---------------------------------------------------------------- 全量扫描并修备注
+
+FIX_OK = "fix_ok"              # 备注已经是「真实群名🐶」，不用动
+FIX_APPLY = "fix_apply"        # 没有备注，可以直接打上
+FIX_CONFLICT = "fix_conflict"  # 已有别的备注 —— 只能人工清（SetGroupRemark 是追加）
+FIX_SKIP = "fix_skip"          # 切不过去 / 读不到真实群名，不动手
+FIX_FAILED = "fix_failed"      # 打了但没成/复核不过
+
+
+def plan_remark(chat_name, remark) -> tuple[str, str]:
+    """给一个群定"该怎么办"。纯函数。
+
+    判据只有一条：备注必须等于【当前窗口读到的真实群名 + 🐶】。
+    ★ 期望值取自 ChatInfo 的 chat_name，不取自我们手上那个名字——这样即便 ChatWith
+    切歪了，打上去的也只会是"那个群自己的正确备注"，不可能再造出一次错打
+    （2026-08-03 「肥肉测试1🐶」打到清迈群头上的根因就是期望值来自外部输入）。
+
+    "已有别的备注"没法自动改：SetGroupRemark 对已有备注是追加、空串也清不掉，
+    硬打只会变成「旧备注🐶新名🐶」。这类只报出来人工清。
+    """
+    name = (chat_name or "").strip()
+    rmk = (remark or "").strip()
+    if not name:
+        return FIX_SKIP, "读不到真实群名"
+    want = name + DOG
+    if rmk == want:
+        return FIX_OK, want
+    if not rmk:
+        return FIX_APPLY, want
+    return FIX_CONFLICT, f"现备注「{rmk}」，应为「{want}」"
+
+
+def extract_group_names(raw) -> list:
+    """从 GetAllRecentGroups() 的返回里抽出会话显示名。
+
+    文档只说 `List[Tuple]`，没说 tuple 里是什么，wxautox 又是编译发行的读不到源码，
+    所以对 tuple/list/str/对象都兜一手，取第一个非空字符串当显示名。
+    真实结构由管理群指令「扫群」实测确认（describe_raw）。
+    """
+    names, seen = [], set()
+    for item in raw or []:
+        name = ""
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, (tuple, list)):
+            name = next((str(x) for x in item if isinstance(x, str) and x.strip()), "")
+        elif isinstance(item, dict):
+            for k in ("name", "nickname", "chat_name", "who", "title"):
+                v = item.get(k)
+                if isinstance(v, str) and v.strip():
+                    name = v
+                    break
+        else:
+            for attr in ("name", "nickname", "chat_name", "who", "title"):
+                v = getattr(item, attr, None)
+                if isinstance(v, str) and v.strip():
+                    name = v
+                    break
+            if not name:
+                name = str(item)
+        name = name.strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def describe_raw(raw, sample: int = 5) -> str:
+    """把 GetAllRecentGroups() 的原始返回描述出来，用于实测确认结构。
+    只读不改，安全。"""
+    try:
+        n = len(raw)
+    except Exception:
+        return f"返回不可迭代：type={type(raw).__name__} repr={raw!r}"[:800]
+    lines = [f"GetAllRecentGroups 返回 {type(raw).__name__}，共 {n} 项。前 {min(sample, n)} 项："]
+    for item in list(raw)[:sample]:
+        t = type(item).__name__
+        extra = ""
+        if isinstance(item, (tuple, list)):
+            extra = f" len={len(item)} 元素类型={[type(x).__name__ for x in item]}"
+        lines.append(f"  · {t}{extra} → {item!r}"[:300])
+    lines.append(f"抽出的显示名（前 {sample} 个）：{extract_group_names(raw)[:sample]}")
+    return "\n".join(lines)
+
+
+def summarize_fix(results, dry: bool = False) -> str:
+    """把 [(群名, verdict, detail)] 汇总成发到管理群的报告。"""
+    b = {}
+    for name, verdict, detail in results:
+        b.setdefault(verdict, []).append((name, detail))
+
+    conflict = b.get(FIX_CONFLICT) or []
+    skip = b.get(FIX_SKIP) or []
+    failed = b.get(FIX_FAILED) or []
+    todo = b.get(FIX_APPLY) or []
+
+    head = "备注核对（预览，没动过微信）" if dry else "备注修复完成"
+    lines = [f"{head}：微信里共 {len(results)} 个群。",
+             f"  ✅ 本来就对：{len(b.get(FIX_OK, []))}",
+             f"  🔧 {'待打上' if dry else '这次打上'}：{len(todo)}"]
+    if failed:
+        lines.append(f"  ❌ 打失败：{len(failed)}")
+    if conflict:
+        lines.append(f"  ⚠️ 要人工处理：{len(conflict)}")
+    if skip:
+        lines.append(f"  ◽ 跳过：{len(skip)}")
+
+    if dry and todo:
+        lines.append("\n🔧 待打备注：")
+        lines.extend(f"  - {n} → {d}" for n, d in todo)
+    if conflict:
+        lines.append("\n⚠️ 这些群已有别的备注，我改不了——SetGroupRemark 对已有备注是"
+                     "【追加】、空串也清不掉，硬打只会变成「旧备注🐶新名🐶」。"
+                     "请在微信里手动清空这些群的备注，然后再发一次「修备注 全部」：")
+        lines.extend(f"  - {n}：{d}" for n, d in conflict)
+    if failed:
+        lines.append("\n❌ 打备注失败（多为切窗口没切稳，可以重跑）：")
+        lines.extend(f"  - {n}：{d}" for n, d in failed)
+    if skip:
+        lines.append("\n◽ 跳过的（切不过去或读不到真实群名）：")
+        lines.extend(f"  - {n}：{d}" for n, d in skip)
+    return "\n".join(lines)
+
+
 def summarize(results) -> str:
     """把 [(群名, verdict, detail)] 汇总成发到管理群的报告。"""
     buckets = {}
