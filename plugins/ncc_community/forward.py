@@ -113,10 +113,27 @@ def _switched(wx, who: str, exact: bool = False) -> bool:
     return False
 
 
-def _locate(bot, source, sig):
-    """（须在 MAIN_WINDOW_LOCK 内调用）滚动定位到 sig 对应消息，返回它当前可见的
-    新鲜元素或 None。ChatWith 回最新 → GetHistoryMessage 往上滚，匹配到本条签名就停，
-    视图停在它上面 → GetAllMessage 取此刻可见（有效）的同签名元素。"""
+def _after_collect_start(msgs):
+    """只保留本次收集起点（COLLECT_PROMPT）之后的消息。
+
+    定位靠签名，而签名对图片这类消息是【不唯一】的（wxautox 里图片消息的 content
+    固定就是「图片」，两张不同的图签名完全一样，只能靠"第几条"区分）。不截断的话，
+    更早那次转发留下的同款消息会把序号顶偏，第 2 张图定位到别的图上。
+    找不到起点就原样返回（退回旧行为，不比以前差）。"""
+    start = -1
+    for i, m in enumerate(msgs):
+        if str(getattr(m, "attr", "")) == "self" and PROMPT_MARK in str(getattr(m, "content", "")):
+            start = i
+    return msgs[start + 1:] if start >= 0 else msgs
+
+
+def _locate(bot, source, sig, occ=0):
+    """（须在 MAIN_WINDOW_LOCK 内调用）滚动定位到 sig 对应的【第 occ 条】消息，返回它
+    当前可见的新鲜元素或 None。ChatWith 回最新 → GetHistoryMessage 往上滚，匹配到本条
+    签名就停，视图停在它上面 → GetAllMessage 取此刻可见（有效）的同签名元素。
+    occ 是同签名消息里的序号（0 起）：连发两张图签名相同，只能按序号区分。
+    可见范围里凑不够 occ+1 条时【宁可返回 None】（报定位失败、不标记群），
+    也不退而求其次拿别的元素——那会把同一张图往 100 多个群里重复发一遍。"""
     STOP = _stop_sign()
     if not _switched(bot.wx, source):
         # 切不过去就别在别人的窗口里翻消息（ChatWith 静默失败，返回 falsy 不抛异常）
@@ -134,9 +151,11 @@ def _locate(bot, source, sig):
         bot.wx.GetHistoryMessage(n=120, callback=cb)
     except Exception:
         pass
-    for m in (bot.wx.GetAllMessage() or []):
-        if _sig(m) == sig:
-            return m
+    cands = [m for m in _after_collect_start(bot.wx.GetAllMessage() or []) if _sig(m) == sig]
+    if len(cands) > occ:
+        return cands[occ]
+    if cands:
+        log("WARNING", f"同签名消息可见 {len(cands)} 条，取不到第 {occ + 1} 条（{sig[0]}），本条判定位失败")
     return None
 
 
@@ -155,7 +174,7 @@ def _is_stale(err: str) -> bool:
     return any(h.lower() in e for h in _STALE_HINTS)
 
 
-def _forward_one_shot(cache_box, bot, source, sig, group, d) -> tuple[bool, str]:
+def _forward_one_shot(cache_box, bot, source, sig, occ, group, d) -> tuple[bool, str]:
     """把定位到的消息转发给【单个群】（走轻量的"发送给"对话框，不碰会卡死微信的
     "分别发送"多选框）。stale 才重定位重试；无结果/失败不重试（单群要么成要么就是没了）。
     返回 (成功, 错误)。"""
@@ -163,7 +182,7 @@ def _forward_one_shot(cache_box, bot, source, sig, group, d) -> tuple[bool, str]
     for _ in range(int(d["max_retries"])):
         with MAIN_WINDOW_LOCK:
             if cache_box[0] is None:
-                cache_box[0] = _locate(bot, source, sig)
+                cache_box[0] = _locate(bot, source, sig, occ)
             if cache_box[0] is None:
                 last = "视图中定位不到该消息"
             else:
@@ -186,8 +205,8 @@ def _forward_one_shot(cache_box, bot, source, sig, group, d) -> tuple[bool, str]
     return False, last
 
 
-def _forward_located_message(bot, source, sig, targets, d):
-    """把一条消息（按签名定位）【一个群一个群】转发。无结果的群记下来，其余照发。
+def _forward_located_message(bot, source, sig, occ, targets, d):
+    """把一条消息（按签名+序号定位）【一个群一个群】转发。无结果的群记下来，其余照发。
     每 batch_every 个群额外歇一会儿。返回 (成功群数, 无结果群列表, 其它失败[str])。"""
     cache_box = [None]
     ok = 0
@@ -196,13 +215,18 @@ def _forward_located_message(bot, source, sig, targets, d):
     for i, g in enumerate(targets):
         if i > 0 and i % int(d["batch_every"]) == 0:
             time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
-        success, err = _forward_one_shot(cache_box, bot, source, sig, g, d)
+        success, err = _forward_one_shot(cache_box, bot, source, sig, occ, g, d)
         if success:
             ok += 1
         elif "定位不到该消息" in err:
             failed.append(f"{g}: {err}")            # 源消息定位不到，非群的问题
+        elif _is_gone(err):
+            gone.append(g)                          # 明确"无结果/找不到" → 该群不可达
         else:
-            gone.append(g)                          # 单群转发无结果 → 该群不可达
+            # 超时、UI 异常这类说不清的错，只汇报不下结论：gone 会被 mark_unreachable
+            # 写进 registry（allow_forward=False），之后所有转发都跳过这个群，
+            # 没人去 Notion 核对就是永久漏发。宁可少标一个，别冤枉一个。
+            failed.append(f"{g}: {err}")
         time.sleep(random.uniform(d["group_min"], d["group_max"]))
 
     # 保护：整条一个群都没成功 → 判定是这条消息本身转不了，别冤枉群（不标记任何群不可达）
@@ -314,6 +338,15 @@ def _sig(msg):
     return (str(getattr(msg, "type", "")), str(getattr(msg, "content", ""))[:60])
 
 
+def _msg_uid(msg):
+    """消息在【同一份列表】里的唯一标识（wxautox Message 自带 id）。只用于去重，
+    不要求跨次调用稳定。取不到返回 None，调用方退回按签名去重。"""
+    uid = getattr(msg, "id", None)
+    if uid in (None, ""):
+        return None
+    return str(uid)
+
+
 def _deliver(task) -> dict:
     """先拿本次要转消息的【签名清单】(身份)，再【逐条】：滚动定位到该消息、取当下
     有效元素、转发给各批群。每条只在"可见"时才转，规避元素失效。按时序逐条处理。
@@ -329,21 +362,33 @@ def _deliver(task) -> dict:
     if not manifest:
         _worker_report(bot, admin, f"{REPLY_PREFIX} 没读到要转发的内容（收集起点可能丢失），请重新 ncc→1。")
         return {"ok": 0, "fail": 0, "dead": []}
-    sigs = []
-    seen = set()
-    for m in manifest:                 # 去重保序
+    # 去重保序。⚠️ 不能按签名去重：图片消息的 content 在 wxautox 里固定是「图片」，
+    # 连发两张图签名一模一样，按签名去重会把第二张吞掉（只转第一张，用户以为都发了）。
+    # 所以按消息 id 去重（同一份列表里 id 唯一），再给同签名的消息编序号 occ，
+    # 投递时按序号定位第几条。没有 id 的旧版/假对象退回按签名去重（旧行为）。
+    sigs = []                          # [(sig, occ)]
+    seen_uid, seen_sig, counter = set(), set(), {}
+    for m in manifest:
         s = _sig(m)
-        if s not in seen:
-            seen.add(s)
-            sigs.append(s)
+        uid = _msg_uid(m)
+        if uid is not None:
+            if uid in seen_uid:
+                continue
+            seen_uid.add(uid)
+        else:
+            if s in seen_sig:
+                continue
+            seen_sig.add(s)
+        sigs.append((s, counter.get(s, 0)))
+        counter[s] = counter.get(s, 0) + 1
     n_msgs = len(sigs)
 
     ok = fail = 0
     gone_all = set()          # 无结果/不可达的群（去重）
     fail_detail = []
 
-    for mi, sig in enumerate(sigs):
-        okc, gone, failed = _forward_located_message(bot, admin, sig, targets, d)
+    for mi, (sig, occ) in enumerate(sigs):
+        okc, gone, failed = _forward_located_message(bot, admin, sig, occ, targets, d)
         ok += okc
         fail += len(gone) + len(failed)
         gone_all.update(gone)

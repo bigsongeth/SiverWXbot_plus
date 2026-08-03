@@ -3,6 +3,7 @@
 全部用假对象，不碰微信、不碰真 Notion。"""
 from __future__ import annotations
 
+import itertools
 import os
 import shutil
 import tempfile
@@ -26,19 +27,41 @@ class FakeChat:
         return None
 
 
+class FakeWxResponse:
+    """wxautox 的 WxResponse：失败时 falsy，错误文案在 ["message"] 里。
+    （本文件以前漏了这个类，转发失败分支实际抛的是 NameError，
+    等于一直在测异常路径而不是真实返回值路径。）"""
+    def __init__(self, ok=True, message=""):
+        self.ok = ok
+        self.message = message
+
+    def __bool__(self):
+        return self.ok
+
+    def __getitem__(self, key):
+        return {"message": self.message}.get(key)
+
+
+_UID = itertools.count(1)
+
+
 class FakeMsg:
     def __init__(self, content="", mtype="text", attr="friend", sender="大松"):
         self.content = content
         self.type = mtype
         self.attr = attr
         self.sender = sender
+        self.id = f"m{next(_UID)}"   # 真实 wxautox Message 自带 id，去重靠它
         self.forwarded = []      # 记录被转发到的所有群（forward 收列表）
         self.forward_ok = True   # False 模拟整条转不了（视频号等）
         self.gone_set = set()    # 这些群"无结果"（被踢/解散）
+        self.raise_set = set()   # 这些群转发时抛异常（超时/UI 抽风这类说不清的错）
 
     def forward(self, target, **kw):
         # 单目标模型：一次转 1 个群（字符串）；容错也接受列表
         groups = target if isinstance(target, list) else [target]
+        if any(g in self.raise_set for g in groups):
+            raise RuntimeError("timeout: 等待发送窗口超时")
         if not self.forward_ok:
             return FakeWxResponse(False, "转发失败")
         if any(g in self.gone_set for g in groups):
@@ -75,6 +98,7 @@ class FakeWx:
         self.remarks = {}     # 群名 -> 备注（模拟“追加”行为验证幂等）
         self.sent = []
         self.timeline = []    # 源群消息时间线（_gather_content 现读这个）
+        self.visible = None   # 不为 None 时表示"此刻可见"只有这些（模拟滚出可见区）
         self.chat_types = {}  # 会话名 -> chat_type，缺省当群聊
 
     def ChatWith(self, who=None, exact=False):
@@ -101,7 +125,7 @@ class FakeWx:
         return msgs
 
     def GetAllMessage(self):
-        return list(self.timeline)
+        return list(self.timeline if self.visible is None else self.visible)
 
     def SetGroupRemark(self, value):
         # 模拟 wxautox 追加行为：若已有备注则追加（用于验证我们不会重复设置）
@@ -354,6 +378,49 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(stat["ok"], 2)
         self.assertEqual(sorted(m.forwarded), ["群0", "群2"])
         self.assertIn("无结果", " ".join(mm for _, mm in self.bot.wx.sent))
+
+    def test_deliver_two_images_both_sent(self):
+        # 两张图片签名一模一样（wxautox 里图片 content 固定是「图片」）：
+        # 按签名去重会吞掉第二张，必须按 id 去重 + 按序号定位
+        img1 = FakeMsg("图片", mtype="image")
+        img2 = FakeMsg("图片", mtype="image")
+        build_timeline(self.bot, img1, img2)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": ["群0", "群1"], "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["ok"], 4)                        # 2 条 × 2 群
+        self.assertEqual(sorted(img1.forwarded), ["群0", "群1"])
+        self.assertEqual(sorted(img2.forwarded), ["群0", "群1"])
+        self.assertIn("2 条", " ".join(m for _, m in self.bot.wx.sent))
+
+    def test_deliver_second_image_out_of_view_is_skipped_not_duplicated(self):
+        # 第二张图滚出可见区 → 宁可漏发并汇报，也不能把第一张再发一遍
+        img1 = FakeMsg("图片", mtype="image")
+        img2 = FakeMsg("图片", mtype="image")
+        build_timeline(self.bot, img1, img2)
+        self.bot.wx.visible = [_prompt(), img1]
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": ["群0", "群1"], "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(sorted(img1.forwarded), ["群0", "群1"])
+        self.assertEqual(img2.forwarded, [])
+        self.assertEqual(stat["gone"], [])                     # 不是群的问题，别标记
+        # 第 2 条一个群都没成 → 归到"整条转发失败"，汇报里看得见，不会悄悄少发
+        self.assertIn("第2条 整条转发失败", " ".join(m for _, m in self.bot.wx.sent))
+
+    def test_deliver_unknown_error_does_not_mark_group_unreachable(self):
+        # 超时/UI 抽风这类说不清的错：只汇报，不能写 registry 把群禁掉
+        seed_registry()
+        m = FakeMsg("素材", mtype="text")
+        m.raise_set = {"大理B群"}
+        build_timeline(self.bot, m)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": ["大理A群", "大理B群"], "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["gone"], [])
+        self.assertEqual(stat["ok"], 1)
+        self.assertTrue(registry.load()["groups"]["大理B群"]["allow_forward"])
+        self.assertIn("其它失败", " ".join(mm for _, mm in self.bot.wx.sent))
 
     def test_deliver_unforwardable_does_not_blame_groups(self):
         # 整条都转不了（视频号）→ 判定是消息问题，不冤枉任何群（gone 为空）
