@@ -807,5 +807,82 @@ class ApplyRemarkEndToEndTests(unittest.TestCase):
         self.assertTrue(registry.load()["groups"]["肥肉测试1"]["remark_applied"])
 
 
+class FixRemarkPlanTests(unittest.TestCase):
+    """「修备注」的判定：期望值就地取自当前窗口的真实群名。"""
+
+    def test_already_correct(self):
+        self.assertEqual(audit.plan_remark("大理群", "大理群🐶"),
+                         (audit.FIX_OK, "大理群🐶"))
+
+    def test_empty_remark_can_apply(self):
+        self.assertEqual(audit.plan_remark("大理群", ""),
+                         (audit.FIX_APPLY, "大理群🐶"))
+
+    def test_other_remark_is_conflict(self):
+        """已有别的备注只能人工清——SetGroupRemark 是追加，硬打会变成垃圾。"""
+        v, d = audit.plan_remark("泰国清迈旅居交流1群", "肥肉测试1🐶")
+        self.assertEqual(v, audit.FIX_CONFLICT)
+        self.assertIn("泰国清迈旅居交流1群🐶", d)
+
+    def test_appended_garbage_is_conflict(self):
+        v, _ = audit.plan_remark("肥肉测试1", "肥肉测试1🐶肥肉测试1🐶")
+        self.assertEqual(v, audit.FIX_CONFLICT)
+
+    def test_no_real_name_skips(self):
+        self.assertEqual(audit.plan_remark("", "随便")[0], audit.FIX_SKIP)
+
+    def test_expectation_never_comes_from_outside(self):
+        """核心回归：期望备注只由真实群名决定，跟"我们以为它是谁"无关。
+        所以切歪了顶多给另一个群打上它自己的正确备注，不会复现 A 打到 B 的错打。"""
+        _, want = audit.plan_remark("泰国清迈旅居交流1群", "")
+        self.assertEqual(want, "泰国清迈旅居交流1群🐶")
+
+
+class ExtractGroupNamesTests(unittest.TestCase):
+    """GetAllRecentGroups 的返回结构没有文档（编译发行），抽名字要能兜住各种形状。"""
+
+    def test_tuples(self):
+        self.assertEqual(audit.extract_group_names([("大理群", 3), ("黄山群", 5)]),
+                         ["大理群", "黄山群"])
+
+    def test_plain_strings(self):
+        self.assertEqual(audit.extract_group_names(["大理群"]), ["大理群"])
+
+    def test_dicts_and_objects(self):
+        class Obj:
+            name = "对象群"
+        self.assertEqual(audit.extract_group_names([{"name": "字典群"}, Obj()]),
+                         ["字典群", "对象群"])
+
+    def test_dedup_and_strip(self):
+        self.assertEqual(audit.extract_group_names([" 大理群 ", "大理群", ""]), ["大理群"])
+
+    def test_empty(self):
+        self.assertEqual(audit.extract_group_names(None), [])
+
+    def test_describe_raw_does_not_crash(self):
+        self.assertIn("共 2 项", audit.describe_raw([("a", 1), ("b", 2)]))
+
+
+class SummarizeFixTests(unittest.TestCase):
+    def test_conflicts_are_spelled_out_for_manual_work(self):
+        out = audit.summarize_fix([
+            ("A群", audit.FIX_OK, "A群🐶"),
+            ("B群", audit.FIX_APPLY, "B群🐶"),
+            ("C群", audit.FIX_CONFLICT, "现备注「野的🐶」，应为「C群🐶」"),
+            ("D群", audit.FIX_FAILED, "打完复核不通过"),
+            ("E群", audit.FIX_SKIP, "切不过去"),
+        ])
+        self.assertIn("共 5 个群", out)
+        self.assertIn("C群", out)
+        self.assertIn("手动清空", out)
+        self.assertIn("D群", out)
+
+    def test_dry_run_lists_todo(self):
+        out = audit.summarize_fix([("B群", audit.FIX_APPLY, "B群🐶")], dry=True)
+        self.assertIn("预览", out)
+        self.assertIn("B群 → B群🐶", out)
+
+
 if __name__ == "__main__":
     unittest.main()

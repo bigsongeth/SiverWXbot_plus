@@ -67,7 +67,9 @@ MAIN_MENU = (
     "0 👈 退出管理模式\n"
     "\n体检指令（直接发）：\n"
     "  检查群组 全部 —— 群还在不在（可达性）\n"
-    "  核对备注 全部 —— 🐶备注有没有打错群"
+    "  核对备注 全部 —— 🐶备注有没有打错群\n"
+    "  扫群 —— 微信里到底有多少个群\n"
+    "  修备注 预览 / 修备注 全部 —— 把每个群的备注修成「群名🐶」并回写 Notion"
 )
 
 COLLECT_PROMPT = (
@@ -637,12 +639,16 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain == "迎新列表":
         reply(chat, _format_welcomes(cfg)); return True
 
-    m = re.match(r"^(检查群组|核对备注|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    if plain in ("扫群", "扫描群列表"):
+        return _scan_groups(bot, chat)
+
+    m = re.match(r"^(检查群组|核对备注|修备注|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
             "检查群组": lambda: _check_groups(bot, chat, name),
             "核对备注": lambda: _audit_remarks(bot, chat, name),
+            "修备注": lambda: _fix_remarks(bot, chat, name),
             "开迎新": lambda: _toggle_welcome(chat, cfg, name, True),
             "关迎新": lambda: _toggle_welcome(chat, cfg, name, False),
             "删拉群": lambda: _delete_invite(chat, cfg, name),
@@ -791,6 +797,180 @@ def _audit_remarks(bot, chat, scope) -> bool:
         time.sleep(0.5)
     reply(chat, audit.summarize(results))
     return True
+
+
+def _scan_groups(bot, chat) -> bool:
+    """「扫群」：只调 GetAllRecentGroups 看一眼返回结构，不碰任何备注。
+
+    wxautox 是编译发行的，文档只写了 `List[Tuple]`、tuple 里是什么读不到源码，
+    所以先用这条只读指令把结构实测确认掉，再让「修备注」动手。"""
+    wx = getattr(bot, "wx", None)
+    reply(chat, "开始扫描微信里的所有群（要滑一遍会话列表），稍等…")
+    t0 = time.time()
+    try:
+        with MAIN_WINDOW_LOCK:
+            raw = wx.GetAllRecentGroups()
+    except Exception as e:
+        reply(chat, f"扫描失败：{e}")
+        log("ERROR", f"GetAllRecentGroups 失败：{e}")
+        return True
+    desc = audit.describe_raw(raw)
+    log("INFO", f"扫群耗时 {time.time() - t0:.1f}s\n{desc}")
+    reply(chat, f"耗时 {time.time() - t0:.1f} 秒。\n{desc}")
+    return True
+
+
+def _admin_group_names(cfg) -> set:
+    """不该打备注的群：管理群一旦有了备注，微信显示名（chat.who）就变成「群名🐶」，
+    而管理群判定是拿 who 跟配置里的名字直接比对的——打上去等于把指令入口关掉。"""
+    names = {(cfg or {}).get("admin_group"), store.DEFAULT_CONFIG.get("admin_group")}
+    return {n.strip() for n in names if isinstance(n, str) and n.strip()}
+
+
+def _fix_remarks(bot, chat, scope) -> bool:
+    """遍历【微信里实际存在的所有群】，把备注修成「真实群名🐶」，再回写 Notion。
+
+    跟「核对备注」的区别：那个从登记表出发（只查得到后台已知的群），这个从微信出发
+    （GetAllRecentGroups），能发现后台根本没有的群——discovery 是被动的（群里有人
+    说话才登记），一直沉默的群从来没进过后台。
+
+    ★ 安全性靠"期望值就地取材"：要打的备注 = 当前窗口 ChatInfo 读到的 chat_name + 🐶，
+    不是我们手上那个名字。切歪了顶多是"给另一个群打上它自己的正确备注"，不可能再
+    复现 2026-08-03 那种把 A 的备注打到 B 头上的错打。
+
+    改不了的只有一种：群已经有别的备注。SetGroupRemark 对已有备注是追加、空串也清不掉，
+    硬打只会变成「旧备注🐶新名🐶」，所以这类只报出来让人工清。
+
+    用法：修备注 预览（只看不改）/ 修备注 全部（真打）。"""
+    wx = getattr(bot, "wx", None)
+    dry = scope in ("预览", "看看", "dry")
+    if not dry and scope not in ("全部", "所有", "all"):
+        reply(chat, "用法：「修备注 预览」先看一遍要改什么，确认后发「修备注 全部」真打。")
+        return True
+
+    reply(chat, "开始扫描微信里的所有群（要滑一遍会话列表），稍等…")
+    try:
+        with MAIN_WINDOW_LOCK:
+            raw = wx.GetAllRecentGroups()
+    except Exception as e:
+        reply(chat, f"扫描群列表失败：{e}")
+        log("ERROR", f"GetAllRecentGroups 失败：{e}")
+        return True
+
+    names = audit.extract_group_names(raw)
+    if not names:
+        reply(chat, "没扫到任何群（GetAllRecentGroups 返回空）。先发「扫群」看看返回结构。")
+        return True
+
+    skip_names = _admin_group_names(store.load())
+    names = [n for n in names if n not in skip_names and n.rstrip(audit.DOG) not in skip_names]
+    reply(chat, f"扫到 {len(names)} 个群（已排除管理群），开始逐个核对备注"
+                f"{'（预览模式，只看不改）' if dry else ''}，大约 {max(1, len(names) * 3 // 60)} 分钟…")
+
+    results, done_names = [], []
+    for display in names:
+        with MAIN_WINDOW_LOCK:
+            info = _probe_remark(wx, display)
+            if info is None:
+                results.append((display, audit.FIX_SKIP, "切不过去"))
+                time.sleep(0.4)
+                continue
+            if str(info.get("chat_type") or "") != "group":
+                time.sleep(0.4)
+                continue          # 同名的私聊，不是群，不管
+            real = str(info.get("chat_name") or "").strip()
+            rmk = str(info.get("remark") or "").strip()
+            # 切歪了就别动手：显示名理应等于真实群名或备注之一
+            if real and display not in (real, rmk):
+                results.append((display, audit.FIX_SKIP,
+                                f"切过去落在「{real}」（备注「{rmk}」）上，名字对不上，没动"))
+                time.sleep(0.4)
+                continue
+            verdict, detail = audit.plan_remark(real, rmk)
+            if verdict == audit.FIX_APPLY and not dry:
+                ok, why = _do_set_remark(wx, real, detail)
+                if not ok:
+                    verdict, detail = audit.FIX_FAILED, why
+        results.append((real or display, verdict, detail))
+        if verdict in (audit.FIX_OK, audit.FIX_APPLY) and real:
+            done_names.append(real)
+        time.sleep(0.4)
+
+    msg = audit.summarize_fix(results, dry=dry)
+    if not dry and done_names:
+        msg += "\n\n" + _sync_names_to_notion(done_names)
+    reply(chat, msg)
+    log("INFO", f"修备注完成（dry={dry}）：{len(results)} 个群")
+    return True
+
+
+def _do_set_remark(wx, real_name, want_remark) -> tuple[bool, str]:
+    """打一个备注并回读复核。调用方须持有 MAIN_WINDOW_LOCK，且窗口已停在该群上。"""
+    from . import remark as remark_mod
+    ok, why = remark_mod.confirm_group_window(wx, real_name, expect_remark=want_remark)
+    if not ok:
+        return False, why
+    try:
+        r = wx.SetGroupRemark(want_remark)
+    except Exception as e:
+        log("ERROR", f"修备注 SetGroupRemark 抛异常 {real_name}: {e}")
+        return False, str(e)
+    if not remark_mod.wxresponse_ok(r):
+        return False, f"SetGroupRemark 返回 {r!r}"
+    ok2, why2 = remark_mod.verify_remark(wx, real_name, want_remark)
+    if not ok2:
+        log("WARNING", f"修备注复核不过 {real_name}: {why2}")
+        return False, f"打完复核不通过（{why2}）"
+    registry.mark_remark_applied(real_name, want_remark)
+    log("INFO", f"修备注：{real_name} -> {want_remark}")
+    return True, want_remark
+
+
+def _sync_names_to_notion(names) -> str:
+    """把这批群名同步进 Notion『群聊列表』，标题统一成「群名🐶」。
+
+    先一次性拉全表建索引再逐个比对，而不是每个群都 find_page_by_name——
+    后者一个群要打 1-2 次 API，100 多个群会被 Notion 限流拖到几分钟。"""
+    try:
+        from . import notion_sync as ns
+        rows = ns._query_all(ns.DB_GROUPS)
+    except Exception as e:
+        log("ERROR", f"Notion 回写跳过：{e}")
+        return f"Notion 同步跳过：{e}"
+
+    index = {}
+    for row in rows:
+        base, marked = ns._strip_dog(ns._title(row["properties"].get("群名")))
+        if base and base not in index:
+            index[base] = (row["id"], marked)
+
+    added = fixed = already = failed = 0
+    new_names = []
+    for name in names:
+        base, _ = ns._strip_dog(name)
+        if not base:
+            continue
+        hit = index.get(base)
+        try:
+            if hit and hit[1]:
+                already += 1
+            elif hit:
+                ns.update_title_dog(hit[0], base)
+                fixed += 1
+            else:
+                ns.push_discovery(base, with_dog=True)
+                added += 1
+                new_names.append(base)
+        except Exception as e:
+            failed += 1
+            log("WARNING", f"回写 Notion 失败 {base}: {e}")
+
+    out = [f"Notion『群聊列表』已更新：新增 {added} 行、补🐶 {fixed} 行、本来就对 {already} 行"
+           + (f"、失败 {failed} 行（见日志）" if failed else "")]
+    if new_names:
+        out.append("新增的群请去 Notion 里选分组、勾允许转发：")
+        out.extend(f"  - {n}" for n in new_names)
+    return "\n".join(out)
 
 
 # ------------------------------------------------------------------ 拉群 / 迎新（config.json）
