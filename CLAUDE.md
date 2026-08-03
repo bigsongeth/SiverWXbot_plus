@@ -265,8 +265,31 @@ if handled and checkin_reply:
   标题行、点不进去，+89px 才可编辑 —— 而 130 正好落在 89px，只剩 29px 余量。已改为按正文
   `DocumentControl` 的实时 rect 取中心。**注意这跟屏幕分辨率是否固定无关**：编辑器是独立窗口，
   拖一下边框或微信记住新尺寸就会翻车。
+- ★ **绝对不要另起进程发日报（2026-08-03 定）**：`sender.py` 开头那句"本模块在 bot 进程内、
+  由 schedule 主循环单线程调用，和 bot 其它 UI 操作串行"是**硬前提，不是描述**。独立进程会和
+  bot 每 3-5 秒的消息轮询抢微信主窗口 —— 实测 18:44：`18:44:57` 编辑器置前成功 →
+  `18:44:58` bot 的 `更新当前聊天窗口缓存信息` 把主窗口拉回来 → `18:45:00` 粘贴时
+  `点归属编辑器=False`，Ctrl+V 打在主窗口上，连败 3 次。
+  外部触发改走 `trigger.py`：mac-mini 通过 SSH 写一个标记文件
+  `C:\Users\Admin\ai_news\send_request.flag`，bot 在自己的 schedule 里每 10 秒消费一次
+  （标记超过 10 分钟当陈旧丢弃，避免 bot 没在跑时的请求隔几小时诈尸）。
+  结果仍写 `send_result.json`，格式与旧入口一致，mac-mini 那边的解析不用改。
+  **计划任务 `ai_news_send_now` 保留但只作人工应急**；跳板当初要的是"进入 session 2"，
+  而 bot 本来就在 session 2，写文件又不挑会话，所以它已无必要。
+- **失败自动重试**（`trigger.py`，2026-08-03 加）：原来一次不成整天放弃 —— 8/3 早上
+  07:04/07:05/09:30 三次全挂、当天断供，而 18:54 手动跑一次就过了，说明抢焦点故障是间歇性的。
+  现在失败后隔 15 分钟重试，最多 4 次（`RETRY_DELAY_MIN` / `RETRY_MAX`）。
+  重试**一律不带 force**，靠 `last_sent.txt` 防重兜底，不可能重复发群。
+  重试状态在内存里，整进程重启会丢（可接受，最多少发一次重试）。
+  单测：`PYTHONPATH=. python3 tests/test_ai_news_trigger.py`（21 个，纯 mock；
+  测试里要先 stub 掉 `wxautox4`/`win32*` 才能在 mac 上导入本插件）。
+- mac-mini 侧对应改动：`~/.hermes/scripts/ai_news_trigger_wechat.sh`（写标记而不是
+  `Start-ScheduledTask`）+ routine `~/.claude/scheduled-tasks/ai-daily-digest/SKILL.md`
+  第 5 步措辞。两者都留了 `.bak-20260803`。**这两个文件不在本版本库里**，改之前先备份。
 - 排查工具在 `plugins/ai_news_note/diag_note_*.py`（布局/键盘/剪贴板/落点四件套）+
   `verify_note_fix.py`（只建笔记不发送的回归验证），都跑在会话 2，见各自文件头。
+  另有 `win-shukong:C:\Users\Admin\ai_news\diag_fg.py`（前台焦点半程复现，只建笔记不发送，
+  配 InteractiveToken 计划任务跑在会话 2）。
   两个坑写在里面了：**UIA TextPattern 读笔记正文不可靠**（内容进去了还是读回占位符 `￼`，
   判定一律以 Ctrl+A/Ctrl+C 回读剪贴板为准）；**多个落点别在同一个编辑器里连着测**
   （前一个失败会把焦点搞脏，后一个跟着败，看起来像"键盘整条不通"）。

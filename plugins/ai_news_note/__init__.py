@@ -9,6 +9,7 @@
 """
 import importlib
 from . import config
+from . import trigger
 from .sender import send_daily_note, log
 
 
@@ -26,9 +27,17 @@ def register_daily_note(bot, schedule):
     # （核心默认只在 定时消息/定时朋友圈 开关打开时才 run_pending）
     bot._ai_news_note_enabled = True
     schedule.every().day.at(config.SEND_TIME).do(_job, bot).tag("ai_news_note")
-    log(f"已注册每日 AI 日报笔记任务：{config.SEND_TIME} -> {config.TARGET}")
+    # 外部触发 + 失败重试，都在主循环里跑（见 trigger.py 顶部：独立进程会和 bot 抢微信 UI）
+    schedule.every(10).seconds.do(_tick, bot).tag("ai_news_note")
+    log(f"已注册每日 AI 日报笔记任务：{config.SEND_TIME} -> {config.TARGET}"
+        f"（外部触发与失败重试已挂载）")
 
 
 def _job(bot):
-    """schedule 回调：跑一次发送。"""
-    return send_daily_note(bot)
+    """schedule 回调：每日定时跑一次发送（失败会自动安排重试）。"""
+    return trigger.start_day(bot, source="scheduled")
+
+
+def _tick(bot):
+    """schedule 回调：每 10 秒看一眼有没有 mac-mini 的发送请求 / 到点的重试。"""
+    return trigger.tick(bot)
