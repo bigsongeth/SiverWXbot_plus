@@ -127,6 +127,60 @@ def _find_global(pred):
 _TOPMOSTED = set()
 
 
+def _describe_hwnd(hwnd):
+    """把一个窗口画成一行可读信息，专供"抢不到前台"时留证据用。
+
+    2026-08-03 教训：那天连续三次卡在"抢不到前台焦点"（日志只有 `前台=False` 一行），
+    事后完全无法定位是谁占着前台 —— 等复现完事后再查，环境已经恢复正常了。
+    所以失败分支必须当场把前台窗口的 hwnd/类名/进程/标题/是否置顶写进日志。
+    本函数只读不写，任何异常都吞掉，绝不能因为记日志把发送流程搞挂。"""
+    if not hwnd:
+        return "hwnd=0（取不到前台窗口，多半是锁屏/会话断开）"
+    try:
+        cls = win32gui.GetClassName(hwnd)
+    except Exception:
+        cls = "?"
+    try:
+        title = win32gui.GetWindowText(hwnd) or ""
+    except Exception:
+        title = "?"
+    pname, pid = "?", 0
+    try:
+        pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+        h = win32api.OpenProcess(0x0410, False, pid)   # QUERY_INFORMATION|VM_READ
+        try:
+            pname = os.path.basename(win32process.GetModuleFileNameEx(h, 0))
+        finally:
+            win32api.CloseHandle(h)
+    except Exception:
+        pass
+    try:
+        topmost = bool(win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE) & win32con.WS_EX_TOPMOST)
+    except Exception:
+        topmost = None
+    ucls = ""
+    try:
+        # 微信窗口 Win32 视角是 Qt51514QWindowIcon，UIA 视角才是 mmui::XXX —— 两个都记上，
+        # 免得事后对不上号。笔记编辑器属于另一个进程 WeChatAppEx.exe，不是 Weixin.exe。
+        c = auto.ControlFromHandle(hwnd)
+        if c:
+            ucls = f" uia={c.ClassName!r}/{(c.Name or '')[:30]!r}"
+    except Exception:
+        pass
+    return (f"hwnd={hwnd} class={cls!r} proc={pname}(pid={pid}) "
+            f"title={title[:60]!r} topmost={topmost}{ucls}")
+
+
+def _log_fg(prefix):
+    """记录"此刻前台窗口是谁"。返回该 hwnd。"""
+    try:
+        fg = win32gui.GetForegroundWindow()
+    except Exception:
+        fg = 0
+    log(f"{prefix} 前台窗口 -> {_describe_hwnd(fg)}")
+    return fg
+
+
 def _force_foreground(hwnd):
     try:
         fg = win32gui.GetForegroundWindow()
@@ -156,9 +210,13 @@ def _force_foreground(hwnd):
     return win32gui.GetForegroundWindow() == hwnd
 
 
-def _raise_hwnd(hwnd):
+def _raise_hwnd(hwnd, tag=""):
     """把窗口抬到最上层并尽量抢到前台。返回是否拿到前台焦点（拿不到也还能点，
-    因为已经 topmost 了，点下去那一下会顺带激活它）。"""
+    因为已经 topmost 了，点下去那一下会顺带激活它）。
+
+    tag 只用于日志，标明这次是在抢哪个窗口（主窗口/笔记编辑器/聊天窗口…）。
+    每次抢失败都记一行"当时前台是谁"：连着三次的持有者如果是同一个窗口，
+    说明有别的程序稳稳占着前台；如果每次都不一样，说明在跟什么东西抢。"""
     try:
         if win32gui.IsIconic(hwnd):
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
@@ -169,23 +227,30 @@ def _raise_hwnd(hwnd):
     except Exception as e:
         log(f"置顶失败 hwnd={hwnd}: {e!r}")
     ok = False
-    for _ in range(3):
+    label = f"[{tag}]" if tag else ""
+    for i in range(3):
         if _force_foreground(hwnd):
             ok = True
             break
+        # 只在失败时记，正常路径不产生额外日志
+        try:
+            log(f"抢前台失败{label} 第 {i + 1}/3 次（目标 hwnd={hwnd}），"
+                f"被占着 -> {_describe_hwnd(win32gui.GetForegroundWindow())}")
+        except Exception:
+            pass
         time.sleep(0.4)
     time.sleep(0.5)
     return ok
 
 
-def _raise(win):
+def _raise(win, tag=""):
     """比 _raise_hwnd 多一步 uiautomation 的 SetActive —— 非前台进程调裸的
     SetForegroundWindow 常被系统拒（拒绝访问），SetActive 里那套激活手法更管用。"""
     try:
         win.SetActive()
     except Exception:
         pass
-    return _raise_hwnd(win.NativeWindowHandle)
+    return _raise_hwnd(win.NativeWindowHandle, tag)
 
 
 def _drop_topmost():
@@ -233,8 +298,12 @@ def _click(ctrl, hwnd, label=""):
     b = ctrl.BoundingRectangle
     cx, cy = (b.left + b.right) // 2, (b.top + b.bottom) // 2
     if not _owns_point(hwnd, cx, cy):
-        log(f"点击点被遮挡（{label} @{cx},{cy}），重新置前")
-        _raise_hwnd(hwnd)
+        try:
+            log(f"点击点被遮挡（{label} @{cx},{cy}），重新置前；"
+                f"挡在这一点上的是 -> {_describe_hwnd(win32gui.WindowFromPoint((int(cx), int(cy))))}")
+        except Exception:
+            log(f"点击点被遮挡（{label} @{cx},{cy}），重新置前")
+        _raise_hwnd(hwnd, f"点击:{label}")
         if not _owns_point(hwnd, cx, cy):
             if _invoke(ctrl):
                 log(f"改用 UIA Invoke 点击：{label}")
@@ -303,20 +372,58 @@ def _desktop_usable():
                    "去机器上跑 tscon <会话号> /dest:console 解锁后再发")
 
 
-def _close_update_windows():
-    """关掉微信"版本更新"弹窗（mmui::UpdateWindow）。它一旦弹出会挡住发送、
-    甚至让 bot 初始化崩溃。发送前先清掉。切记别让微信真升级（wxautox4 只支持到 4.1.9.35）。"""
-    closed = 0
+def _list_update_windows():
+    """当前所有微信"版本更新"弹窗的 hwnd 集合。"""
+    out = set()
     for w in list(auto.GetRootControl().GetChildren()):
         try:
             if w.ClassName == "mmui::UpdateWindow":
-                win32gui.PostMessage(w.NativeWindowHandle, win32con.WM_CLOSE, 0, 0)
-                closed += 1
+                out.add(w.NativeWindowHandle)
         except Exception:
             pass
-    if closed:
-        log(f"关闭了 {closed} 个微信更新弹窗")
-        time.sleep(1.5)
+    return out
+
+
+def _close_update_windows():
+    """关掉微信"版本更新"弹窗（mmui::UpdateWindow）。它一旦弹出会挡住发送、
+    甚至让 bot 初始化崩溃。发送前先清掉。切记别让微信真升级（wxautox4 只支持到 4.1.9.35）。
+
+    2026-08-03 加校验：原来只 PostMessage(WM_CLOSE) + 固定 sleep 1.5s 就走人，从不复查。
+    PostMessage 是异步的，弹窗完全可能没关掉（比如它自己弹了个确认框），而更新弹窗通常
+    置顶且持有前台 —— 一个没关掉的更新弹窗正好能解释那天"抢不到前台焦点"。
+    现在关完复查，还在就再关一次；两次都关不掉就把这些窗口画像写进日志留证据
+    （只记不拦：更新弹窗未必真挡路，为它中止整条发送反而更糟）。"""
+    first = _list_update_windows()
+    if not first:
+        return
+    for hwnd in first:
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+    log(f"关闭了 {len(first)} 个微信更新弹窗：{sorted(first)}")
+    time.sleep(1.5)
+
+    left = _list_update_windows()
+    if not left:
+        return
+    log(f"复查：还有 {len(left)} 个更新弹窗没关掉 {sorted(left)}，再关一次")
+    for hwnd in left:
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+    time.sleep(2.0)
+
+    left = _list_update_windows()
+    if left:
+        log(f"⚠ 更新弹窗关不掉（{len(left)} 个），它多半置顶且占着前台，"
+            f"后面抢焦点很可能失败：")
+        for hwnd in left:
+            log(f"    {_describe_hwnd(hwnd)}")
+        _log_fg("此刻")
+    else:
+        log("复查通过：更新弹窗已全部关掉")
 
 
 # ---------------- 步骤 ----------------
@@ -329,8 +436,12 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
     if not wx:
         return False, "主窗口未找到"
     hwnd = wx.NativeWindowHandle
-    got_fg = _raise(wx)
+    got_fg = _raise(wx, "主窗口")
     log(f"主窗口置前：前台={got_fg} rect={wx.BoundingRectangle}")
+    if not got_fg:
+        # 这一行是 2026-08-03 三次失败时唯一的线索，但当时没记"前台被谁占着"，
+        # 事后完全查不下去（等去复现，环境已经自己好了）。现在当场留证。
+        _log_fg("主窗口没抢到前台，此刻")
 
     fav = _find_in(wx, lambda c: c.ControlTypeName == "ButtonControl" and c.Name == "收藏")
     if not fav:
@@ -381,12 +492,21 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
         return False, "笔记编辑器未打开"
     r = note.BoundingRectangle
     nh = note.NativeWindowHandle
-    _raise_hwnd(nh)
+    _raise_hwnd(nh, "笔记编辑器")
     if win32gui.GetForegroundWindow() != nh:
         # 键盘走前台焦点：编辑器不在前台，Ctrl+V 会粘到别的窗口去，
         # 结果存出一条空笔记（或干脆不存），后面还会误发历史笔记。
-        _raise_hwnd(nh)
+        _log_fg(f"编辑器(hwnd={nh})第一次没拿到前台，此刻")
+        _raise_hwnd(nh, "笔记编辑器-重试")
         if win32gui.GetForegroundWindow() != nh:
+            # 中止前把现场记全：谁占着前台、编辑器自己什么状态、有没有更新弹窗挡着。
+            # 没有这几行，事后只剩一句"没拿到键盘焦点"，根因无从查起（8/3 就是这样）。
+            _log_fg(f"编辑器(hwnd={nh})两次都没拿到前台，中止；此刻")
+            log(f"    编辑器窗口自身 -> {_describe_hwnd(nh)}")
+            upd = _list_update_windows()
+            log(f"    当前微信更新弹窗={len(upd)} {sorted(upd)}")
+            for _h in upd:
+                log(f"      {_describe_hwnd(_h)}")
             win32gui.PostMessage(nh, win32con.WM_CLOSE, 0, 0)
             return False, "笔记编辑器没拿到键盘焦点，怕粘贴落空，已中止"
     # 粘贴 + 硬校验：点完正文，编辑器（Chromium）拿到输入焦点要时间，
@@ -452,14 +572,16 @@ def _open_target(target):
     """
     cw = _top("mmui::ChatSingleWindow", target)
     if cw:
-        _raise(cw)
+        if not _raise(cw, f"独立聊天窗口:{target}"):
+            _log_fg("独立聊天窗口没抢到前台，此刻")
         return True, cw, f"独立聊天窗口「{target}」"
 
     wx = _top("mmui::MainWindow")
     if not wx:
         return False, None, "主窗口未找到"
     hwnd = wx.NativeWindowHandle
-    _raise(wx)
+    if not _raise(wx, "主窗口(搜索目标)"):
+        _log_fg("主窗口没抢到前台，此刻")
 
     chat_tab = _find_in(wx, lambda c: c.ControlTypeName == "ButtonControl" and c.Name == "微信")
     if chat_tab:
@@ -479,6 +601,7 @@ def _open_target(target):
         _force_foreground(hwnd)
         time.sleep(0.5)
         if win32gui.GetForegroundWindow() != hwnd:
+            _log_fg(f"搜索框输入前主窗口(hwnd={hwnd})没拿到前台，中止；此刻")
             return False, None, "微信没拿到键盘焦点（被别的窗口占着），中止"
     _clip_text(target)
     auto.SendKeys("{Ctrl}a", waitTime=0.1)
@@ -518,8 +641,10 @@ def _open_target(target):
 def _send_favorite(win, title_kw):
     """在 win 这个聊天窗口点'发送收藏' -> 选中标题含 title_kw 的笔记 -> 点'发送'。"""
     hwnd = win.NativeWindowHandle
-    got_fg = _raise(win)
+    got_fg = _raise(win, "聊天窗口(发送收藏)")
     log(f"聊天窗口置前：前台={got_fg}")
+    if not got_fg:
+        _log_fg("聊天窗口没抢到前台，此刻")
     btn = _find_in(win, lambda c: c.ControlTypeName == "ButtonControl" and c.Name == "发送收藏")
     if not btn:
         return False, "'发送收藏'按钮未找到"
