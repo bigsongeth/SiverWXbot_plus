@@ -642,13 +642,15 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
             "检查群组": lambda: _check_groups(bot, chat, name),
             "核对备注": lambda: _audit_remarks(bot, chat, name),
             "修备注": lambda: _fix_remarks(bot, chat, name),
+            "看群": lambda: _inspect_chat(bot, chat, name),
+            "看会话": lambda: _inspect_sessions(bot, chat, name),
             "开迎新": lambda: _toggle_welcome(chat, cfg, name, True),
             "关迎新": lambda: _toggle_welcome(chat, cfg, name, False),
             "删拉群": lambda: _delete_invite(chat, cfg, name),
@@ -817,6 +819,63 @@ def _scan_groups(bot, chat) -> bool:
     desc = audit.describe_raw(raw)
     log("INFO", f"扫群耗时 {time.time() - t0:.1f}s\n{desc}")
     reply(chat, f"耗时 {time.time() - t0:.1f} 秒。\n{desc}")
+    return True
+
+
+def _inspect_chat(bot, chat, arg) -> bool:
+    """「看群 A|B」：切过去把 ChatInfo() 的完整返回打出来。只读，不改任何东西。
+
+    存在的理由：2026-08-03 「修备注 预览」实测发现 ChatInfo 的 chat_name 给的是
+    【当前窗口显示名】（群有备注时就是备注本身）、remark 字段一律空——
+    而 audit/remark 里那套"chat_name 是真实群名"的假设从来没被实测验证过。
+    要判断备注对不对，得先搞清楚真实群名到底能不能读到。"""
+    wx = getattr(bot, "wx", None)
+    names = [n.strip() for n in (arg or "").split("|") if n.strip()]
+    if not names:
+        reply(chat, "用法：看群 <群名>，多个用 | 分隔")
+        return True
+    out = []
+    for n in names:
+        with MAIN_WINDOW_LOCK:
+            switched = _switched(wx, n, exact=False)
+            info = None
+            if switched:
+                try:
+                    info = wx.ChatInfo()
+                except Exception as e:
+                    info = f"ChatInfo 异常：{e}"
+        out.append(f"「{n}」切群={switched}\n  {info!r}")
+        time.sleep(0.4)
+    reply(chat, "\n".join(out))
+    return True
+
+
+def _inspect_sessions(bot, chat, arg) -> bool:
+    """「看会话 N」：把 GetSession() 前 N 个 SessionElement 的属性全打出来。只读。
+    看看会话列表元素里有没有比 GetAllRecentGroups 更完整的信息
+    （后者的显示名会被截断到 16 字左右，长群名读回来是残的）。"""
+    wx = getattr(bot, "wx", None)
+    n = int(arg) if (arg or "").strip().isdigit() else 5
+    try:
+        with MAIN_WINDOW_LOCK:
+            sessions = wx.GetSession() or []
+    except Exception as e:
+        reply(chat, f"GetSession 失败：{e}")
+        return True
+    out = [f"GetSession 返回 {len(sessions)} 项，前 {min(n, len(sessions))} 项："]
+    for s in list(sessions)[:n]:
+        attrs = {}
+        for k in dir(s):
+            if k.startswith("_"):
+                continue
+            try:
+                v = getattr(s, k)
+            except Exception:
+                continue
+            if not callable(v):
+                attrs[k] = v
+        out.append(f"  · {type(s).__name__} {attrs!r}"[:400])
+    reply(chat, "\n".join(out))
     return True
 
 
