@@ -912,7 +912,7 @@ def _inspect_panel(bot, chat, arg) -> bool:
         except Exception as e:
             lines.append(f"读 wx 属性失败：{e}")
         box = None
-        for attr in ("chatbox", "_chatbox", "core", "_core", "chat_box"):
+        for attr in ("ChatBox", "chatbox", "_chatbox", "core", "_core", "chat_box"):
             box = getattr(wx, attr, None)
             if box is not None:
                 lines.append(f"chatbox 在 wx.{attr} = {type(box).__name__}")
