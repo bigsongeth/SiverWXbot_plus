@@ -3555,17 +3555,33 @@ class WXBot:
 
     def _build_split_prompt(self, base_prompt, max_chars, max_count):
         """将拆分格式要求注入到 prompt 前面，返回组合后的 prompt"""
-        return SPLIT_PROMPT_TEMPLATE.format(
+        prompt = SPLIT_PROMPT_TEMPLATE.format(
             max_chars=max_chars,
             max_count=max_count,
             base_prompt=base_prompt,
         )
+        # reply_shape plugin hook：补一条"每条都要有信息量"，别拿开场白/收尾邀请凑条数
+        try:
+            from plugins.reply_shape import augment_split_prompt
+            prompt = augment_split_prompt(prompt)
+        except Exception as _rs_err:
+            log(level="ERROR", message=f"reply_shape prompt hook error: {_rs_err}")
+        return prompt
 
     def _parse_split_reply(self, reply, max_count):
         """按 ||SPLIT|| 分隔符解析回复，过滤空白，截断到 max_count 条"""
         parts = [strip_leading_timestamp(p.strip()) for p in reply.split(SPLIT_SEPARATOR)]
         parts = [p for p in parts if p]
-        return parts[:max_count] if parts else [reply]
+        parts = parts[:max_count] if parts else [reply]
+        # reply_shape plugin hook：把过短的碎片并进相邻条（prompt 那层没生效时的兜底）。
+        # 群聊和私聊共用这个方法、单条字数上限却各配各的，取小的那个，两边都不会被撑破。
+        try:
+            from plugins.reply_shape import merge_thin_parts
+            limit = min(self.config.chat_split_max_chars, self.config.group_split_max_chars)
+            parts = merge_thin_parts(parts, limit)
+        except Exception as _rs_err:
+            log(level="ERROR", message=f"reply_shape merge hook error: {_rs_err}")
+        return parts
 
     def _clean_reply_for_send(self, reply):
         """按配置清洗即将发送给用户的 AI 回复。"""

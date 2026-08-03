@@ -32,6 +32,14 @@ _DEFAULT_CONFIG = {
         "API返回错误，请稍后再试",
         "[NO_REPLY]",
     ],
+    # 机器人自己说过的"我没有联网能力"——措辞每次都不一样，只能按子串丢。
+    # 现在非 NCC 话题走的是真有搜索能力的 grok，这类旧回答留在历史里会被照着复读。
+    "drop_assistant_substrings": [
+        "没法联网",
+        "没有联网",
+        "无法联网",
+        "不能联网",
+    ],
 }
 
 _WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日']
@@ -91,19 +99,69 @@ def filter_history(messages, extra_drop=None):
     drop = set(cfg.get('drop_assistant_contents') or [])
     if extra_drop:
         drop.update(x for x in extra_drop if x)
+    # 子串黑名单：措辞每次都不一样的，精确匹配抓不住，只能按关键片段丢。
+    drop_sub = [s for s in (cfg.get('drop_assistant_substrings') or []) if s]
+
+    def _bad(m, content):
+        """这条机器人发言该不该从历史里摘掉。"""
+        if content in drop:
+            return True
+        # 机器人自己说过的"我没法联网"。2026-08-03：松爸连问三次搜推特，肥肉每次都答
+        # "我这边没法联网"——查下来路由没错（确实走了有搜索能力的 grok），是历史里那几条
+        # 自我否定被模型当成行为范例照着复读（去掉历史再问，同一个模型立刻真搜并给出
+        # x.com 引用）。跟"在忙，我稍后回复您"是同一类病：assistant 历史里的错误回答
+        # 会教模型继续这么答。
+        return m.get('attr') == 'self' and any(s in content for s in drop_sub)
+
+    # 先扫一遍，记下"被判定为坏回复"的时刻。分段发送（||SPLIT||）拆出来的多条消息
+    # 共享同一个 time，而关键词往往只落在其中一条上——只丢那条的话，剩下的半句
+    # （"你把链接贴过来，我帮你提炼"）照样留在历史里当行为范例，模型接着照做。
+    # 所以同一时刻的机器人发言要连坐一起丢。
+    bad_times = set()
+    for m in messages:
+        if not isinstance(m, dict) or m.get('attr') != 'self':
+            continue
+        content = (m.get('content') or '').strip()
+        t = m.get('time')
+        if content and t and _bad(m, content):
+            bad_times.add(t)
+
+    def _is_bad_self(m):
+        if not isinstance(m, dict) or m.get('attr') != 'self':
+            return False
+        content = (m.get('content') or '').strip()
+        return bool(content) and (_bad(m, content) or m.get('time') in bad_times)
+
+    # 整轮丢：坏回复对应的用户提问也一起摘掉。只删机器人那半边会留下孤零零的重复提问，
+    # 模型看到"同一个问题问了三遍都没人应"反而判定不用接话——实测直接回了 [NO_REPLY]，
+    # 静默不回复比答错更糟。
+    drop_idx = set()
+    for i, m in enumerate(messages):
+        if not _is_bad_self(m):
+            continue
+        drop_idx.add(i)
+        for j in range(i - 1, -1, -1):       # 往前收同一轮的提问
+            prev = messages[j]
+            if not isinstance(prev, dict):
+                break
+            if prev.get('attr') == 'system' or prev.get('type') == 'time':
+                continue                      # 时间戳条目横在中间，跳过接着往前
+            if prev.get('attr') == 'self':
+                break                         # 碰到上一轮的回复，这一轮到头了
+            drop_idx.add(j)
 
     kept = []
-    for m in messages:
-        if not isinstance(m, dict):
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict) or i in drop_idx:
             continue
         content = (m.get('content') or '').strip()
         if not content:
             continue
-        # 1. 系统时间戳条目（type=time / attr=system），纯噪音
+        # 系统时间戳条目（type=time / attr=system），纯噪音
         if m.get('attr') == 'system' or m.get('type') == 'time':
             continue
-        # 2/3. 系统兜底文案与 [NO_REPLY] 标记，不该作为模型的"过往发言"
-        if content in drop:
+        # 兜底文案、[NO_REPLY]、自称没联网
+        if _bad(m, content):
             continue
         kept.append(m)
     return kept

@@ -43,6 +43,52 @@ class TestPreamble(unittest.TestCase):
 
 
 class TestFilterHistory(unittest.TestCase):
+    # 2026-08-03：松爸连问三次"搜一下推特"，肥肉每次都答"我这边没法联网"。
+    # 路由是对的（确实走了有搜索能力的 grok），病根是历史里那几条自我否定被模型
+    # 当成行为范例照着复读——去掉它们再问，同一个模型立刻真搜并给出 x.com 引用。
+    _松爸历史 = [
+        {"time": "2026/08/03 02:45:39", "type": "text", "attr": "friend",
+         "sender": "松爸", "content": "你能搜索一下推特上 DeepSeek 的评价吗？"},
+        {"time": "2026/08/03 02:46:06", "type": "text", "attr": "self",
+         "sender": "self", "content": "我这边没法联网，也看不到推特/X，别让我硬编 😂"},
+        {"time": "2026/08/03 02:46:06", "type": "text", "attr": "self",
+         "sender": "self", "content": "你把链接、截图或几条推文贴过来，我可以帮你提炼。"},
+        {"time": "2026/08/03 02:50:00", "type": "text", "attr": "friend",
+         "sender": "松爸", "content": "NCC 谁是主理人？"},
+        {"time": "2026/08/03 02:50:10", "type": "text", "attr": "self",
+         "sender": "self", "content": "主理人是大曹，微信 ShariCao。"},
+    ]
+
+    def test_丢掉机器人自称没联网的历史(self):
+        out = filter_history(self._松爸历史)
+        self.assertNotIn('没法联网', ''.join(m['content'] for m in out))
+
+    def test_分段回复的另一半按同一时刻连坐(self):
+        """||SPLIT|| 拆出来的多条共享同一个 time，关键词只落在其中一条上。
+        只丢那条的话，"你把链接贴过来"照样留在历史里当行为范例。"""
+        out = filter_history(self._松爸历史)
+        self.assertNotIn('贴过来', ''.join(m['content'] for m in out))
+
+    def test_坏回复对应的用户提问一起丢(self):
+        """只删机器人那半边会留下孤零零的提问，模型看到"问了没人应"会判定不用接话
+        （实测直接回 [NO_REPLY]，静默不回复比答错更糟）。"""
+        out = filter_history(self._松爸历史)
+        self.assertNotIn('搜索一下推特', ''.join(m['content'] for m in out))
+
+    def test_连坐不误伤无关轮次(self):
+        """同一份历史里正常的那轮（问主理人）必须原样保留。"""
+        out = filter_history(self._松爸历史)
+        joined = ''.join(m['content'] for m in out)
+        self.assertIn('NCC 谁是主理人', joined)
+        self.assertIn('ShariCao', joined)
+        self.assertEqual(len(out), 2)
+
+    def test_用户说的没法联网不被丢(self):
+        """子串规则只管机器人自己的发言——用户问"你是不是没法联网"得留着。"""
+        msgs = [{"time": "2026/08/03 02:45:39", "type": "text", "attr": "friend",
+                 "sender": "松爸", "content": "你是不是没法联网啊？"}]
+        self.assertEqual(len(filter_history(msgs)), 1)
+
     def test_丢掉系统时间戳条目(self):
         msgs = [
             {"time": "2026/07/30 02:06:27", "type": "time", "attr": "system",
