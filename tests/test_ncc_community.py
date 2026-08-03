@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import unittest
 
-from plugins.ncc_community import store, forward, invite, registry, welcome, notion_sync, audit
+from plugins.ncc_community import store, forward, invite, registry, welcome, notion_sync, audit, remark
 from plugins.ncc_community import handle_friend_message, handle_self_message, handle_system_message
 from plugins.ncc_community.common import REPLY_PREFIX
 
@@ -664,6 +664,147 @@ class SelectGroupsTests(unittest.TestCase):
 
     def test_unknown_scope_returns_none(self):
         self.assertIsNone(forward._select_groups(self.DATA, "不存在的分组"))
+
+
+
+# ---------------------------------------------------------------- 打备注前后的两道校验
+
+class FakeRemarkWx:
+    """按"当前窗口"返回 ChatInfo；SetGroupRemark 按 wxautox 的真实行为【追加】。"""
+
+    def __init__(self, world, cur=None):
+        self.world = world      # {会话键: {"chat_name":.., "remark":.., "chat_type":..}}
+        self.cur = cur
+        self.remark_calls = []
+
+    def ChatWith(self, who=None, exact=False):
+        # 模糊搜索：先按群名精确找，再按【子串】命中备注——微信就是这个行为，
+        # 也正是错打的入口：搜「肥肉测试1」会命中备注「肥肉测试1🐶」的那个群
+        for key, info in self.world.items():
+            if info.get("chat_name") == who:
+                self.cur = key
+                return True
+        for key, info in self.world.items():
+            if who and who in (info.get("remark") or ""):
+                self.cur = key
+                return True
+        return False
+
+    def ChatInfo(self):
+        return self.world.get(self.cur)
+
+    def SetGroupRemark(self, remark):
+        self.remark_calls.append((self.cur, remark))
+        info = self.world[self.cur]
+        info["remark"] = (info.get("remark") or "") + remark   # 追加，不是替换
+        return True
+
+
+class ConfirmBeforeRemarkTests(unittest.TestCase):
+    """打备注前的复核：群名和备注【两边都要对得上】。"""
+
+    def test_rejects_misapplied_window(self):
+        """核心回归：备注已被错打到清迈群，再给肥肉测试1打备注时不能放行。
+
+        旧判据 `want in (name.rstrip(DOG), rmk.rstrip(DOG))` 在这里会返回 True——
+        rmk 剥掉🐶恰好等于目标群名，等于让错误替自己背书，于是又追加打一次。"""
+        wx = FakeRemarkWx({"清迈": {"chat_type": "group",
+                                    "chat_name": "泰国清迈旅居交流1群",
+                                    "remark": "肥肉测试1🐶"}}, cur="清迈")
+        ok, why = remark.confirm_group_window(wx, "肥肉测试1")
+        self.assertFalse(ok)
+        self.assertIn("错打", why)
+        self.assertIn("泰国清迈旅居交流1群", why)
+
+    def test_accepts_clean_target_group(self):
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试1", "remark": ""}}, cur="a")
+        self.assertTrue(remark.confirm_group_window(wx, "肥肉测试1")[0])
+
+    def test_accepts_group_already_having_exact_target_remark(self):
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试1",
+                                 "remark": "肥肉测试1🐶"}}, cur="a")
+        self.assertTrue(remark.confirm_group_window(wx, "肥肉测试1")[0])
+
+    def test_rejects_group_with_other_remark(self):
+        """群名对上了，但它已经有别的备注——再打会追加成垃圾。"""
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试1",
+                                 "remark": "别的备注🐶"}}, cur="a")
+        ok, why = remark.confirm_group_window(wx, "肥肉测试1")
+        self.assertFalse(ok)
+        self.assertIn("追加", why)
+
+    def test_rejects_similar_group_name(self):
+        """模糊搜索命中名字相近的另一个群。"""
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试12", "remark": ""}}, cur="a")
+        self.assertFalse(remark.confirm_group_window(wx, "肥肉测试1")[0])
+
+    def test_rejects_unreadable_real_name(self):
+        """读不到真实群名就不动手——没有它无从判断切到的是谁。"""
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "", "remark": "肥肉测试1🐶"}}, cur="a")
+        self.assertFalse(remark.confirm_group_window(wx, "肥肉测试1")[0])
+
+    def test_rejects_non_group(self):
+        wx = FakeRemarkWx({"a": {"chat_type": "friend", "chat_name": "松爸", "remark": ""}}, cur="a")
+        self.assertFalse(remark.confirm_group_window(wx, "肥肉测试1")[0])
+
+
+class VerifyAfterRemarkTests(unittest.TestCase):
+    """打完之后的回读复核：SetGroupRemark 的返回值不可信（None 都算成功）。"""
+
+    def test_passes_when_remark_landed(self):
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试1",
+                                 "remark": "肥肉测试1🐶"}}, cur="a")
+        self.assertTrue(remark.verify_remark(wx, "肥肉测试1", "肥肉测试1🐶")[0])
+
+    def test_fails_when_remark_appended(self):
+        """追加坑的现场：回读发现备注是拼接出来的，不能记进登记表。"""
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试1",
+                                 "remark": "旧备注🐶肥肉测试1🐶"}}, cur="a")
+        ok, why = remark.verify_remark(wx, "肥肉测试1", "肥肉测试1🐶")
+        self.assertFalse(ok)
+        self.assertIn("回读备注", why)
+
+    def test_fails_when_landed_on_another_group(self):
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "泰国清迈旅居交流1群",
+                                 "remark": "肥肉测试1🐶"}}, cur="a")
+        self.assertFalse(remark.verify_remark(wx, "肥肉测试1", "肥肉测试1🐶")[0])
+
+
+class ApplyRemarkEndToEndTests(unittest.TestCase):
+    """整条 apply_remark 链路：错打场景下必须【一次都不写】。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="ncc_apply_")
+        self._d, self._p = registry.DATA_DIR, registry.REGISTRY_PATH
+        registry.DATA_DIR = self.tmpdir
+        registry.REGISTRY_PATH = os.path.join(self.tmpdir, "registry.json")
+        registry.save({"groupings": {}, "invite_keywords": {}, "groups": {
+            "肥肉测试1": {"name": "肥肉测试1", "remark": "肥肉测试1🐶",
+                          "remark_applied": False, "notion_page_id": "p1"},
+        }})
+
+    def tearDown(self):
+        registry.DATA_DIR, registry.REGISTRY_PATH = self._d, self._p
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_does_not_write_when_remark_already_misapplied_elsewhere(self):
+        """真群不在会话里、备注却挂在清迈群上：ChatWith 会命中备注切到清迈群。
+        必须拒绝，且【绝不能】调用 SetGroupRemark。"""
+        wx = FakeRemarkWx({"清迈": {"chat_type": "group",
+                                    "chat_name": "泰国清迈旅居交流1群",
+                                    "remark": "肥肉测试1🐶"}})
+        ok, info = remark.apply_remark(wx, "肥肉测试1")
+        self.assertFalse(ok)
+        self.assertEqual(wx.remark_calls, [])          # 一次都没写
+        self.assertIn("错打", info)
+        self.assertFalse(registry.load()["groups"]["肥肉测试1"]["remark_applied"])
+
+    def test_writes_and_marks_on_clean_group(self):
+        wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "肥肉测试1", "remark": ""}})
+        ok, info = remark.apply_remark(wx, "肥肉测试1")
+        self.assertTrue(ok)
+        self.assertEqual(wx.remark_calls, [("a", "肥肉测试1🐶")])
+        self.assertTrue(registry.load()["groups"]["肥肉测试1"]["remark_applied"])
 
 
 if __name__ == "__main__":
