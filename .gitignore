@@ -57,6 +57,8 @@ plugins/wechat_checkin/data/
 plugins/wechat_checkin/imports/
 # ncc_community / ncc_kb：群内指令实时写盘的运行配置（见 CLAUDE.md 3.6 / 3.9）
 plugins/ncc_community/data/*.json
+# 后台任务触发器的请求/结果（运行时产物，见 plugins/ncc_community/task_runner.py）
+plugins/ncc_community/data/task_*.txt
 plugins/ncc_kb/data/
 # ai_news_note：抓取数据与已发送标记
 plugins/ai_news_note/data/

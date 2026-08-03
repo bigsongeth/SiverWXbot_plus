@@ -2658,6 +2658,14 @@ class WXBot:
         except Exception as e:
             log(level="ERROR", message=f"ai_news_note 注册失败：{e}")
 
+        # ncc_community 插件 hook：后台任务触发器（写 data/task_request.txt 即在 bot 进程内
+        # 执行一条管理指令）。微信操作必须在本进程内跑，独立进程会抢主窗口。
+        try:
+            from plugins.ncc_community.task_runner import register as _register_ncc_task
+            _register_ncc_task(self, schedule)
+        except Exception as e:
+            log(level="ERROR", message=f"ncc_community 后台任务触发器注册失败：{e}")
+
         log(message="监听器初始化完成")
 
     # ----------------------------------------------------------
@@ -5165,7 +5173,8 @@ class WXBot:
 
                 # ---- 定时任务执行（定时消息 / 定时朋友圈 / ai_news_note 日报）----
                 if (self.config.scheduled_msg_switch or self.config.scheduled_moments_switch
-                        or getattr(self, '_ai_news_note_enabled', False)):
+                        or getattr(self, '_ai_news_note_enabled', False)
+                        or getattr(self, '_ncc_task_runner_enabled', False)):
                     schedule.run_pending()
 
                 # ---- 随机定时朋友圈模块 ----

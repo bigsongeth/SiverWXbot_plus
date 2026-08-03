@@ -6,9 +6,11 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
-from plugins.ncc_community import store, forward, invite, registry, welcome, notion_sync, audit, remark
+from plugins.ncc_community import (store, forward, invite, registry, welcome, notion_sync,
+                                   audit, remark, task_runner)
 from plugins.ncc_community import handle_friend_message, handle_self_message, handle_system_message
 from plugins.ncc_community.common import REPLY_PREFIX
 
@@ -882,6 +884,69 @@ class SummarizeFixTests(unittest.TestCase):
         out = audit.summarize_fix([("B群", audit.FIX_APPLY, "B群🐶")], dry=True)
         self.assertIn("预览", out)
         self.assertIn("B群 → B群🐶", out)
+
+
+class TaskRunnerTests(unittest.TestCase):
+    """后台任务触发器：外部写一行指令，bot 进程内执行，回复落到结果文件。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="ncc_task_")
+        self._req, self._res = task_runner.REQUEST_PATH, task_runner.RESULT_PATH
+        task_runner.REQUEST_PATH = os.path.join(self.tmpdir, "task_request.txt")
+        task_runner.RESULT_PATH = os.path.join(self.tmpdir, "task_result.txt")
+
+    def tearDown(self):
+        task_runner.REQUEST_PATH, task_runner.RESULT_PATH = self._req, self._res
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _write(self, text, age=0.0):
+        with open(task_runner.REQUEST_PATH, "w", encoding="utf-8") as f:
+            f.write(text)
+        if age:
+            old = time.time() - age
+            os.utime(task_runner.REQUEST_PATH, (old, old))
+
+    def test_request_is_consumed_and_deleted(self):
+        """先删再执行：崩了也不会开机重放。"""
+        self._write("扫群")
+        text, age = task_runner._read_request()
+        self.assertEqual(text, "扫群")
+        self.assertLess(age, 5)
+        self.assertFalse(os.path.exists(task_runner.REQUEST_PATH))
+
+    def test_no_request_is_noop(self):
+        self.assertEqual(task_runner._read_request(), (None, 0.0))
+
+    def test_stale_request_is_dropped(self):
+        """bot 没在跑时攒下的请求不能隔几小时诈尸。"""
+        self._write("修备注 全部", age=task_runner.STALE_SECONDS + 60)
+        task_runner.tick(object())
+        self.assertFalse(os.path.exists(task_runner.RESULT_PATH))
+
+    def test_file_sink_collects_replies(self):
+        sink = task_runner.FileSink(task_runner.RESULT_PATH)
+        sink.SendMsg(msg="第一条")
+        sink.SendMsg(msg="第二条")
+        with open(task_runner.RESULT_PATH, encoding="utf-8") as f:
+            out = f.read()
+        self.assertIn("第一条", out)
+        self.assertIn("第二条", out)
+
+    def test_unknown_command_is_reported_not_swallowed(self):
+        task_runner._run(FakeBot(), "这不是指令")
+        with open(task_runner.RESULT_PATH, encoding="utf-8") as f:
+            out = f.read()
+        self.assertIn("不认识的指令", out)
+        self.assertIn("任务结束", out)
+
+    def test_runs_a_real_direct_command(self):
+        """跑一条不碰微信的直接指令，验证 forward 的指令层原样复用。"""
+        task_runner._run(FakeBot(), "分组列表")
+        with open(task_runner.RESULT_PATH, encoding="utf-8") as f:
+            out = f.read()
+        self.assertIn("=== 后台任务「分组列表」开始", out)
+        self.assertIn("任务结束", out)
+        self.assertNotIn("不认识的指令", out)
 
 
 if __name__ == "__main__":
