@@ -161,13 +161,29 @@ if handled and checkin_reply:
   的真实群名比对。切到的群【也在登记表里】= 两个群身份串了，判错打；不在册则多半只是改名。
   **反过来按群名寻址是查不出的**——错打时登记表往往还停在 `remark_applied=False`
   （切歪了这笔没记成），按群名切到的是真群、一切正常，野备注完全隐形。
+- ★★ **打备注的复核曾经放行错打，而且越重试错得越深（2026-08-03 根因）**：
+  `confirm_group_window` 旧判据是 `want in (name, rmk) or want in (name.rstrip(DOG),
+  rmk.rstrip(DOG))`——群名【或】备注任一匹配就放行。**这是循环论证：备注是我们自己
+  打上去的，拿它确认"这是不是目标群"，等于让错误替自己背书。**
+  事故链：某次切群歪了 →「肥肉测试1🐶」落在清迈群头上 → 之后再给「肥肉测试1」打备注，
+  `ChatWith` 模糊搜索是**子串匹配**，命中清迈群那个错备注、切过去 → `rmk.rstrip(DOG)`
+  恰好等于目标群名 → 放行 → `SetGroupRemark` **追加** →「肥肉测试1🐶肥肉测试1🐶」→
+  下次重试回到第二步。而登记表那笔一直没记成（`remark_applied` 至今 False），
+  **从后台完全看不出来**。
+  现在：真实群名必须**严格相等**（备注只用于诊断错打、绝不用于放行）、读不到真实群名
+  一律拒绝、目标群已有别的备注也拒绝。**写任何"先切窗口再改东西"的代码，
+  判据只能用那个东西的【身份】（真实群名），不能用你自己将要写进去的值。**
+- **打完要回读复核**（`remark.verify_remark`）：原来只看 `SetGroupRemark` 的返回值，
+  而 `wxresponse_ok` 连 `None` 都判成功，等于几乎不设防。备注不可逆，登记表一旦记错
+  就再也对不上微信——复核不过就不 mark，留给批量指令重来。`apply_remark` 和
+  `batch._apply_one` 两条路径都接了这两道，batch 的回读在同一把锁里做。
 - ⚠️ **打错的备注只能人工清**：`SetGroupRemark` 对已有备注是【追加】、空串也清不掉。
   在微信里手动清空后，把登记表该群的 `remark_applied` 复位再重打。
 - ⚠️ `remark_applied=True` 有两个来源：本地真打成功过，**或 Notion 标题带🐶**
   （`upsert_from_notion` 的兜底，为的是本地 registry 重置后能恢复）。所以**人在 Notion 里
   手动敲一个🐶上去，会让登记表误以为微信已打备注**，寻址用「群名🐶」而微信里根本没这备注。
   要加🐶请走「批量打🐶」指令，别手敲。
-- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（54 个，纯 mock 不碰微信）。
+- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（66 个，纯 mock 不碰微信）。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
 知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），469 篇公众号文章 2175 块，
