@@ -64,31 +64,51 @@ def classify(expect_name: str, info, known_names) -> tuple[str, str]:
 FIX_OK = "fix_ok"              # 备注已经是「真实群名🐶」，不用动
 FIX_APPLY = "fix_apply"        # 没有备注，可以直接打上
 FIX_CONFLICT = "fix_conflict"  # 已有别的备注 —— 只能人工清（SetGroupRemark 是追加）
-FIX_SKIP = "fix_skip"          # 切不过去 / 读不到真实群名，不动手
+FIX_SKIP = "fix_skip"          # 切不过去 / 读不到会话名 / 没群名的群，不动手
 FIX_FAILED = "fix_failed"      # 打了但没成/复核不过
+FIX_UNKNOWN = "fix_unknown"    # 有🐶备注但登记表里没这个名字（改名？错打？）
 
 
-def plan_remark(chat_name, remark) -> tuple[str, str]:
+def plan_remark(display, known_names=()) -> tuple[str, str]:
     """给一个群定"该怎么办"。纯函数。
 
-    判据只有一条：备注必须等于【当前窗口读到的真实群名 + 🐶】。
-    ★ 期望值取自 ChatInfo 的 chat_name，不取自我们手上那个名字——这样即便 ChatWith
-    切歪了，打上去的也只会是"那个群自己的正确备注"，不可能再造出一次错打
-    （2026-08-03 「肥肉测试1🐶」打到清迈群头上的根因就是期望值来自外部输入）。
+    ★ 2026-08-03 实测把设计前提改掉了：`ChatInfo()` 返回的只有
+    `{'chat_type', 'chat_name', 'group_member_count'}` —— **根本没有 remark 字段**，
+    而 `chat_name` 给的是【当前窗口显示名】：群一旦有备注，显示名就是备注本身。
+    也就是说**微信侧根本读不到"真实群名"**，只读得到"现在显示成什么"。
+    （旧版按"chat_name 是真名、remark 是备注"来判，会把 97 个已经打过🐶的群
+    当成"没备注"，计划打成「NCC的朋友们16群🐶🐶」。）
 
-    "已有别的备注"没法自动改：SetGroupRemark 对已有备注是追加、空串也清不掉，
-    硬打只会变成「旧备注🐶新名🐶」。这类只报出来人工清。
+    所以判定改成：显示名自己说明一切，真相源是 Notion 同步下来的群名集合。
+      · 显示名以🐶结尾  → 已经打过备注；剥掉🐶在册就是达标，不在册要人看一眼
+      · 显示名里夹着🐶  → 追加出来的垃圾备注（SetGroupRemark 对已有备注是追加），人工清
+      · 显示名不含🐶    → 还没打备注，此时显示名就是真实群名，打它 + 🐶
     """
-    name = (chat_name or "").strip()
-    rmk = (remark or "").strip()
+    name = (display or "").strip()
     if not name:
-        return FIX_SKIP, "读不到真实群名"
-    want = name + DOG
-    if rmk == want:
-        return FIX_OK, want
-    if not rmk:
-        return FIX_APPLY, want
-    return FIX_CONFLICT, f"现备注「{rmk}」，应为「{want}」"
+        return FIX_SKIP, "读不到会话名"
+    known = set(known_names or ())
+
+    if name.endswith(DOG):
+        base = name[:-len(DOG)].strip()
+        if DOG in base:
+            return FIX_CONFLICT, f"备注是追加出来的垃圾「{name}」，只能人工清空重打"
+        if not base:
+            return FIX_SKIP, "备注只有一个🐶，读不出群名"
+        if base in known:
+            return FIX_OK, name
+        return FIX_UNKNOWN, (f"备注「{name}」剥掉🐶后「{base}」不在登记表里——"
+                             f"要么群在 Notion 改过名，要么这个备注打错了群")
+
+    if DOG in name:
+        return FIX_CONFLICT, f"备注是追加出来的垃圾「{name}」，只能人工清空重打"
+
+    # 没设过群名的群，微信显示成成员名拼接（「松爸、大曹、睿南…」），
+    # 这种"名字"会随成员变化，拿它当群名打备注、写进 Notion 都没意义
+    if "、" in name and name not in known:
+        return FIX_SKIP, f"没有群名的群（微信显示成员名「{name}」），要不要打备注请人来定"
+
+    return FIX_APPLY, name + DOG
 
 
 def extract_group_names(raw) -> list:
@@ -154,31 +174,38 @@ def summarize_fix(results, dry: bool = False) -> str:
     skip = b.get(FIX_SKIP) or []
     failed = b.get(FIX_FAILED) or []
     todo = b.get(FIX_APPLY) or []
+    unknown = b.get(FIX_UNKNOWN) or []
 
     head = "备注核对（预览，没动过微信）" if dry else "备注修复完成"
     lines = [f"{head}：微信里共 {len(results)} 个群。",
-             f"  ✅ 本来就对：{len(b.get(FIX_OK, []))}",
+             f"  ✅ 备注已是「群名🐶」：{len(b.get(FIX_OK, []))}",
              f"  🔧 {'待打上' if dry else '这次打上'}：{len(todo)}"]
     if failed:
         lines.append(f"  ❌ 打失败：{len(failed)}")
+    if unknown:
+        lines.append(f"  🟡 备注在册对不上：{len(unknown)}")
     if conflict:
-        lines.append(f"  ⚠️ 要人工处理：{len(conflict)}")
+        lines.append(f"  ⚠️ 要人工清：{len(conflict)}")
     if skip:
         lines.append(f"  ◽ 跳过：{len(skip)}")
 
-    if dry and todo:
-        lines.append("\n🔧 待打备注：")
+    if todo:
+        lines.append(f"\n🔧 {'待打' if dry else '已打'}备注：")
         lines.extend(f"  - {n} → {d}" for n, d in todo)
     if conflict:
-        lines.append("\n⚠️ 这些群已有别的备注，我改不了——SetGroupRemark 对已有备注是"
-                     "【追加】、空串也清不掉，硬打只会变成「旧备注🐶新名🐶」。"
+        lines.append("\n⚠️ 这些备注是追加出来的垃圾，我改不了——SetGroupRemark 对已有备注是"
+                     "【追加】、空串也清不掉，硬打只会越接越长。"
                      "请在微信里手动清空这些群的备注，然后再发一次「修备注 全部」：")
         lines.extend(f"  - {n}：{d}" for n, d in conflict)
+    if unknown:
+        lines.append("\n🟡 这些群有🐶备注，但剥掉🐶后的名字不在登记表里"
+                     "（多半是在 Notion 改过名，也可能是当年打错了群），要人看一眼：")
+        lines.extend(f"  - {n}" for n, _ in unknown)
     if failed:
         lines.append("\n❌ 打备注失败（多为切窗口没切稳，可以重跑）：")
         lines.extend(f"  - {n}：{d}" for n, d in failed)
     if skip:
-        lines.append("\n◽ 跳过的（切不过去或读不到真实群名）：")
+        lines.append("\n◽ 跳过的：")
         lines.extend(f"  - {n}：{d}" for n, d in skip)
     return "\n".join(lines)
 

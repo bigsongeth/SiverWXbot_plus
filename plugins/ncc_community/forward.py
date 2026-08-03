@@ -897,8 +897,14 @@ def _fix_remarks(bot, chat, scope) -> bool:
     不是我们手上那个名字。切歪了顶多是"给另一个群打上它自己的正确备注"，不可能再
     复现 2026-08-03 那种把 A 的备注打到 B 头上的错打。
 
-    改不了的只有一种：群已经有别的备注。SetGroupRemark 对已有备注是追加、空串也清不掉，
-    硬打只会变成「旧备注🐶新名🐶」，所以这类只报出来让人工清。
+    ★ 实测前提（2026-08-03，「看群」指令打出来的）：ChatInfo 只有
+    `{'chat_type','chat_name','group_member_count'}`，**没有 remark 字段**，
+    `chat_name` 就是当前显示名——群有备注时它显示的是备注。所以"这个群的真实群名
+    是什么"在微信侧读不到，判定只能是：显示名带🐶 = 打过了，不带 = 没打过、
+    此时显示名就是真实群名。是否打对了，拿 Notion 同步下来的群名集合去核。
+
+    改不了的只有一种：备注是追加出来的垃圾（形如「A🐶B🐶」）。SetGroupRemark 对已有
+    备注是追加、空串也清不掉，硬打只会越接越长，这类只报出来让人工清。
 
     用法：修备注 预览（只看不改）/ 修备注 全部（真打）。"""
     wx = getattr(bot, "wx", None)
@@ -923,10 +929,11 @@ def _fix_remarks(bot, chat, scope) -> bool:
 
     skip_names = _admin_group_names(store.load())
     names = [n for n in names if n not in skip_names and n.rstrip(audit.DOG) not in skip_names]
+    known = set(registry.load().get("groups", {}))
     reply(chat, f"扫到 {len(names)} 个群（已排除管理群），开始逐个核对备注"
                 f"{'（预览模式，只看不改）' if dry else ''}，大约 {max(1, len(names) * 3 // 60)} 分钟…")
 
-    results, done_names = [], []
+    results, done_names, seen = [], [], set()
     for display in names:
         with MAIN_WINDOW_LOCK:
             info = _probe_remark(wx, display)
@@ -937,22 +944,22 @@ def _fix_remarks(bot, chat, scope) -> bool:
             if str(info.get("chat_type") or "") != "group":
                 time.sleep(0.4)
                 continue          # 同名的私聊，不是群，不管
+            # 会话列表里的名字会被截断到 16 字左右，ChatInfo 读回来的才是完整显示名
             real = str(info.get("chat_name") or "").strip()
-            rmk = str(info.get("remark") or "").strip()
-            # 切歪了就别动手：显示名理应等于真实群名或备注之一
-            if real and display not in (real, rmk):
-                results.append((display, audit.FIX_SKIP,
-                                f"切过去落在「{real}」（备注「{rmk}」）上，名字对不上，没动"))
+            if not real or real in seen:
                 time.sleep(0.4)
-                continue
-            verdict, detail = audit.plan_remark(real, rmk)
+                continue          # 截断名重复切到同一个群，不重复处理
+            seen.add(real)
+            verdict, detail = audit.plan_remark(real, known)
             if verdict == audit.FIX_APPLY and not dry:
                 ok, why = _do_set_remark(wx, real, detail)
                 if not ok:
                     verdict, detail = audit.FIX_FAILED, why
-        results.append((real or display, verdict, detail))
-        if verdict in (audit.FIX_OK, audit.FIX_APPLY) and real:
-            done_names.append(real)
+        results.append((real, verdict, detail))
+        if verdict == audit.FIX_APPLY and real:
+            done_names.append(real)                      # 这次新打的，要写进 Notion
+        elif verdict == audit.FIX_OK:
+            done_names.append(real[:-len(audit.DOG)])    # 已达标的，顺手确认 Notion 有🐶
         time.sleep(0.4)
 
     msg = audit.summarize_fix(results, dry=dry)

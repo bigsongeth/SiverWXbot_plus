@@ -91,14 +91,20 @@ def verify_remark(wx, group_name: str, expect_remark: str) -> tuple[bool, str]:
 
     为什么不能只信 SetGroupRemark 的返回值：`wxresponse_ok` 连 None 都判成功
     （wxautox 有成功返回 None 的先例），等于几乎不设防。备注不可逆，登记表一旦记错
-    就再也对不上微信了——宁可这次不 mark，让批量指令重来。"""
+    就再也对不上微信了——宁可这次不 mark，让批量指令重来。
+
+    ★ 2026-08-03 实测：`ChatInfo()` 只返回
+    `{'chat_type','chat_name','group_member_count'}`，**没有 remark 字段**——
+    只认 remark 的老判据在真机上会永远判失败。而备注生效的直接现象就是
+    【窗口显示名变成备注】，所以显示名等于目标备注同样算数（切没切对群由打之前的
+    confirm_group_window 保证，那时显示名还是真实群名）。"""
     info, err = _read_info(wx, group_name)
     if info is None:
         return False, err
     name = str(info.get("chat_name") or "").strip()
     rmk = str(info.get("remark") or "").strip()
-    if rmk != expect_remark:
-        return False, f"回读备注是「{rmk}」，不是「{expect_remark}」"
+    if expect_remark not in (name, rmk):
+        return False, f"回读显示名「{name}」/备注「{rmk}」，都不是「{expect_remark}」"
     if name and name not in (group_name.strip(), expect_remark):
         return False, f"备注对了但窗口群名是「{name}」，不是「{group_name}」"
     return True, ""
