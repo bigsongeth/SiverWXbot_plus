@@ -764,7 +764,7 @@ class VerifyAfterRemarkTests(unittest.TestCase):
                                  "remark": "旧备注🐶肥肉测试1🐶"}}, cur="a")
         ok, why = remark.verify_remark(wx, "肥肉测试1", "肥肉测试1🐶")
         self.assertFalse(ok)
-        self.assertIn("回读备注", why)
+        self.assertIn("回读", why)
 
     def test_fails_when_landed_on_another_group(self):
         wx = FakeRemarkWx({"a": {"chat_type": "group", "chat_name": "泰国清迈旅居交流1群",
@@ -810,33 +810,50 @@ class ApplyRemarkEndToEndTests(unittest.TestCase):
 
 
 class FixRemarkPlanTests(unittest.TestCase):
-    """「修备注」的判定：期望值就地取自当前窗口的真实群名。"""
+    """「修备注」的判定。实测前提：ChatInfo 没有 remark 字段，chat_name 就是显示名——
+    群一旦有备注，显示名就是备注本身。所以判据只能看显示名 + Notion 群名集合。"""
+
+    KNOWN = {"大理群", "泰国清迈旅居交流1群", "肥肉测试1"}
 
     def test_already_correct(self):
-        self.assertEqual(audit.plan_remark("大理群", "大理群🐶"),
+        self.assertEqual(audit.plan_remark("大理群🐶", self.KNOWN),
                          (audit.FIX_OK, "大理群🐶"))
 
-    def test_empty_remark_can_apply(self):
-        self.assertEqual(audit.plan_remark("大理群", ""),
+    def test_no_dog_means_never_marked(self):
+        """没🐶就是没打过备注，此时显示名就是真实群名。"""
+        self.assertEqual(audit.plan_remark("大理群", self.KNOWN),
                          (audit.FIX_APPLY, "大理群🐶"))
 
-    def test_other_remark_is_conflict(self):
-        """已有别的备注只能人工清——SetGroupRemark 是追加，硬打会变成垃圾。"""
-        v, d = audit.plan_remark("泰国清迈旅居交流1群", "肥肉测试1🐶")
-        self.assertEqual(v, audit.FIX_CONFLICT)
-        self.assertIn("泰国清迈旅居交流1群🐶", d)
-
     def test_appended_garbage_is_conflict(self):
-        v, _ = audit.plan_remark("肥肉测试1", "肥肉测试1🐶肥肉测试1🐶")
+        """SetGroupRemark 是追加，重试过的错打会长成这样，只能人工清。"""
+        v, d = audit.plan_remark("肥肉测试1🐶肥肉测试1🐶", self.KNOWN)
         self.assertEqual(v, audit.FIX_CONFLICT)
+        self.assertIn("人工清", d)
 
-    def test_no_real_name_skips(self):
-        self.assertEqual(audit.plan_remark("", "随便")[0], audit.FIX_SKIP)
+    def test_dog_in_middle_is_conflict(self):
+        """现场真有这种：「黑多岛在地群🐶NCC大理在地邻里活…」"""
+        self.assertEqual(audit.plan_remark("黑多岛在地群🐶NCC大理在地邻里活动群", self.KNOWN)[0],
+                         audit.FIX_CONFLICT)
+
+    def test_dog_but_unknown_base_needs_human(self):
+        """有🐶但剥掉后不在册：可能改了名，也可能当年打错了群。不能自动动。"""
+        v, d = audit.plan_remark("某个没在册的群🐶", self.KNOWN)
+        self.assertEqual(v, audit.FIX_UNKNOWN)
+        self.assertIn("不在登记表", d)
+
+    def test_nameless_group_is_skipped(self):
+        """没设群名的群微信显示成成员名，会随成员变，不能当群名用。"""
+        v, d = audit.plan_remark("松爸、Outsider大曹、睿南、晓", self.KNOWN)
+        self.assertEqual(v, audit.FIX_SKIP)
+        self.assertIn("没有群名", d)
+
+    def test_empty_is_skipped(self):
+        self.assertEqual(audit.plan_remark("", self.KNOWN)[0], audit.FIX_SKIP)
 
     def test_expectation_never_comes_from_outside(self):
-        """核心回归：期望备注只由真实群名决定，跟"我们以为它是谁"无关。
+        """核心回归：要打的备注只由当前窗口显示名决定，跟"我们以为它是谁"无关。
         所以切歪了顶多给另一个群打上它自己的正确备注，不会复现 A 打到 B 的错打。"""
-        _, want = audit.plan_remark("泰国清迈旅居交流1群", "")
+        _, want = audit.plan_remark("泰国清迈旅居交流1群", self.KNOWN)
         self.assertEqual(want, "泰国清迈旅居交流1群🐶")
 
 
@@ -869,7 +886,7 @@ class ExtractGroupNamesTests(unittest.TestCase):
 class SummarizeFixTests(unittest.TestCase):
     def test_conflicts_are_spelled_out_for_manual_work(self):
         out = audit.summarize_fix([
-            ("A群", audit.FIX_OK, "A群🐶"),
+            ("A群🐶", audit.FIX_OK, "A群🐶"),
             ("B群", audit.FIX_APPLY, "B群🐶"),
             ("C群", audit.FIX_CONFLICT, "现备注「野的🐶」，应为「C群🐶」"),
             ("D群", audit.FIX_FAILED, "打完复核不通过"),
