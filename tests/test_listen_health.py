@@ -112,8 +112,10 @@ class TestProbe(unittest.TestCase):
         probe_mod._record = self._orig_record
 
     def _cfg(self, **over):
+        # auto_restart 必须显式关掉：探针失败用例会把连续失败数推过自愈阈值，
+        # 不关的话在 Windows 生产机上跑单测会真的触发 SWXPanelRestart。
         base = {'probe': {'enabled': True, 'target': '文件传输助手',
-                          'alert_after_consecutive': 3}}
+                          'alert_after_consecutive': 3, 'auto_restart': False}}
         base['probe'].update(over)
         return base
 
@@ -197,6 +199,29 @@ class TestProbe(unittest.TestCase):
         probe_mod.load = lambda: (_ for _ in ()).throw(RuntimeError('boom'))
         probe_mod.tick(FakeBot())  # 不抛就算过
 
+    def test_failure_calls_heal(self):
+        """失败要走自愈判定，别只记个日志。"""
+        calls = []
+        import plugins.listen_health.heal as h
+        orig = h.maybe_heal
+        h.maybe_heal = lambda bot, n, cfg, **kw: calls.append(n) or 'none'
+        probe_mod.load = lambda: self._cfg()
+        try:
+            probe_mod.tick(FakeBot(FakeWx(add_raises=OSError('x'))))
+        finally:
+            h.maybe_heal = orig
+        self.assertEqual(calls, [1])
+
+    def test_env_snapshot_recorded(self):
+        """环境快照要落到采样行里（非 Windows 上是空 dict，字段本身必须在）。"""
+        probe_mod.load = lambda: self._cfg()
+        probe_mod.tick(FakeBot(FakeWx()))
+        self.assertIn('env', self._rows[0])
+        self.assertIsInstance(self._rows[0]['env'], dict)
+
+    def test_env_snapshot_never_raises(self):
+        self.assertIsInstance(probe_mod._env_snapshot(), dict)
+
 
 class TestRegister(unittest.TestCase):
 
@@ -243,6 +268,72 @@ class TestRegister(unittest.TestCase):
         probe_mod.register(bot, sch)
         self.assertFalse(getattr(bot, '_listen_probe_enabled', False))
         self.assertEqual(sch.tagged, [])
+
+
+class TestHeal(unittest.TestCase):
+    """自愈：连续失败 -> 自动重启；冷却期内再失败 -> 判定重启无效，叫人。"""
+
+    def setUp(self):
+        from plugins.listen_health import heal as heal_mod
+        self.heal = heal_mod
+        self.restarts = []
+        self.alerts = []
+        self.state = {}
+        heal_mod._trigger_restart = lambda task: self.restarts.append(task)
+        heal_mod._alert = lambda bot, title, content: self.alerts.append((title, content))
+        heal_mod.load_state = lambda: dict(self.state)
+        heal_mod.save_state = lambda s: self.state.update(s)
+
+    def _cfg(self, **over):
+        cfg = {'auto_restart': True, 'restart_after_consecutive': 2,
+               'restart_cooldown_min': 60, 'restart_task_name': 'SWXPanelRestart'}
+        cfg.update(over)
+        return cfg
+
+    def test_below_threshold_does_nothing(self):
+        self.assertEqual(self.heal.maybe_heal(None, 1, self._cfg()), 'none')
+        self.assertEqual(self.restarts, [])
+
+    def test_threshold_triggers_restart(self):
+        self.assertEqual(self.heal.maybe_heal(None, 2, self._cfg()), 'restart')
+        self.assertEqual(self.restarts, ['SWXPanelRestart'])
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_state_persisted_before_restart(self):
+        """必须先落盘再重启——进程被杀掉后内存状态就没了。"""
+        self.heal.maybe_heal(None, 2, self._cfg())
+        self.assertGreater(self.state.get('last_restart_ts', 0), 0)
+        self.assertEqual(self.state.get('restart_count'), 1)
+
+    def test_cooldown_blocks_second_restart_and_escalates(self):
+        import time as _t
+        self.state = {'last_restart_ts': _t.time() - 60, 'escalated': False}
+        self.assertEqual(self.heal.maybe_heal(None, 2, self._cfg()), 'give_up')
+        self.assertEqual(self.restarts, [], '冷却期内绝不能再重启')
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn('人工', self.alerts[0][0])
+
+    def test_escalation_alert_sent_only_once(self):
+        import time as _t
+        self.state = {'last_restart_ts': _t.time() - 60, 'escalated': False}
+        for _ in range(4):
+            self.heal.maybe_heal(None, 3, self._cfg())
+        self.assertEqual(len(self.alerts), 1, '升级告警不能每轮都刷')
+
+    def test_restart_allowed_after_cooldown_expires(self):
+        import time as _t
+        self.state = {'last_restart_ts': _t.time() - 3601, 'escalated': True}
+        self.assertEqual(self.heal.maybe_heal(None, 2, self._cfg()), 'restart')
+        self.assertEqual(self.restarts, ['SWXPanelRestart'])
+        self.assertFalse(self.state['escalated'], '新一轮自愈要清掉升级标记')
+
+    def test_disabled_never_restarts(self):
+        self.assertEqual(self.heal.maybe_heal(None, 9, self._cfg(auto_restart=False)), 'none')
+        self.assertEqual(self.restarts, [])
+
+    def test_never_raises_when_trigger_broken(self):
+        self.heal._trigger_restart = lambda task: (_ for _ in ()).throw(OSError('schtasks not found'))
+        self.assertEqual(self.heal.maybe_heal(None, 2, self._cfg()), 'none')
 
 
 class TestConfig(unittest.TestCase):
