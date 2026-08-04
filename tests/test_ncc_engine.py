@@ -7,6 +7,7 @@ import itertools
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 from plugins.ncc_community import registry, forward, discovery, remark, notion_sync, store
@@ -56,10 +57,15 @@ class FakeMsg:
         self.forward_ok = True   # False 模拟整条转不了（视频号等）
         self.gone_set = set()    # 这些群"无结果"（被踢/解散）
         self.raise_set = set()   # 这些群转发时抛异常（超时/UI 抽风这类说不清的错）
+        self.hang_set = set()    # 这些群转发时【卡住不返回】（wxautox 搜不到目标的真实行为）
+        self.hang_secs = 30.0    # 卡多久
 
     def forward(self, target, **kw):
         # 单目标模型：一次转 1 个群（字符串）；容错也接受列表
         groups = target if isinstance(target, list) else [target]
+        if any(g in self.hang_set for g in groups):
+            time.sleep(self.hang_secs)
+            return None
         if any(g in self.raise_set for g in groups):
             raise RuntimeError("timeout: 等待发送窗口超时")
         if not self.forward_ok:
@@ -377,7 +383,81 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(stat["gone"], ["群1"])
         self.assertEqual(stat["ok"], 2)
         self.assertEqual(sorted(m.forwarded), ["群0", "群2"])
-        self.assertIn("无结果", " ".join(mm for _, mm in self.bot.wx.sent))
+        self.assertIn("搜不到", " ".join(mm for _, mm in self.bot.wx.sent))
+
+    # ---------- 寻址候选 / 卡死兜底（2026-08-04 全量转发第一个群就卡死那次）----------
+
+    def test_address_candidates_prefers_name_then_remark(self):
+        g = {"name": "甲群", "remark": "甲群🐶", "remark_applied": True}
+        # 特意不看 remark_applied：它还兼着「Notion 标题带🐶」的语义，不代表微信里真有这个备注
+        self.assertEqual(registry.address_candidates(g), ["甲群", "甲群🐶"])
+        g["addressing_hit"] = "甲群🐶"      # 实测命中过 → 排最前，省掉一次白等
+        self.assertEqual(registry.address_candidates(g), ["甲群🐶", "甲群", ])
+
+    def test_forward_falls_back_to_remark_candidate(self):
+        # 首选串搜不到 → 自动换备选串，并把实测结果记进 addressing_hit
+        seed_registry()
+        m = FakeMsg("素材", mtype="text")
+        m.gone_set = {"大理A群"}                       # 群名搜不到
+        build_timeline(self.bot, m)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": [{"name": "大理A群", "cands": ["大理A群", "大理A群🐶"]}],
+                "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["ok"], 1)
+        self.assertEqual(m.forwarded, ["大理A群🐶"])
+        self.assertEqual(stat["gone"], [])
+        self.assertEqual(registry.load()["groups"]["大理A群"]["addressing_hit"], "大理A群🐶")
+
+    def test_forward_call_timeout_skips_group_and_continues(self):
+        # wxautox 搜不到目标时会卡着不返回：限时判失败、继续下一个群，不许拖垮整轮
+        m = FakeMsg("素材", mtype="text")
+        m.hang_set = {"群1"}
+        m.hang_secs = 1.0
+        build_timeline(self.bot, m)
+        d = dict(ZERO_DELAY); d["call_timeout"] = 0.2
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": ["群0", "群1", "群2"], "label": "x", "delay": d}
+        stat = forward._deliver(task)
+        self.assertEqual(sorted(m.forwarded), ["群0", "群2"])   # 卡住那个跳过，其余照发
+        self.assertEqual(stat["gone"], ["群1"])                 # 搜不到 → 标记不可达
+        self.assertEqual(stat["ok"], 2)
+
+    def test_forward_stuck_aborts_the_round(self):
+        # ESC 也没能让它退出 = 全局 UI 锁没释放，再转下去只会一路卡死 → 立刻收手
+        orig_grace = forward.STUCK_GRACE
+        forward.STUCK_GRACE = 0.2
+        try:
+            m = FakeMsg("素材", mtype="text")
+            m.hang_set = {"群1"}
+            m.hang_secs = 30.0
+            build_timeline(self.bot, m)
+            d = dict(ZERO_DELAY); d["call_timeout"] = 0.2
+            task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                    "targets": ["群0", "群1", "群2"], "label": "x", "delay": d}
+            stat = forward._deliver(task)
+        finally:
+            forward.STUCK_GRACE = orig_grace
+        self.assertEqual(m.forwarded, ["群0"])      # 群2 没再试
+        self.assertEqual(stat["gone"], [])          # 不是群的问题，别冤枉它
+        self.assertIn("卡死", " ".join(mm for _, mm in self.bot.wx.sent))
+
+    def test_gate_keepalive_extends_hold(self):
+        from plugins.ncc_community import wxlock
+        orig = wxlock._MAX_HOLD
+        wxlock._MAX_HOLD = 0.3
+        try:
+            wxlock.set_forwarding(True)
+            time.sleep(0.4)
+            self.assertFalse(wxlock.is_forwarding())     # 久无续期 = 转发线程死了，放行
+            wxlock.set_forwarding(True)
+            time.sleep(0.2)
+            wxlock.keepalive()
+            time.sleep(0.2)
+            self.assertTrue(wxlock.is_forwarding())      # 续过期 → 闸门还举着
+        finally:
+            wxlock.set_forwarding(False)
+            wxlock._MAX_HOLD = orig
 
     def test_deliver_two_images_both_sent(self):
         # 两张图片签名一模一样（wxautox 里图片 content 固定是「图片」）：

@@ -85,6 +85,32 @@ def target(group: dict) -> str:
     return group.get("name", "")
 
 
+def address_candidates(group: dict) -> list:
+    """转发寻址的候选串，按【优先级】排序，转发时依次试，命中即用。
+
+    为什么不能只给一个串（2026-08-04 事故）：
+    `remark_applied` 并不代表微信里真打上了备注 —— upsert_from_notion 里它可以由
+    「Notion 群名标题末尾带🐶」推断出来，而 8/4 实测改群备注的三条路全部封死、
+    备注根本打不上。结果 105 个群的寻址串全是「群名🐶」这种微信里不存在的名字，
+    转发的"发送给"对话框搜出来一律无结果，第一个群就把整条线卡死。
+    （而「检查群组」用的是宽容得多的主窗口搜索，105/105 全报可达，假绿。）
+
+    群名排在前面：它是 Notion 同步下来的真实群名，没打备注时就是微信里的显示名；
+    真打了备注的群，微信搜索同样能按原名命中，所以群名优先更安全。
+    上次实测命中过的串（addressing_hit）排最前，改过名的群才不用每次先白等一次超时。
+
+    ⚠️ 特意【不】看 remark_applied：那个字段还兼着"Notion 标题带🐶=已纳管"的语义，
+    是给备注工作流用的，不能当作"微信里确实存在这个备注"的依据。"""
+    name = str(group.get("name") or "").strip()
+    remark = str(group.get("remark") or "").strip()
+    hit = str(group.get("addressing_hit") or "").strip()
+    out = []
+    for c in (hit, name, remark):
+        if c and c not in out:
+            out.append(c)
+    return out
+
+
 def match_key(group: dict):
     """返回该群在微信里可能显示的名字集合（用于把 chat.who 匹配到登记表）。"""
     keys = set()
@@ -173,6 +199,42 @@ def all_forward_targets(data: dict):
                 seen.add(t)
                 out.append(t)
     return out
+
+
+def forward_specs(data: dict, grouping_name: str = None):
+    """转发用的目标清单：每个群一条 {"name": 群名, "cands": [寻址候选…]}。
+
+    与 targets_for_grouping/all_forward_targets 的区别是【带候选】：单一寻址串
+    一旦不对（比如备注其实没打上），转发就会在"发送给"对话框里搜不到而卡死，
+    详见 address_candidates 的注释。分组名传 None 表示"所有群聊"。"""
+    out, seen = [], set()
+    for name, g in data.get("groups", {}).items():
+        if not g.get("allow_forward", False):
+            continue
+        if grouping_name is not None and grouping_name not in g.get("groupings", []):
+            continue
+        cands = address_candidates(g)
+        if not cands or cands[0] in seen:
+            continue
+        seen.add(cands[0])
+        out.append({"name": name, "cands": cands})
+    return out
+
+
+def mark_addressing(name: str, hit: str) -> None:
+    """记下某群实际是靠哪个串搜到的，下次寻址从它开始试。
+
+    只写 addressing_hit 这个独立字段，【不动 remark_applied】——后者兼着
+    "Notion 标题带🐶=已纳管"的语义，是备注工作流的地盘，改它会打架。"""
+    if not name or not hit:
+        return
+    with _LOCK:
+        data = load()
+        g = data.get("groups", {}).get(name)
+        if not g or g.get("addressing_hit") == hit:
+            return
+        g["addressing_hit"] = hit
+        save(data)
 
 
 def get_group(data: dict, name: str):
@@ -294,6 +356,8 @@ def upsert_from_notion(groupings: dict, groups: dict, invite_keywords: dict | No
                 # 没打过就跟着新名走，等 apply_remark 去打
                 "remark": (old.get("remark") if applied else "") or (name + DOG),
                 "remark_applied": applied,   # 机器人管 + Notion🐶标记兜底
+                # 实测命中的寻址串（机器人管，Notion 同步不该抹掉它）——见 address_candidates
+                "addressing_hit": old.get("addressing_hit"),
                 "notion_page_id": incoming.get("notion_page_id"),
                 "allow_forward": incoming.get("allow_forward", False),
                 "allow_speak": incoming.get("allow_speak", False),

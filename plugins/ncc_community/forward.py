@@ -42,7 +42,7 @@ STATE_TTL = 600            # 状态闲置超时（秒）
 # 转发做完再按序执行。主循环 + 监听线程侧 hook 见 wxbot_core.py +
 # AI_COLLABORATION_GUIDE.md「潜在冲突：主窗口串行闸门」。
 from .wxlock import WX_LOCK as MAIN_WINDOW_LOCK
-from .wxlock import set_forwarding
+from .wxlock import set_forwarding, keepalive
 
 # 转发策略：【一个群一个群转】。多群"分别发送"多选框会把微信卡死
 # （2026-07-09 实证：转 106 群时微信直接未响应）。单个转发走轻量的"发送给"对话框，稳。
@@ -51,6 +51,9 @@ DELAY = {  # 防风控/防卡死延迟（可被 config.forward.delay 覆盖）
     "msg_min": 5.0, "msg_max": 8.0,         # 每条消息之间
     "batch_every": 10, "batch_min": 5.0, "batch_max": 9.0,   # 每 N 群额外歇一会儿
     "max_retries": 2,
+    # 单次 forward 调用的硬超时（秒）。wxautox 自己那个 timeout 只管对话框弹出，
+    # 搜不到目标时它无限等且攥着全局 uilock，必须我们兜（见 _forward_call）。
+    "call_timeout": 25.0,
 }
 
 # 收集时忽略的消息类型：只跳真噪音。视频号是 'other'，必须收集。
@@ -179,11 +182,118 @@ def _is_stale(err: str) -> bool:
     return any(h.lower() in e for h in _STALE_HINTS)
 
 
-def _forward_one_shot(cache_box, bot, source, sig, occ, group, d) -> tuple[bool, str]:
+TIMEOUT_MARK = "转发对话框超时"     # 超时错误的识别串（判定"这个串搜不到"用）
+STUCK_MARK = "转发线程卡死未释放"    # ESC 也救不回来 —— 整轮必须中止
+STUCK_GRACE = 5.0                  # 关掉对话框后，再给卡住的调用多少秒退出（测试里调小）
+
+
+def _wx_windows() -> set:
+    """微信进程当前的可见顶层窗口句柄集合。非 Windows / 缺依赖返回空集。"""
+    out = set()
+    try:
+        import win32gui
+        import win32process
+        import psutil
+    except Exception:
+        return out
+
+    def cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if psutil.Process(pid).name().lower() not in ("weixin.exe", "wechat.exe"):
+                return
+            out.add(hwnd)
+        except Exception:
+            return
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        pass
+    return out
+
+
+def _dismiss_windows(hwnds) -> int:
+    """给这些窗口发 ESC / 关闭消息，把卡住的"发送给"对话框弄走。
+
+    ⚠️ 不能用 wxautox 自己的 `close()` —— 它带 @uilock，而此刻那把锁正被卡死的
+    forward() 攥着，调它只会连自己一起挂上去。这里直接走 win32 消息，绕开 wxautox。"""
+    n = 0
+    try:
+        import win32api
+        import win32con
+        import win32gui
+    except Exception:
+        return 0
+    for h in hwnds:
+        try:
+            win32gui.PostMessage(h, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+            win32gui.PostMessage(h, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+            n += 1
+        except Exception:
+            continue
+    time.sleep(0.5)
+    for h in hwnds:                     # ESC 不认账的，再补一刀关闭
+        try:
+            if win32gui.IsWindow(h) and win32gui.IsWindowVisible(h):
+                win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            continue
+    _ = win32api
+    return n
+
+
+def _forward_call(element, group, timeout: float) -> tuple[bool, str]:
+    """调一次 `element.forward(group)`，但【限时】。返回 (成功, 错误)。
+
+    为什么必须自己限时（2026-08-04 事故）：wxautox 的 `forward(targets, timeout=3)`
+    里那个 timeout 只管"等发送给对话框弹出来"，`SelectContactWnd.search()/send()`
+    压根没有超时参数 —— 目标搜不到时它在里面【无限等】，而且整个 forward 带
+    @uilock，于是这一个卡住的线程攥着全局 UI 锁，进程里所有微信操作全停。
+    ui_watchdog 还抓不到（主循环心跳照常打），实测干等了 12 分钟一动不动。
+
+    超时后的动作：找出调用期间新冒出来的微信窗口（就是那个"发送给"对话框），
+    直接发 ESC 把它关掉，逼卡在里面的 send() 退出、释放 uilock。认新窗口而不是
+    按类名找，是 ai_news_note 3.11 那次残留编辑器自锁教的。"""
+    before = _wx_windows()
+    box = {}
+
+    def run():
+        try:
+            box["r"] = element.forward(group)
+        except Exception as e:            # noqa: BLE001 —— 原样带回给调用方判定
+            box["e"] = e
+
+    t = threading.Thread(target=run, daemon=True, name="ncc-forward-call")
+    t.start()
+    t.join(timeout)
+
+    if not t.is_alive():
+        if "e" in box:
+            raise box["e"]
+        r = box.get("r")
+        return (True, "") if (r is None or r) else (False, _wxresponse_message(r) or "无结果")
+
+    # 卡住了：关掉新冒出来的对话框，给它 5 秒退出
+    leftover = _wx_windows() - before
+    closed = _dismiss_windows(leftover)
+    log("WARNING", f"「{group}」转发调用超过 {timeout}s 未返回，已关闭 {closed} 个残留窗口")
+    t.join(STUCK_GRACE)
+    if t.is_alive():
+        return False, f"{STUCK_MARK}（「{group}」，ESC 也没能让它退出）"
+    return False, f"{TIMEOUT_MARK}：「{group}」在发送给对话框里搜不到"
+
+
+def _forward_one_shot(cache_box, bot, source, sig, occ, spec, d) -> tuple[bool, str, str]:
     """把定位到的消息转发给【单个群】（走轻量的"发送给"对话框，不碰会卡死微信的
-    "分别发送"多选框）。stale 才重定位重试；无结果/失败不重试（单群要么成要么就是没了）。
-    返回 (成功, 错误)。"""
+    "分别发送"多选框）。spec 是 {"name","cands"}：候选串依次试，命中即用。
+    stale 才重定位重试；搜不到就换下一个候选，都不行才算这个群失败。
+    返回 (成功, 错误, 命中的寻址串)。"""
     last = ""
+    cands = spec.get("cands") or [spec.get("name")]
+    timeout = float(d.get("call_timeout", 25))
     for _ in range(int(d["max_retries"])):
         with MAIN_WINDOW_LOCK:
             if cache_box[0] is None:
@@ -191,42 +301,64 @@ def _forward_one_shot(cache_box, bot, source, sig, occ, group, d) -> tuple[bool,
             if cache_box[0] is None:
                 last = "视图中定位不到该消息"
             else:
-                try:
+                for cand in cands:
                     try:
-                        cache_box[0].roll_into_view()
-                    except Exception:
-                        pass
-                    r = cache_box[0].forward(group)   # 单目标字符串
-                    if r is None or r:
-                        return True, ""
-                    return False, _wxresponse_message(r) or "无结果"   # 单群失败 = 该群没了，不重试
-                except Exception as e:
-                    last = str(e)
-                    if _is_stale(last):
-                        cache_box[0] = None           # 元素失效 → 重定位重试
-                    else:
-                        return False, last            # 其它错误（多为无结果）→ 不重试
+                        try:
+                            cache_box[0].roll_into_view()
+                        except Exception:
+                            pass
+                        ok, err = _forward_call(cache_box[0], cand, timeout)
+                        if ok:
+                            return True, "", cand
+                        last = err
+                        if STUCK_MARK in err:
+                            return False, err, ""     # 锁没救回来，别再试了
+                        continue                      # 搜不到/无结果 → 换下一个候选串
+                    except Exception as e:
+                        last = str(e)
+                        if _is_stale(last):
+                            cache_box[0] = None       # 元素失效 → 跳出去重定位重试
+                            break
+                        return False, last, ""        # 其它错误 → 不重试
+                else:
+                    return False, last, ""            # 候选都试过了，这个群确实找不到
         time.sleep(1.5)
-    return False, last
+    return False, last, ""
 
 
 def _forward_located_message(bot, source, sig, occ, targets, d):
     """把一条消息（按签名+序号定位）【一个群一个群】转发。无结果的群记下来，其余照发。
-    每 batch_every 个群额外歇一会儿。返回 (成功群数, 无结果群列表, 其它失败[str])。"""
+    每 batch_every 个群额外歇一会儿。返回 (成功群数, 无结果群列表, 其它失败[str])。
+    targets 是 _normalize_targets 出来的 spec 列表。"""
     cache_box = [None]
     ok = 0
     gone = []
     failed = []
-    for i, g in enumerate(targets):
+    stuck = False
+    for i, spec in enumerate(targets):
+        g = spec["name"]
         if i > 0 and i % int(d["batch_every"]) == 0:
             time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
-        success, err = _forward_one_shot(cache_box, bot, source, sig, occ, g, d)
+        success, err, hit = _forward_one_shot(cache_box, bot, source, sig, occ, spec, d)
+        keepalive()          # 转发仍在推进，给主窗口闸门续期（别让它半路失效被人抢窗口）
         if success:
             ok += 1
+            if hit and hit != (spec.get("cands") or [None])[0]:
+                # 首选串没搜到、备选串命中 → 登记表里的寻址状态是错的，就地纠正
+                log("INFO", f"「{g}」用备选串「{hit}」命中，纠正登记表寻址")
+                try:
+                    registry.mark_addressing(g, hit)
+                except Exception as e:
+                    log("WARNING", f"回写寻址状态失败 {g}: {e}")
+        elif STUCK_MARK in err:
+            failed.append(f"{g}: {err}")
+            stuck = True
+            log("ERROR", f"UI 锁没能释放，中止本条转发：{err}")
+            break                                   # 再转下去只会一路卡死
         elif "定位不到该消息" in err:
             failed.append(f"{g}: {err}")            # 源消息定位不到，非群的问题
-        elif _is_gone(err):
-            gone.append(g)                          # 明确"无结果/找不到" → 该群不可达
+        elif TIMEOUT_MARK in err or _is_gone(err):
+            gone.append(g)                          # 候选串都搜不到 → 该群不可达
         else:
             # 超时、UI 异常这类说不清的错，只汇报不下结论：gone 会被 mark_unreachable
             # 写进 registry（allow_forward=False），之后所有转发都跳过这个群，
@@ -236,6 +368,8 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
 
     # 保护：整条一个群都没成功 → 判定是这条消息本身转不了，别冤枉群（不标记任何群不可达）
     if ok == 0 and (gone or failed):
+        if stuck:
+            return 0, [], failed      # 卡死的真相要原样带出去，别被"消息不支持转发"盖掉
         return 0, [], ["整条转发失败（该消息可能不支持转发，未标记任何群）"]
     return ok, gone, failed
 
@@ -352,13 +486,29 @@ def _msg_uid(msg):
     return str(uid)
 
 
+def _normalize_targets(targets):
+    """把目标清单统一成 [{"name","cands"}]。
+
+    兼容两种形态：registry.forward_specs 出来的 dict（带寻址候选），以及历史/测试里
+    的纯字符串（只有一个候选，行为与以前一致）。"""
+    out = []
+    for t in targets or []:
+        if isinstance(t, dict):
+            cands = [str(c) for c in (t.get("cands") or []) if c]
+            name = t.get("name") or (cands[0] if cands else "")
+            out.append({"name": str(name), "cands": cands or [str(name)]})
+        else:
+            out.append({"name": str(t), "cands": [str(t)]})
+    return out
+
+
 def _deliver(task) -> dict:
     """先拿本次要转消息的【签名清单】(身份)，再【逐条】：滚动定位到该消息、取当下
     有效元素、转发给各批群。每条只在"可见"时才转，规避元素失效。按时序逐条处理。
     主窗口锁已和主循环共用，转发期间主循环不会来抢窗口。
     """
     bot = task["bot"]; admin = task["admin"]
-    targets = task["targets"]
+    targets = _normalize_targets(task["targets"])
     label = task["label"]; d = task["delay"]
     operator = task.get("operator")
 
@@ -392,6 +542,7 @@ def _deliver(task) -> dict:
     gone_all = set()          # 无结果/不可达的群（去重）
     fail_detail = []
 
+    aborted = False
     for mi, (sig, occ) in enumerate(sigs):
         okc, gone, failed = _forward_located_message(bot, admin, sig, occ, targets, d)
         ok += okc
@@ -399,6 +550,11 @@ def _deliver(task) -> dict:
         gone_all.update(gone)
         if failed:
             fail_detail.extend(f"第{mi+1}条 {x}" for x in failed[:5])
+        if any(STUCK_MARK in x for x in failed):
+            # 全局 UI 锁没释放，后面的消息只会一路卡死 —— 整轮收手，交给人处置
+            aborted = True
+            log("ERROR", "转发中止：微信 UI 锁未释放，请重启程序后再试")
+            break
         time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
 
     # 无结果的群 → 本地标记不可达（后续转发自动跳过），并从 Notion 视角提醒人清理
@@ -417,10 +573,12 @@ def _deliver(task) -> dict:
     except Exception:
         pass
 
-    lines = [f"{REPLY_PREFIX} 转发完成！{label}",
+    lines = [f"{REPLY_PREFIX} {'转发中止！' if aborted else '转发完成！'}{label}",
              f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。"]
+    if aborted:
+        lines.append("⛔ 微信 UI 锁没能释放，剩下的没转。请重启程序（SWXPanelRestart）后重来。")
     if marked:
-        lines.append(f"🚫 {len(marked)} 个群转发无结果（可能被踢/解散/改名），已本地标记跳过："
+        lines.append(f"🚫 {len(marked)} 个群搜不到（候选名字都试过了，可能被踢/解散/改名），已本地标记跳过："
                      + "、".join(marked[:10]) + ("…" if len(marked) > 10 else "")
                      + "\n（记得去 Notion 里核对这些群）")
     if fail_detail:
@@ -548,9 +706,11 @@ def _handle_choose(bot, chat, cfg, sender, st, text) -> bool:
     nums = [int(x) for x in re.split(r"\s*\+\s*", text.strip())]
     data = registry.load()
 
+    # 用 forward_specs 而不是单一寻址串：每个群带上候选（群名/备注），
+    # 转发时依次试，避免一个错串（比如微信里根本没打上的🐶备注）把整轮卡死。
     targets, label = [], ""
     if 1 in nums:  # 所有群聊
-        targets = registry.all_forward_targets(data)
+        targets = registry.forward_specs(data)
         label = "分组「所有群聊」"
     else:
         chosen, seen = [], set()
@@ -559,10 +719,10 @@ def _handle_choose(bot, chat, cfg, sender, st, text) -> bool:
             if not gname:
                 continue
             chosen.append(gname)
-            for t in registry.targets_for_grouping(data, gname):
-                if t not in seen:
-                    seen.add(t)
-                    targets.append(t)
+            for spec in registry.forward_specs(data, gname):
+                if spec["name"] not in seen:
+                    seen.add(spec["name"])
+                    targets.append(spec)
         if not chosen:
             reply(chat, "这些编号都没对应到分组，请重新选择，或发送【0】退出")
             return True
@@ -724,25 +884,45 @@ def _format_welcome_invite(cfg) -> str:
 def _check_groups(bot, chat, name) -> bool:
     data = registry.load()
     if name in ("全部", "所有", "all"):
-        targets = registry.all_forward_targets(data)
+        specs = registry.forward_specs(data)
     elif name in data.get("groupings", {}):
-        targets = registry.targets_for_grouping(data, name)
+        specs = registry.forward_specs(data, name)
     else:
         reply(chat, f"没有「{name}」这个分组。发「分组列表」看看。")
         return True
-    if not targets:
+    if not specs:
         reply(chat, "该分组没有允许转发的群可检查。")
         return True
-    reply(chat, f"开始检查 {len(targets)} 个群的可达性，请稍等…")
-    ok_list, fail_list = [], []
+    reply(chat, f"开始检查 {len(specs)} 个群的可达性，请稍等…")
+    ok_list, fail_list, fixed = [], [], []
     wx = getattr(bot, "wx", None)
-    for t in targets:
-        # 以前只捕异常不看返回值，切群静默失败会被报成"可达"，检查等于白做
-        with MAIN_WINDOW_LOCK:
-            reachable = _switched(wx, t, exact=False)
-        (ok_list if reachable else fail_list).append(t)
+    for spec in specs:
+        # 候选串依次试，记下哪个串真的切得过去 —— 只报"可达"而不说清是靠哪个名字，
+        # 就是 8/4 那次 105/105 假绿的由来
+        hit = None
+        for cand in spec["cands"]:
+            with MAIN_WINDOW_LOCK:
+                if _switched(wx, cand, exact=False):
+                    hit = cand
+                    break
+            time.sleep(0.3)
+        if hit:
+            ok_list.append(spec["name"])
+            if hit != spec["cands"][0]:
+                fixed.append(f"{spec['name']} → 「{hit}」")
+                try:
+                    registry.mark_addressing(spec["name"], hit)
+                except Exception as e:
+                    log("WARNING", f"回写寻址状态失败 {spec['name']}: {e}")
+        else:
+            fail_list.append(spec["name"])
         time.sleep(0.5)
-    lines = [f"检查完成：{len(ok_list)}/{len(targets)} 可达。"]
+    lines = [f"检查完成：{len(ok_list)}/{len(specs)} 可达。",
+             "⚠️ 这里验的是主窗口搜索，比转发用的「发送给」对话框宽容得多，"
+             "能切过去不等于转发一定搜得到（8/4 就是这么假绿的）。"]
+    if fixed:
+        lines.append(f"🔧 {len(fixed)} 个群的寻址串已按实测纠正：\n" + "\n".join(f" - {x}" for x in fixed[:10])
+                     + ("…" if len(fixed) > 10 else ""))
     if fail_list:
         lines.append("不可达（可能改了群名/退群，去 Notion 更新）：")
         lines.extend(f" - {t}" for t in fail_list)
