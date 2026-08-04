@@ -2429,6 +2429,7 @@ class WXBot:
             # 部分会话双击弹不出独立窗口（实测"松爸"两次复现，wxautox 内部拿到 None 后直接抛异常）。
             # 这里接住返回 None，让上层重试和主窗口回落接手，避免异常炸穿主循环导致消息静默丢弃。
             log(level="ERROR", message=f"添加{label} {nickname} 监听异常: {repr(e)}")
+            self._last_listen_error = repr(e)   # 供 listen_health 告警带上最后一次异常
             return None
         if result:
             log(message=f"添加{label} {nickname} 监听完成")
@@ -2470,25 +2471,45 @@ class WXBot:
 
         log(level="ERROR", message=f"以下对象初始化监听重试失败，已跳过实际监听: {missing}")
 
+    # 动态监听重试的退避间隔（秒），第 N 次重试等 RETRY_BACKOFF[N-1]。
+    # 原来是固定 0.5 秒、4 次全挤在 16 秒内打完，对付的却是一个间歇性 UI 故障——
+    # 它缺的是时间不是次数（2026-08-03/04 两次失败，4 次连打全废）。拉开到 2/5/15 秒，
+    # 整体窗口从 16 秒放宽到约 30 秒，用户侧感知仍在可接受范围。
+    RETRY_BACKOFF = (2, 5, 15)
+
     def _add_and_verify_subwindow(self, nickname, retry_count=3):
         """
         添加单个监听并用 GetSubWindow 校验，返回校验成功的子窗口对象。
-        初次添加失败或未返回子窗口时再重试 retry_count 次。
+        初次添加失败或未返回子窗口时再重试 retry_count 次（间隔见 RETRY_BACKOFF）。
         """
+        self._last_listen_error = None
         total_attempts = retry_count + 1
         for attempt in range(1, total_attempts + 1):
             if attempt == 1:
                 log(message=f"{nickname} 不在动态监听列表，正在添加监听")
             else:
-                log(level="WARNING", message=f"{nickname} 动态监听校验失败，正在进行第 {attempt - 1} 次重试")
-                time.sleep(0.5)
+                idx = min(attempt - 2, len(self.RETRY_BACKOFF) - 1)
+                wait = self.RETRY_BACKOFF[idx]
+                log(level="WARNING",
+                    message=f"{nickname} 动态监听校验失败，{wait} 秒后进行第 {attempt - 1} 次重试")
+                time.sleep(wait)
 
             self._add_listen_chat_once(nickname, "动态监听")
             sub_chat = self._get_verified_subwindow(nickname)
             if sub_chat:
+                if attempt > 1:
+                    log(message=f"{nickname} 第 {attempt - 1} 次重试后添加成功")
                 return sub_chat
 
         log(level="ERROR", message=f"{nickname} 动态监听添加失败，重试 {retry_count} 次后仍未获取到子窗口，已跳过")
+
+        # listen_health plugin hook：最终失败推告警，别再靠人肉翻日志发现消息没回。
+        try:
+            from plugins.listen_health import alert_listen_failure
+            alert_listen_failure(self, nickname, retry_count=retry_count,
+                                 last_error=getattr(self, '_last_listen_error', None))
+        except Exception as _alert_err:
+            log(level="WARNING", message=f"listen_health 告警失败：{_alert_err}")
         return None
 
     def _remove_dynamic_listen_chat(self, chat):
@@ -2671,6 +2692,15 @@ class WXBot:
             _register_ncc_task(self, schedule)
         except Exception as e:
             log(level="ERROR", message=f"ncc_community 后台任务触发器注册失败：{e}")
+
+        # listen_health 插件 hook：动态监听探针（定时对固定会话打一次 AddListenChat，
+        # 攒 1400 偶发故障的样本）。必须在 bot 进程内由 schedule 串行调用，
+        # 独立进程/线程做微信 UI 操作会抢主窗口。
+        try:
+            from plugins.listen_health import register as _register_listen_probe
+            _register_listen_probe(self, schedule)
+        except Exception as e:
+            log(level="ERROR", message=f"listen_health 探针注册失败：{e}")
 
         log(message="监听器初始化完成")
 
@@ -5180,7 +5210,8 @@ class WXBot:
                 # ---- 定时任务执行（定时消息 / 定时朋友圈 / ai_news_note 日报）----
                 if (self.config.scheduled_msg_switch or self.config.scheduled_moments_switch
                         or getattr(self, '_ai_news_note_enabled', False)
-                        or getattr(self, '_ncc_task_runner_enabled', False)):
+                        or getattr(self, '_ncc_task_runner_enabled', False)
+                        or getattr(self, '_listen_probe_enabled', False)):
                     schedule.run_pending()
 
                 # ---- 随机定时朋友圈模块 ----
