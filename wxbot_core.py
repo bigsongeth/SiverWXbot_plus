@@ -2174,12 +2174,18 @@ class MainWindowChat:
     """
     主窗口回落通道：AddListenChat 弹不出独立子窗口时（实测部分会话如"松爸"双击不弹窗），
     用主窗口 SendMsg(who=...) 回复，消息不丢。
-    鸭子类型兼容 process_message / wx_send_ai 用到的 chat 接口（只有 who 和 SendMsg）。
+    鸭子类型兼容 process_message / wx_send_ai 用到的 chat 接口（who / chat_type / SendMsg）。
+    chat_type 必须有：process_message 在全局模式分支里直接读 chat.chat_type 判是不是群聊
+    （wxbot_core.py 约 3443 行，另 message_handle_callback 约 3159 行同理），少一个属性
+    就 AttributeError，整条 ALLListen_mode 被 main 的兜底 except 接住，消息已被
+    GetNextNewMessage 消费掉、无声丢失（2026-08-03 私聊「签到」就是这么丢的）。
+    本通道只在私聊回落时构造，默认 'friend'。
     """
 
-    def __init__(self, wx, who):
+    def __init__(self, wx, who, chat_type='friend'):
         self._wx = wx
         self.who = who
+        self.chat_type = chat_type
 
     def SendMsg(self, msg, *args, **kwargs):
         return self._wx.SendMsg(msg=msg, who=self.who, exact=True)
