@@ -63,6 +63,9 @@ plugins/ncc_kb/data/
 # ai_news_note：抓取数据与已发送标记
 plugins/ai_news_note/data/
 plugins/ai_news_note/last_sent.txt
+# listen_health：探针采样流水 + 本机配置（默认值写在 config.py 的 DEFAULTS，
+# 文件缺失自动回落，所以 data/ 整个不进库，与其它插件一致）
+plugins/listen_health/data/
 
 # ============================================================
 # 临时文件 / 手工备份
