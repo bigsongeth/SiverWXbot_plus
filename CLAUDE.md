@@ -551,6 +551,94 @@ hook 3 处，合并上游后逐个确认：
   `chain.py` 刻意不 import `wxbot_core`（会连带拉起 wxautox），所以 mac 上能裸跑。
 - 设计与决策记录：`plugins/model_fallback/SPEC.md`。
 
+### 3.18 动态监听「窗口丢失」与自愈 `plugins/listen_health/`（2026-08-04 加）★ 治私聊消息静默丢失
+
+**故障链条**：全局模式下来了新私聊 → `AddListenChat` 给它开独立聊天窗口 →
+**窗口没弹出来** → wxautox 拿到 0 句柄 → `wxautox4/ui/base.py` 的 `set_window_size()`
+里 `win32gui.MoveWindow(0, ...)` 抛 `error(1400, 'MoveWindow', '无效的窗口句柄。')`。
+上层重试 3 次全败 → 回落主窗口（`MainWindowChat`）。
+
+**它到底是什么**（2026-08-04 问了 wxautox 作者 Siver）：就是普通的**微信窗口丢失**，
+可能是微信/Windows 自身的问题，也可能被人为或后台软件干扰，**碰到了重启就好**。
+我们的日志完全对得上，而且比作者说的更乐观——**只重启我们的进程就够，微信客户端不用重启**
+（所以自愈不需要人扫码，可以全自动）：
+
+| 时间 | 事件 |
+|------|------|
+| 08-03 20:34 / 20:37 | 连续两次失败（其间 21:24 朋友圈点赞正常 → 坏的只是「开独立窗口」这一个能力，不是整个 UIA）|
+| 08-04 00:20 | 重启程序 → 初始化 5 个监听全部成功 |
+| 08-04 00:49 / 08:04 | 成功 |
+| 08-04 13:46 | 失败 |
+| 08-04 15:09 | 重启程序 → 诊断脚本连打 18 轮全成功 |
+
+**关键性质：进坏状态后持续失败，不是随机抖动。** 别再按「5% 概率随机」去理解——
+连续两次失败在独立随机下只有 0.25% 的概率；15:09 之后那 18 轮全过，是因为测在重启之后，
+测的是健康状态，什么也没证明。
+
+#### ★ 三个已被证伪的假说，别再重走
+
+1. **「微信独立聊天窗口有 5 个上限」** —— 手动开到 8 个，第 9 个照样开得出来；
+   08-04 00:49 和 08:04 都是在 5 个窗口占满时成功的。
+2. **「朋友圈点赞等 UI 操作把状态搞脏」** —— 只对得上 08-04 13:46 那次（相隔 52 秒），
+   08-03 20:34 那次距上次点赞 2 小时 43 分。专门跑了 6 轮「开关朋友圈后立刻调用」，6/6 成功。
+3. **「wxautox/UIA 连接随进程运行时长老化」** —— 成功样本覆盖 0~49.84 小时，
+   失败样本 1.15/1.20/13.44 小时，完全重叠。
+
+#### 四层处理
+
+1. **回落通道补 `chat_type`**（`wxbot_core.py` 的 `MainWindowChat`）——
+   这是**真正丢消息的那个 bug**。回落对象原来只有 `who` 和 `SendMsg`，而
+   `process_message` 在全局模式分支里直接读 `chat.chat_type` → `AttributeError` →
+   整条 `ALLListen_mode` 被 main 的兜底 except 接住，而消息已被 `GetNextNewMessage`
+   消费掉、不会重投。**实际丢了两条真实消息**：08-03 20:34 King_🐕 的「签到」、
+   08-04 13:46 基司菲尔的提问，用户什么回复都没收到。
+2. **重试改退避**（`wxbot_core.RETRY_BACKOFF = (2, 5, 15)`）——原来固定 0.5 秒、
+   4 次全挤在 16 秒内打完。对付间歇性 UI 故障缺的是时间不是次数。
+3. **失败告警**（`alert.py`）——最终失败推 webhook + 管理群，同一会话 10 分钟冷却防刷屏。
+   在此之前失败只写一行 ERROR 日志，两次丢消息都是人肉翻日志事后才发现的。
+4. **探针 + 自愈**（`probe.py` / `heal.py`）——每 10 分钟对「文件传输助手」打一次
+   `AddListenChat`，连续失败 2 次（≈20 分钟）判定坏状态 → 触发 `SWXPanelRestart`
+   重启进程 → 冷却 60 分钟防重启风暴。**冷却期内又连续失败 = 重启这条路无效 =
+   微信侧坏了 → 升级告警叫人**（这时候才轮到人上机重启微信客户端）。
+   故障通常在 10~20 分钟内自愈，且赶在真人发消息之前。
+
+采样落 `data/probe-YYYYMMDD.jsonl`（一天 144 条），除成败/耗时/异常外还记**环境快照**：
+前台窗口标题+进程、RustDesk ESTABLISHED 连接数、微信主窗口 hwnd。
+作者提的「人为/后台软件干扰」从此可查而不是靠猜。
+（RustDesk console 模式**不写** TerminalServices 事件日志——已验证 08-03 12:00 起
+一条会话事件都没有——所以只能从进程连接数看有没有人连着。
+微信主窗口 hwnd 也值得盯：08-04 实测它会在**进程不重启**的情况下被销毁重建，
+264072 → 64685408，而 wxautox 是启动时把它缓存下来用的。）
+
+#### hook 5 处（合并上游后逐个确认）
+
+- `MainWindowChat.__init__`：`chat_type='friend'`（少这一个属性就丢消息）
+- `_add_listen_chat_once`：记 `self._last_listen_error`，供告警引用
+- `_add_and_verify_subwindow`：退避重试 + 最终失败调 `alert_listen_failure`
+- `init_wx_listeners` 定时任务注册处：挂探针 `register(self, schedule)`
+- 主循环 `run_pending` 条件：加 `_listen_probe_enabled`
+
+#### 坑
+
+- ★ **跑单测可能触发真实重启**：探针的失败用例会把连续失败数推过自愈阈值。
+  `tests/test_listen_health.py` 的 `TestProbe` 里已显式关掉 `auto_restart`，
+  **以后新增探针相关用例照做**，否则在 win-shukong 上跑单测会真的重启机器人。
+- **自愈状态必须落盘**（`data/heal_state.json`）：进程被杀后内存全丢，
+  不落盘会陷入无限重启。
+- **重启触发复用 `ui_watchdog._default_trigger`**，别自己再写一遍 —— 那里踩过
+  `schtasks` 裸名字 `FileNotFoundError` 的坑（见 3.13）。
+- **探针绝不能另起进程/线程**跑微信 UI 操作，只能挂在 bot 的 schedule 主循环里串行执行
+  （见 3.11 的血泪）。靶子用「文件传输助手」这种系统会话，不打扰真人、不产生已读。
+- `data/` 整个不进库（默认值写在 `config.py` 的 `DEFAULTS`，文件缺失自动回落）。
+  注意 `.gitignore` 第 4 行有全局 `config.json` 规则，插件的默认配置文件放不进库。
+- 单测：`PYTHONPATH=. python3 tests/test_listen_health.py`（34 个，纯 mock）、
+  `tests/test_main_window_chat.py`（8 个，用 ast 摘类出来 exec，不 import wxbot_core；
+  其中一个用例会扫 `process_message` / `wx_send_ai` / `message_handle_callback` 里所有
+  `chat.xxx` 读取，逐个校验回落通道答得上来——以后再漏属性直接测试失败）。
+
+**根因仍未知**，已把现象整理成一段话发社区问了。探针数据攒够之后回来看失败样本的共同点：
+失败那一刻 `fg_proc` 是谁、`rustdesk_conns` 是不是 0、`wx_main_hwnd` 有没有变。
+
 ---
 
 ## 4. 同步上游的标准流程
@@ -673,6 +761,7 @@ credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 | NCC 社群插件 | `plugins/ncc_community/` |
 | 知识库开关插件 | `plugins/ncc_kb/` |
 | AI 日报插件 | `plugins/ai_news_note/` |
+| 监听健康 / 自愈插件 | `plugins/listen_health/`（探针采样 `data/probe-*.jsonl`，见 3.18） |
 | 码池拉取导入 | `plugins/wechat_checkin/pull_and_import.py`（计划任务 `WechatCheckinPull` 每天 8:05） |
 | 面板模板 | `templates/dashboard.html` |
 | 配置 | `config/config.json` |
