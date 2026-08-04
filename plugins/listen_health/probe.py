@@ -69,6 +69,69 @@ def _visible_chat_windows():
     return count[0]
 
 
+def _env_snapshot() -> dict:
+    """
+    采样时的环境快照。wxautox 作者说这类「窗口丢失」多半是被人为/后台软件干扰，
+    所以把「坏掉那一刻谁在前台、有没有人远程连着、微信主窗口是哪个句柄」记下来，
+    等真出故障时才有得对。全程吞异常，非 Windows 返回空。
+    """
+    snap = {}
+    try:
+        import win32gui
+        import win32process
+        import psutil
+    except Exception:
+        return snap
+
+    # 前台窗口是谁——被别的程序抢了焦点，双击就可能落空
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        snap['fg_title'] = win32gui.GetWindowText(hwnd)
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            snap['fg_proc'] = psutil.Process(pid).name()
+        except Exception:
+            snap['fg_proc'] = None
+    except Exception:
+        pass
+
+    # 有没有人正连着远程（RustDesk console 模式不写 TerminalServices 事件日志，
+    # 只能这样看）。ESTABLISHED 连接数 > 0 基本等于「有人在看着这台机器」。
+    try:
+        est = 0
+        for p in psutil.process_iter(['name']):
+            if 'rustdesk' not in (p.info.get('name') or '').lower():
+                continue
+            try:
+                est += sum(1 for c in p.net_connections(kind='inet')
+                           if c.status == psutil.CONN_ESTABLISHED)
+            except Exception:
+                continue
+        snap['rustdesk_conns'] = est
+    except Exception:
+        pass
+
+    # 微信主窗口句柄。08-04 实测它会在进程不重启的情况下被销毁重建
+    # （264072 -> 64685408），而 wxautox 启动时是把它缓存下来用的。
+    try:
+        found = []
+
+        def cb(h, _):
+            try:
+                if (win32gui.GetClassName(h) == 'Qt51514QWindowIcon'
+                        and win32gui.IsWindowVisible(h)
+                        and win32gui.GetWindowText(h) in ('微信', 'Weixin', 'WeChat')):
+                    found.append(h)
+            except Exception:
+                return
+        win32gui.EnumWindows(cb, None)
+        snap['wx_main_hwnd'] = found[0] if found else None
+    except Exception:
+        pass
+
+    return snap
+
+
 def _record(row: dict) -> None:
     """一行 JSON 落盘。写失败只记日志，绝不往上抛。"""
     try:
@@ -110,6 +173,7 @@ def tick(bot) -> None:
             existing = None
 
         win_before = _visible_chat_windows()
+        snapshot = _env_snapshot()
         err = None
         t0 = time.time()
         try:
@@ -145,6 +209,7 @@ def tick(bot) -> None:
             "bot_uptime_h": _uptime_hours(bot),
             "dyn_listen_count": len(getattr(bot, 'all_Mode_listen_list', []) or []),
             "msg_received": getattr(bot, 'msg_received_count', None),
+            "env": snapshot,
         })
 
         if ok:
@@ -153,7 +218,7 @@ def tick(bot) -> None:
             _consecutive_fail = 0
         else:
             _consecutive_fail += 1
-            log("WARNING", f"探针第 {_consecutive_fail} 次连续失败：{err}")
+            log("WARNING", f"探针第 {_consecutive_fail} 次连续失败：{err} 环境={snapshot}")
             threshold = int(pcfg.get('alert_after_consecutive', 3))
             if _consecutive_fail == threshold:
                 try:
@@ -165,6 +230,12 @@ def tick(bot) -> None:
                     )
                 except Exception as e:
                     log("WARNING", f"探针告警失败：{e}")
+            # 自愈：连续失败说明进入了「窗口丢失」坏状态，重启程序即可恢复（见 heal.py）
+            try:
+                from .heal import maybe_heal
+                maybe_heal(bot, _consecutive_fail, pcfg, last_error=err, snapshot=snapshot)
+            except Exception as e:
+                log("WARNING", f"自愈调用失败：{e}")
     except Exception as e:
         log("ERROR", f"探针本轮出错（已吞掉）：{e}")
 

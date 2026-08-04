@@ -19,7 +19,14 @@ DEFAULTS = {
         "enabled": True,
         "interval_min": 10,
         "target": "文件传输助手",  # 拿系统会话当靶子，不打扰真人、不产生已读
-        "alert_after_consecutive": 3,  # 连续失败几次才告警（探针失败本身不影响用户）
+        # 连续失败几次才发普通告警。开着自愈时通常轮不到它（2 次就重启并另发通知了），
+        # 它主要服务于 auto_restart=false 的场景。
+        "alert_after_consecutive": 3,
+        # --- 自愈（见 heal.py）---
+        "auto_restart": True,
+        "restart_after_consecutive": 2,   # 连续 2 次 ≈ 20 分钟，避开单次抖动
+        "restart_cooldown_min": 60,       # 冷却期内不再重启；期内又失败 = 重启无效，叫人
+        "restart_task_name": "SWXPanelRestart",
     },
 }
 
