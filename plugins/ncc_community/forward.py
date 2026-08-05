@@ -3,7 +3,7 @@
 
 交互习惯对齐旧 WCRobot（ncc/ncc_manager.py）：发「ncc」弹主菜单，数字选择。
 
-  ncc              -> 主菜单：1转发 / 2同步 / 3后台 / 4待归类 / 5迎新拉群 / 0退出
+  ncc              -> 主菜单：1转发 / 2面板地址 / 3待归类 / 4迎新拉群 / 0退出
   1                -> 进入转发：把消息【一条条发完】
   1                -> 收集完，进入选分组
   2+4+6            -> 多选分组编号（1=所有群聊），后台群发
@@ -15,7 +15,9 @@
 - 后台线程跑，收集/接收不阻塞。
 - 视频号是 type='other'，会正常收集与转发；真转不了的连续 2 群失败即跳过并汇报。
 
-分组/权限来自 Notion（同步到 registry），发「同步」拉取。状态按发送人隔离。
+分组/权限来自本地 registry.json，由面板 `/ncc_community` 维护（2026-08-05 去
+Notion 化，见 PANEL_SPEC.md）——**「同步」指令已下线**，改配置不再需要拉取。
+状态按发送人隔离。
 """
 from __future__ import annotations
 
@@ -25,10 +27,8 @@ import random
 import threading
 from queue import Queue
 
-from . import store, registry, audit
+from . import store, registry, audit, panel
 from .common import REPLY_PREFIX, is_bot_reply, log, reply
-
-NOTION_BACKEND_URL = "https://bigsong.notion.site/NCC-1564e93f5682805d9a2ff0519c24738b"
 
 # ---- 每个操作者的状态机（对齐旧 OperatorState）----
 S_MAIN = "main"            # 主菜单
@@ -63,16 +63,15 @@ MAIN_MENU = (
     "🐶 NCC 社群管理（本群成员皆管理员）\n"
     "请回复数字：\n"
     "1 👈 转发消息\n"
-    "2 👈 同步 Notion 更改\n"
-    "3 👈 查看 Notion 后台\n"
-    "4 👈 待归类新群\n"
-    "5 👈 迎新 / 拉群设置\n"
+    "2 👈 管理面板地址（分组/权限/拉群关键词都在那儿改）\n"
+    "3 👈 待归类新群\n"
+    "4 👈 迎新 / 拉群设置\n"
     "0 👈 退出管理模式\n"
-    "\n体检指令（直接发）：\n"
+    "\n体检指令（直接发，要动微信 UI 所以留在这里）：\n"
     "  检查群组 全部 —— 群还在不在（可达性）\n"
     "  核对备注 全部 —— 🐶备注有没有打错群\n"
     "  扫群 —— 微信里到底有多少个群\n"
-    "  修备注 预览 / 修备注 全部 —— 把每个群的备注修成「群名🐶」并回写 Notion"
+    "  修备注 预览 / 修备注 全部 —— 把每个群的备注修成「群名🐶」"
 )
 
 COLLECT_PROMPT = (
@@ -362,7 +361,7 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
         else:
             # 超时、UI 异常这类说不清的错，只汇报不下结论：gone 会被 mark_unreachable
             # 写进 registry（allow_forward=False），之后所有转发都跳过这个群，
-            # 没人去 Notion 核对就是永久漏发。宁可少标一个，别冤枉一个。
+            # 没人去面板核对就是永久漏发。宁可少标一个，别冤枉一个。
             failed.append(f"{g}: {err}")
         time.sleep(random.uniform(d["group_min"], d["group_max"]))
 
@@ -557,7 +556,7 @@ def _deliver(task) -> dict:
             break
         time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
 
-    # 无结果的群 → 本地标记不可达（后续转发自动跳过），并从 Notion 视角提醒人清理
+    # 无结果的群 → 本地标记不可达（后续转发自动跳过），并提醒人去面板核对/恢复
     marked = []
     for g in gone_all:
         try:
@@ -580,7 +579,7 @@ def _deliver(task) -> dict:
     if marked:
         lines.append(f"🚫 {len(marked)} 个群搜不到（候选名字都试过了，可能被踢/解散/改名），已本地标记跳过："
                      + "、".join(marked[:10]) + ("…" if len(marked) > 10 else "")
-                     + "\n（记得去 Notion 里核对这些群）")
+                     + "\n（去面板「群列表」核对这些群，确认还在就点「恢复可转发」）")
     if fail_detail:
         show = fail_detail[:10]
         lines.append("其它失败：\n" + "\n".join(show) + ("…" if len(fail_detail) > 10 else ""))
@@ -649,17 +648,13 @@ def _handle_main_menu(bot, chat, cfg, sender, text) -> bool:
         _set_state(sender, S_FWD_COLLECT, messages=[])
         reply(chat, COLLECT_PROMPT)
         return True
-    if text == "2":       # 同步 Notion
-        _do_sync(chat)
-        reply(chat, MAIN_MENU)
+    if text == "2":       # 管理面板
+        reply(chat, _backend_hint())
         return True
-    if text == "3":       # 查看 Notion 后台
-        reply(chat, "Notion 后台（登录查看）：\n" + NOTION_BACKEND_URL)
-        return True
-    if text == "4":       # 待归类新群
+    if text == "3":       # 待归类新群
         reply(chat, _format_pending())
         return True
-    if text == "5":       # 迎新 / 拉群设置
+    if text in ("4", "5"):   # 迎新 / 拉群设置（5 是老编号，手指记着呢，留个兼容）
         reply(chat, _format_welcome_invite(cfg))
         return True
     reply(chat, "请输入有效的选项，或发送【0】退出。\n\n" + MAIN_MENU)
@@ -693,7 +688,7 @@ def _choose_menu(n_msgs) -> str:
     for name, num, cnt in groupings:
         lines.append(f"{num} 👈 {name}（{cnt} 群）")
     if not groupings:
-        lines.append("（暂无分组，先发「同步」从 Notion 拉取）")
+        lines.append("（暂无分组，去面板「分组管理」建一个：" + panel.panel_url() + "）")
     return "\n".join(lines)
 
 
@@ -729,7 +724,7 @@ def _handle_choose(bot, chat, cfg, sender, st, text) -> bool:
         label = "分组「" + "、".join(chosen) + "」"
 
     if not targets:
-        reply(chat, "未找到任何可转发的群组（检查 Notion 里群是否勾了「允许转发」），或发送【0】退出")
+        reply(chat, "未找到任何可转发的群组（去面板看看这些群勾没勾「允许转发」），或发送【0】退出")
         return True
 
     count = st.get("count", 0)
@@ -790,6 +785,8 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
         _set_state(sender, S_MAIN); reply(chat, MAIN_MENU); return True
     if plain in ("同步", "拉取", "刷新"):
         return _do_sync(chat)
+    if plain in ("后台", "面板", "管理面板"):
+        reply(chat, _backend_hint()); return True
     if plain in ("分组列表", "转发分组"):
         reply(chat, _format_groupings()); return True
     if plain in ("待归类", "新群"):
@@ -831,21 +828,18 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
 
 # ------------------------------------------------------------------ 同步 / 查看
 
+def _backend_hint() -> str:
+    return ("管理面板（分组 / 转发权限 / 迎新链接 / 拉群关键词 / 新群归类都在这儿改，"
+            "改完下一条消息即生效）：\n" + panel.panel_url())
+
+
 def _do_sync(chat) -> bool:
-    try:
-        from . import notion_sync
-        stat = notion_sync.pull()
-        msg = (f"同步成功 ✅ 分组 {stat['groupings']} 个、群 {stat['groups']} 个"
-               f"（允许转发 {stat['forward_on']} 个）、拉群关键词 {stat.get('invites', 0)} 条")
-        # 改名迁移不能静默：寻址仍走微信里的老备注，人得知道表里名字变了
-        renamed = stat.get("renamed") or []
-        if renamed:
-            msg += f"\n检测到 {len(renamed)} 个群在 Notion 改了名（寻址仍用原备注，不影响转发）："
-            msg += "".join(f"\n  「{r['from']}」→「{r['to']}」" for r in renamed)
-        reply(chat, msg)
-    except Exception as e:
-        reply(chat, f"同步失败：{e}")
-        log("ERROR", f"Notion 同步失败: {e}")
+    """「同步」已下线（2026-08-05 去 Notion 化）。
+
+    保留这个入口只为回一句人话——直接不认识这条指令的话，习惯性发「同步」的人
+    会以为机器人挂了。"""
+    reply(chat, "「同步」已经下线啦：分组/权限/拉群关键词现在直接在面板上改，"
+                "改完立刻生效，不用再拉取。\n" + _backend_hint())
     return True
 
 
@@ -853,11 +847,11 @@ def _format_groupings() -> str:
     data = registry.load()
     groupings = registry.forward_groupings_detailed(data)
     if not groupings:
-        return "还没有可转发的分组。发「同步」从 Notion 拉取。"
+        return "还没有可转发的分组。去面板「分组管理」建一个：\n" + panel.panel_url()
     lines = [f"转发分组（共 {len(groupings)} 个，编号即选择号）："]
     for name, num, cnt in groupings:
         lines.append(f"  {num} 👈 {name}（{cnt} 群）")
-    lines.append(f"最近同步：{data.get('synced_at') or '未同步'}")
+    lines.append(f"最后改动：{data.get('synced_at') or '未记录'}")
     return "\n".join(lines)
 
 
@@ -866,18 +860,20 @@ def _format_pending() -> str:
     pend = [name for name, g in data.get("groups", {}).items() if g.get("status") == "pending"]
     if not pend:
         return "没有待归类的新群。"
-    lines = [f"待归类新群（{len(pend)} 个，请去 Notion『群聊列表』选分组+勾允许转发）："]
+    lines = [f"待归类新群（{len(pend)} 个，去面板「待归类」选分组+勾允许转发）："]
     lines.extend(f"  - {n}" for n in pend)
+    lines.append(panel.panel_url())
     return "\n".join(lines)
 
 
 def _format_welcome_invite(cfg) -> str:
     return ("迎新 / 拉群设置：\n"
-            "【迎新】在 Notion『群聊列表』填「迎新推送链接」即开启该群迎新卡片。\n"
+            "【迎新】面板上给群填「迎新链接」即开启该群迎新卡片。\n"
             "  文案：设迎新文案 <群名>|<文案>（{name}=新人昵称）\n"
             "  开关：开迎新 <群名> / 关迎新 <群名>；查看：迎新列表\n"
-            "【拉群】关键词维护在 Notion『迎新拉群』表，发「同步」后生效；查看：拉群列表\n"
-            "  本地覆盖：设拉群 <关键词>|<目标群>；删拉群 <关键词>\n"
+            "【拉群】关键词在面板「拉群关键词」页增删改；查看：拉群列表\n"
+            "  应急也可在群里发：设拉群 <关键词>|<目标群>；删拉群 <关键词>\n"
+            "面板：" + panel.panel_url() + "\n"
             "回复 0 退出管理模式。")
 
 
@@ -924,7 +920,7 @@ def _check_groups(bot, chat, name) -> bool:
         lines.append(f"🔧 {len(fixed)} 个群的寻址串已按实测纠正：\n" + "\n".join(f" - {x}" for x in fixed[:10])
                      + ("…" if len(fixed) > 10 else ""))
     if fail_list:
-        lines.append("不可达（可能改了群名/退群，去 Notion 更新）：")
+        lines.append("不可达（可能改了群名/退群，去面板「群列表」改名或删除）：")
         lines.extend(f" - {t}" for t in fail_list)
     reply(chat, "\n".join(lines))
     return True
@@ -1121,7 +1117,7 @@ def _admin_group_names(cfg) -> set:
 
 
 def _fix_remarks(bot, chat, scope) -> bool:
-    """遍历【微信里实际存在的所有群】，把备注修成「真实群名🐶」，再回写 Notion。
+    """遍历【微信里实际存在的所有群】，把备注修成「真实群名🐶」。
 
     跟「核对备注」的区别：那个从登记表出发（只查得到后台已知的群），这个从微信出发
     （GetAllRecentGroups），能发现后台根本没有的群——discovery 是被动的（群里有人
@@ -1135,7 +1131,7 @@ def _fix_remarks(bot, chat, scope) -> bool:
     `{'chat_type','chat_name','group_member_count'}`，**没有 remark 字段**，
     `chat_name` 就是当前显示名——群有备注时它显示的是备注。所以"这个群的真实群名
     是什么"在微信侧读不到，判定只能是：显示名带🐶 = 打过了，不带 = 没打过、
-    此时显示名就是真实群名。是否打对了，拿 Notion 同步下来的群名集合去核。
+    此时显示名就是真实群名。是否打对了，拿登记表里的群名集合去核。
 
     改不了的只有一种：备注是追加出来的垃圾（形如「A🐶B🐶」）。SetGroupRemark 对已有
     备注是追加、空串也清不掉，硬打只会越接越长，这类只报出来让人工清。
@@ -1192,14 +1188,25 @@ def _fix_remarks(bot, chat, scope) -> bool:
                     verdict, detail = audit.FIX_FAILED, why
         results.append((real, verdict, detail))
         if verdict == audit.FIX_APPLY and real:
-            done_names.append(real)                      # 这次新打的，要写进 Notion
+            done_names.append(real)                      # 这次新打的
         elif verdict == audit.FIX_OK:
-            done_names.append(real[:-len(audit.DOG)])    # 已达标的，顺手确认 Notion 有🐶
+            done_names.append(real[:-len(audit.DOG)])    # 已达标的（去掉🐶还原群名）
         time.sleep(0.4)
 
     msg = audit.summarize_fix(results, dry=dry)
-    if not dry and done_names:
-        msg += "\n\n" + _sync_names_to_notion(done_names)
+    # 原来这里还要把这批群名回写 Notion『群聊列表』（补🐶、新增行）。去 Notion 化后
+    # 登记表自己就是真相源，打成功的那笔已由 _do_set_remark → mark_remark_applied
+    # 落盘；微信里扫到但登记表里没有的群，走面板「待归类」归类。
+    if not dry:
+        known = set(registry.load().get("groups", {}))
+        unknown = [n for n in done_names if n and n.rstrip(audit.DOG) not in known
+                   and n not in known]
+        if unknown:
+            msg += (f"\n\n以下 {len(unknown)} 个群微信里有、登记表里没有，"
+                    f"去面板手工新增并归类：\n"
+                    + "\n".join(f"  - {n}" for n in unknown[:20])
+                    + ("\n  …" if len(unknown) > 20 else "")
+                    + "\n" + panel.panel_url())
     reply(chat, msg)
     log("INFO", f"修备注完成（dry={dry}）：{len(results)} 个群")
     return True
@@ -1228,69 +1235,24 @@ def _do_set_remark(wx, real_name, want_remark) -> tuple[bool, str]:
     return True, want_remark
 
 
-def _sync_names_to_notion(names) -> str:
-    """把这批群名同步进 Notion『群聊列表』，标题统一成「群名🐶」。
-
-    先一次性拉全表建索引再逐个比对，而不是每个群都 find_page_by_name——
-    后者一个群要打 1-2 次 API，100 多个群会被 Notion 限流拖到几分钟。"""
-    try:
-        from . import notion_sync as ns
-        rows = ns._query_all(ns.DB_GROUPS)
-    except Exception as e:
-        log("ERROR", f"Notion 回写跳过：{e}")
-        return f"Notion 同步跳过：{e}"
-
-    index = {}
-    for row in rows:
-        base, marked = ns._strip_dog(ns._title(row["properties"].get("群名")))
-        if base and base not in index:
-            index[base] = (row["id"], marked)
-
-    added = fixed = already = failed = 0
-    new_names = []
-    for name in names:
-        base, _ = ns._strip_dog(name)
-        if not base:
-            continue
-        hit = index.get(base)
-        try:
-            if hit and hit[1]:
-                already += 1
-            elif hit:
-                ns.update_title_dog(hit[0], base)
-                fixed += 1
-            else:
-                ns.push_discovery(base, with_dog=True)
-                added += 1
-                new_names.append(base)
-        except Exception as e:
-            failed += 1
-            log("WARNING", f"回写 Notion 失败 {base}: {e}")
-
-    out = [f"Notion『群聊列表』已更新：新增 {added} 行、补🐶 {fixed} 行、本来就对 {already} 行"
-           + (f"、失败 {failed} 行（见日志）" if failed else "")]
-    if new_names:
-        out.append("新增的群请去 Notion 里选分组、勾允许转发：")
-        out.extend(f"  - {n}" for n in new_names)
-    return "\n".join(out)
-
-
-# ------------------------------------------------------------------ 拉群 / 迎新（config.json）
+# ------------------------------------------------------------------ 拉群 / 迎新
 
 def _format_invites(cfg) -> str:
-    notion_kw = registry.load().get("invite_keywords", {})
-    manual_kw = cfg.get("invite", {}).get("keywords", {})
-    if not notion_kw and not manual_kw:
-        return ("还没有拉群关键词。去 Notion『迎新拉群』表添加后发「同步」，"
-                "或用「设拉群 <关键词>|<目标群>」本地添加。")
-    lines = ["拉群关键词（用户私聊我或在群里发关键词即可被拉群）："]
-    if notion_kw:
-        lines.append(f"— Notion『迎新拉群』表（{len(notion_kw)} 条）—")
-        lines.extend(f"◾ {k} → {v}" + ("　⚠️被本地覆盖" if k in manual_kw else "")
-                     for k, v in notion_kw.items())
-    if manual_kw:
-        lines.append(f"— 本地（设拉群，{len(manual_kw)} 条，同名时优先）—")
-        lines.extend(f"◾ {k} → {v}" for k, v in manual_kw.items())
+    """拉群关键词现在只有一张表（registry.invite_keywords，面板维护）。
+    config.json 里那份老的本地覆盖若还有残留也一并列出来，提示去面板收编。"""
+    items = registry.invite_items(registry.load())
+    legacy = cfg.get("invite", {}).get("keywords", {})
+    if not items and not legacy:
+        return ("还没有拉群关键词。去面板「拉群关键词」页添加：\n" + panel.panel_url())
+    lines = ["拉群关键词（用户【私聊】我发关键词即可被拉群）："]
+    for k, e in items:
+        mark = "" if e["enabled"] else "　（已停用）"
+        mark += "　⚠️被 config 覆盖" if k in legacy else ""
+        lines.append(f"◾ {k} → {e['group']}{mark}")
+    if legacy:
+        lines.append(f"— config.json 遗留覆盖（{len(legacy)} 条，同名时优先，建议去面板收编）—")
+        lines.extend(f"◾ {k} → {v}" for k, v in legacy.items())
+    lines.append("面板：" + panel.panel_url())
     return "\n".join(lines)
 
 
@@ -1324,18 +1286,28 @@ def _set_remark_override(chat, cfg, group_name, remark) -> bool:
 
 
 def _set_invite(chat, cfg, keyword, target) -> bool:
+    """「设拉群 <关键词>|<目标群>」——现在直写 registry，和面板同一张表。
+
+    以前它写的是 config.json 的本地覆盖层，于是同一个关键词可能在两处各有一份，
+    面板上改了却被 config 那份盖掉。现在只有一张表，群里改和面板改等价。"""
     if not keyword or not target:
         reply(chat, "格式：设拉群 <关键词>|<目标群>"); return True
-    cfg.setdefault("invite", {}).setdefault("keywords", {})[keyword] = target
-    store.save(cfg)
-    reply(chat, f"已设置：发「{keyword}」→ 拉进「{target}」。"); return True
+    try:
+        registry.set_invite_keyword(keyword, target)
+    except ValueError as e:
+        reply(chat, f"没设成：{e}。目标群得先在登记表里（面板「群列表」能看到）。")
+        return True
+    legacy = (cfg.get("invite") or {}).get("keywords") or {}
+    extra = "\n⚠️ config.json 里还有一条同名的旧覆盖，会盖住这次设置，去面板清一下。" \
+        if keyword in legacy else ""
+    reply(chat, f"已设置：发「{keyword}」→ 拉进「{target}」。{extra}"); return True
 
 
 def _delete_invite(chat, cfg, keyword) -> bool:
-    kw = cfg.setdefault("invite", {}).setdefault("keywords", {})
-    if keyword not in kw:
-        reply(chat, f"没有「{keyword}」这个拉群关键词。"); return True
-    del kw[keyword]; store.save(cfg)
+    try:
+        registry.delete_invite_keyword(keyword)
+    except ValueError as e:
+        reply(chat, f"{e}"); return True
     reply(chat, f"拉群关键词「{keyword}」已删除。"); return True
 
 

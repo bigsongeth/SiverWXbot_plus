@@ -1652,6 +1652,45 @@ def ncc_kb_save_config():
         return jsonify({'status': 'error', 'message': str(e)})
 
 
+@app.route('/ncc_community')
+@login_required
+def ncc_community_page():
+    """NCC 社群管理独立配置页（ncc_community 插件，PANEL_SPEC.md）。
+    独立模板 + 薄路由，避免改上游 dashboard.html 与业务逻辑。"""
+    return render_template('ncc_community.html')
+
+
+@app.route('/ncc_community/state')
+@login_required
+def ncc_community_state():
+    """一次返回面板需要的全部数据（群/分组/关键词/待归类/统计）。"""
+    try:
+        from plugins.ncc_community import panel
+        return jsonify({'status': 'success', 'state': panel.state()})
+    except Exception as e:
+        log('ERROR', f'读取 NCC 社群管理数据失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+@app.route('/ncc_community/action', methods=['POST'])
+@login_required
+def ncc_community_action():
+    """执行一次面板操作（增删改群/分组/拉群关键词、归类、改名、恢复）。
+    判断与写盘全在 plugins/ncc_community/panel.py 里，这里只做收发。"""
+    try:
+        data = request.get_json() or {}
+        from plugins.ncc_community import panel
+        message = panel.apply(data.get('op'), data.get('payload') or {})
+        log('SUCCESS', f"NCC 社群管理：{data.get('op')} —— {message}")
+        return jsonify({'status': 'success', 'message': message})
+    except ValueError as e:
+        # 参数不合法（群名为空、分组不存在、编号重复…）——这是用户输入问题，不是故障
+        return jsonify({'status': 'error', 'message': str(e)})
+    except Exception as e:
+        log('ERROR', f'NCC 社群管理操作失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
 @app.route('/pick_image_file', methods=['GET'])
 @login_required
 def pick_image_file():

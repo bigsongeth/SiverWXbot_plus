@@ -195,12 +195,22 @@ class NccCommunityTestCase(unittest.TestCase):
     # ---------- 拉群 / 迎新配置指令 ----------
 
     def test_invite_keyword_management(self):
+        """「设拉群/删拉群」现在直写 registry —— 和面板同一张表（去 Notion 化）。
+
+        以前它写 config.json 的本地覆盖层，于是同一个关键词可能两处各有一份，
+        面板上改了却被 config 那份盖掉。"""
+        registry.add_group("灵感食堂活动群")
         handle_friend_message(self.bot, self.admin_chat, FakeMsg("设拉群 灵感食堂|灵感食堂活动群"))
-        cfg = store.load()
-        self.assertEqual(cfg["invite"]["keywords"]["灵感食堂"], "灵感食堂活动群")
+        self.assertEqual(registry.invite_map(registry.load())["灵感食堂"], "灵感食堂活动群")
         handle_friend_message(self.bot, self.admin_chat, FakeMsg("删拉群 灵感食堂"))
-        cfg = store.load()
-        self.assertNotIn("灵感食堂", cfg["invite"]["keywords"])
+        self.assertNotIn("灵感食堂", registry.load()["invite_keywords"])
+
+    def test_invite_keyword_rejects_unknown_group(self):
+        """目标群不在登记表里就不给设 —— 那种关键词是哑弹：
+        用户发了、机器人找不到群，只会失败退配额。"""
+        handle_friend_message(self.bot, self.admin_chat, FakeMsg("设拉群 张三|根本没有这个群"))
+        self.assertNotIn("张三", registry.load().get("invite_keywords", {}))
+        self.assertIn("登记表", self.admin_chat.sent[-1])
 
     def test_welcome_management(self):
         handle_friend_message(self.bot, self.admin_chat, FakeMsg("设迎新文案 某群|你好 {name}"))
@@ -358,7 +368,7 @@ class NccCommunityTestCase(unittest.TestCase):
         handled = handle_friend_message(self.bot, chat, FakeMsg("今天天气不错", sender="小明"))
         self.assertFalse(handled)
 
-    # ---------- invite: Notion 同步来的关键词（registry.invite_keywords） ----------
+    # ---------- invite: registry.invite_keywords（面板维护的那张表） ----------
 
     def _seed_registry_invites(self, keywords, groups=None):
         data = registry.load()
@@ -391,19 +401,30 @@ class NccCommunityTestCase(unittest.TestCase):
         self.assertEqual(self.bot.wx.chatted, ["NCC的大理朋友们3群🐶"])
 
     def test_manual_keyword_overrides_registry(self):
-        self._seed_registry_invites({"测试拉群": "Notion指向的群"})
-        # config.json 默认带 测试拉群 → 肥肉测试1，应覆盖 Notion 的同名关键词
+        self._seed_registry_invites({"测试拉群": "另一个群"})
+        # config.json 默认带 测试拉群 → 肥肉测试1，作为遗留覆盖层仍优先于 registry
         chat = FakeChat("小红", chat_type="friend")
         self.assertTrue(handle_friend_message(self.bot, chat, FakeMsg("测试拉群", sender="小红")))
         self.assertEqual(self.bot.wx.chatted, ["肥肉测试1"])
 
-    def test_invite_list_shows_both_sources(self):
+    def test_invite_list_shows_registry_and_legacy(self):
+        """列表以 registry 那张表为主，config.json 里的遗留覆盖也列出来提示收编。"""
         self._seed_registry_invites({"大理": "NCC的大理朋友们3群"})
         handle_friend_message(self.bot, self.admin_chat, FakeMsg("拉群列表"))
         out = self.admin_chat.sent[-1]
         self.assertIn("大理", out)
-        self.assertIn("Notion", out)
+        self.assertNotIn("Notion", out)
+        self.assertIn("遗留覆盖", out)
         self.assertIn("测试拉群", out)
+        self.assertIn("/ncc_community", out)
+
+    def test_disabled_keyword_not_triggered(self):
+        """面板上「停用」的关键词保留配置但不生效。"""
+        self._seed_registry_invites(
+            {"大理": {"group": "NCC的大理朋友们3群", "enabled": False}})
+        chat = FakeChat("小红", chat_type="friend")
+        self.assertFalse(handle_friend_message(self.bot, chat, FakeMsg("大理", sender="小红")))
+        self.assertEqual(self.bot.wx.chatted, [])
 
 
 
@@ -574,10 +595,15 @@ class RenameMigrationTests(unittest.TestCase):
         self.assertTrue(data["groups"]["A群"]["remark_applied"])
         self.assertEqual(data["renamed_last_sync"], [])
 
-    def test_notion_dog_marks_applied_without_local_record(self):
+    def test_notion_dog_no_longer_marks_applied(self):
+        """Notion 标题带🐶【不再】能把 remark_applied 顶成 True（PANEL_SPEC §1 #7）。
+
+        这个兜底是 8/4 事故的假绿来源：人在 Notion 里手敲一个🐶，登记表就以为
+        微信里已经打上备注，寻址串用「群名🐶」而微信里根本没这备注。
+        本地记录丢了就跑「修备注 全部」从微信侧重建，别让 Notion 替微信作证。"""
         self._seed("A群", "pid-1", applied=False)
         data = registry.upsert_from_notion({}, self._incoming("A群", "pid-1", marked=True))
-        self.assertTrue(data["groups"]["A群"]["remark_applied"])
+        self.assertFalse(data["groups"]["A群"]["remark_applied"])
 
 
 

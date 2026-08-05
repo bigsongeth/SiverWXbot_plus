@@ -2,12 +2,16 @@
 """ncc_community 插件：NCC 社群自动化。
 
 - forward.py   管理群转发：菜单式指令，把任意消息群发到一组群聊（读 registry）
-- registry.py  本地群登记表：群/分组/权限，Notion 同步下来的运行时缓存
-- notion_sync  Notion 双向同步：拉分组/权限、回写新发现群
+- registry.py  本地群登记表：群/分组/权限/拉群关键词，**唯一真相源**
+- panel.py     面板 /ncc_community 的逻辑层（人在网页上维护上面那张表）
+- notion_sync  【已解除挂接】旧的 Notion 双向同步，留作回滚参考，无调用点
 - remark.py    干净打🐶备注（登记表标志幂等，避免 wxautox 追加坑）
-- discovery.py 被动发现：未登记群一说话 → 打备注 + 入 Notion 待归类 + 提醒
+- discovery.py 被动发现：未登记群一说话 → 打备注 + 登记为待归类 + 提醒
 - welcome.py   分群迎新：新人进群发欢迎语 + 在地化链接卡片
 - invite.py    关键词拉群：私聊命中关键词后把发送人拉进目标群（群聊不触发）
+
+2026-08-05 去 Notion 化（PANEL_SPEC.md）：分组/权限/拉群关键词改由面板维护，
+「同步」「回写notion」指令下线，机器人侧不再有任何 Notion 网络调用。
 
 权限模型：管理群（进群即管理员）替代旧协议的 wxid 白名单验证。
 wxbot_core.py 只保留三个最小 hook（friend/self/system 三个分支各一处），
@@ -61,7 +65,7 @@ def handle_self_message(bot, chat, msg) -> bool:
 
 
 def _try_batch(bot, chat, msg, cfg) -> bool:
-    """管理群里的 Phase3 批量纳管指令（批量备注/预览/回写Notion）。命中返回 True。"""
+    """管理群里的 Phase3 批量纳管指令（批量备注/预览）。命中返回 True。"""
     if str(getattr(msg, "type", "") or "") != "text":
         return False
     content = str(getattr(msg, "content", "") or "").strip()

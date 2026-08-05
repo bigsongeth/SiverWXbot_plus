@@ -2,8 +2,8 @@
 """被动发现新群 —— 引擎的④。
 
 肥肉被拉进新群、群里一有人说话，就自动：
-  登记为 pending → 打🐶备注 → 写进 Notion 待归类 → 管理群提醒。
-（用户决策：自动打备注+入库+提醒）
+  登记为 pending → 打🐶备注 → 管理群提醒（去面板归类）。
+（用户决策：自动打备注+入库+提醒。2026-08-05 起不再写 Notion，见 PANEL_SPEC.md）
 
 只对【群消息】且【未登记】的会话触发，且用进程内去重避免同一群反复处理。
 微信操作（打备注）走 bot.wx，同进程、持 MAIN_WINDOW_LOCK。
@@ -57,19 +57,12 @@ def handle_discovery(bot, chat, msg, cfg) -> None:
             applied_note = f"（打备注异常：{e}）"
             log("ERROR", f"发现新群打备注异常 {who}: {e}")
 
-    # 写入 Notion 待归类（失败不影响本地登记）
-    notion_note = ""
-    try:
-        from . import notion_sync
-        notion_sync.push_discovery(who)
-        notion_note = "，已加入 Notion 待归类"
-    except Exception as e:
-        notion_note = f"（写 Notion 失败：{e}）"
-        log("WARNING", f"新群写 Notion 失败 {who}: {e}")
-
+    # 去 Notion 化后不再往 Notion 写待归类行（PANEL_SPEC §1 #2）：
+    # registry.add_pending 已经把它落到本地，面板「待归类」页直接就能看到并归类。
+    from . import panel
     _notify_admin(bot, cfg,
-                  f"发现新群「{who}」{applied_note}{notion_note}。\n"
-                  f"请去 Notion『群聊列表』给它选分组、勾选允许转发/发言。")
+                  f"发现新群「{who}」{applied_note}。\n"
+                  f"去面板「待归类」给它选分组、勾允许转发/发言：\n{panel.panel_url()}")
 
 
 def _registry_name(data: dict, who: str) -> str:
