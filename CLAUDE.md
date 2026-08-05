@@ -138,7 +138,8 @@ if handled and checkin_reply:
   - **`remark_applied` 的「Notion 标题带🐶」兜底删掉了**——那是假绿来源：人在 Notion 手敲一个🐶，登记表就以为微信里已打备注，寻址串用「群名🐶」而微信里根本没这备注。本地记录丢了就跑「修备注 全部」从微信侧重建。
   - **改名不再自动发现**：Notion 时代改标题即隐式迁移，现在群改名要人在面板点「改名」（换 key、保 `gid`、继承微信里那个真实备注、指向它的拉群关键词跟着迁）。隐式批量迁移出过事（幽灵群、同步悄悄复活坏群），显式更好排查。
   - 群条目多了 `gid`（内部稳定 id），接替 `notion_page_id` 认人；`notion_page_id` 保留为只读遗留字段。
-  - **部署要先跑一次迁移**：`python -m plugins.ncc_community.migrate_notion_off`（补 gid、关键词升级+合并，幂等，`--dry` 可预览，自动备份 `registry.json.bak-<日期>`）。
+  - **部署要先跑一次迁移**：`python -m plugins.ncc_community.migrate_notion_off`（补 gid、关键词升级+合并，幂等，`--dry` 可预览，自动备份 `registry.json.bak-<日期>`）。新代码**兼容未迁移的老数据**，所以迁移不是硬前提，看门狗提前自动重启也不会出事。
+  - ★★ **改磁盘数据格式的上线，先问"没重启的老进程读得动吗"（2026-08-05 踩到）**：迁移把 `invite_keywords` 升级成 dict 后，**还在跑的旧进程当场 `TypeError: unhashable type: 'dict'`**（旧 `invite.py` 直接拿值当群名寻址），从迁移完到人重启之间**拉群全坏**——而"人手动重启"这段时间是不可控的。处置是迁移后把关键词临时降回纯字符串（gid 留着，旧代码不认识也不碰），等重启后再跑一次迁移。**读不动就把格式升级推迟到重启之后，别赌那段窗口没人用。**
   - **写任何面板改动都走 `registry` 的 CRUD**（`set_group_fields`/`rename_group`/`classify_pending`/`restore_reachable`/`set_grouping`/`set_invite_keyword`…），别直接改 dict 落盘——校验（分组存在、编号唯一、目标群存在）和级联（删群连带清关键词、删分组从所有群摘掉）都在那儿。
   - 面板逻辑在 `panel.py`，**刻意不 import flask、不 import wxbot_core**，所以 mac 上能裸跑单测；`web_server.py` 只有三条薄路由（页/state/action）。
 - **拉群只在私聊触发**，群聊发关键词不处理（2026-07-12 定）。
