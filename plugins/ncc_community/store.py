@@ -19,6 +19,9 @@ CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 DEFAULT_CONFIG = {
     # 管理群：群内所有成员都是管理员
     "admin_group": "NCC 社群管理肥肉售后维权🤖",
+    # 管理面板地址（「后台」指令回给管理群的链接）。留空则用 panel.DEFAULT_PANEL_URL。
+    # 走 Tailscale IP，局域网换段也不用改（CLAUDE.md 3.1）。
+    "panel_url": "http://100.73.185.46:10001/ncc_community",
     "forward": {
         # 收集模式空闲多少秒后自动结束
         "session_timeout": 300,

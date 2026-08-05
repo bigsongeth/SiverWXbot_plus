@@ -88,8 +88,10 @@ def _record_failure(person: str, keyword: str) -> tuple:
 def handle_invite(bot, chat, msg, cfg) -> bool:
     """私聊好友消息入口。命中拉群关键词返回 True；群聊一律不处理。
 
-    关键词两个来源：Notion「迎新拉群」表（发「同步」进 registry，真相源）
-    + config.json 的 invite.keywords（管理群「设拉群」手工加的，同名时覆盖前者）。"""
+    关键词真相源是 registry.invite_keywords（面板 `/ncc_community` 维护，
+    管理群「设拉群」也直接写它）。config.json 的 invite.keywords 是去 Notion 化
+    之前的本地覆盖层，只为兼容残留数据还读一下，同名时仍优先——一期迁移脚本
+    已把它并进 registry，正常情况下这份是空的。"""
     if str(getattr(chat, "chat_type", "") or "") == "group":
         return False
     if str(getattr(msg, "type", "") or "") != "text":
@@ -101,7 +103,7 @@ def handle_invite(bot, chat, msg, cfg) -> bool:
 
     icfg = cfg.get("invite") or {}
     reg_data = registry.load()
-    keywords = dict(reg_data.get("invite_keywords") or {})
+    keywords = registry.invite_map(reg_data)     # 停用的关键词不会出现在这里
     keywords.update(icfg.get("keywords") or {})
     target = keywords.get(content)
     if not target:

@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Phase 3 批量纳管 —— 给存量群逐个打🐶备注，再回写 Notion。
+"""Phase 3 批量纳管 —— 给存量群逐个打🐶备注。
 
-清单来源：registry（Notion『群聊列表』同步下来的 86 个群，全是群、无个人）。
-比"滚动聊天列表"更全、且不会误判个人。
+清单来源：registry（本地登记表，全是群、无个人）。比"滚动聊天列表"更全、
+且不会误判个人。
 
-两步（对齐用户："打完标记之后把它同步到 database"）：
-  ① run_remark_pass  逐群 ChatWith→确认是群→SetGroupRemark(原名🐶)→登记表标记
-  ② run_notion_pass  把已标记群的 Notion『群名』改成「原名🐶」，让表里可见
+  run_remark_pass  逐群 ChatWith→确认是群→SetGroupRemark(原名🐶)→登记表标记
+
+2026-08-05 去 Notion 化（PANEL_SPEC §4）后，原来的第②步「回写notion」
+（把已标记群的 Notion 标题改成「原名🐶」）已下线——登记表自己就是真相源，
+打成功那笔由 registry.mark_remark_applied 落盘，不需要再往别处抄一份。
 
 安全：
 - 全程在机器人进程内、持 forward.MAIN_WINDOW_LOCK（与监听/转发同一把锁，
@@ -21,7 +23,7 @@ import random
 import threading
 import time
 
-from . import registry, remark, notion_sync
+from . import registry, remark
 from .common import REPLY_PREFIX, log
 
 DOG = "\U0001f436"  # 🐶
@@ -136,43 +138,6 @@ def _apply_one(wx, name, lock):
     return "ok", target
 
 
-# ---------------------------------------------------------------- ② 回写 Notion 标题
-
-def run_notion_pass(bot, admin: str) -> None:
-    if not _RUNNING.acquire(blocking=False):
-        _send(bot, admin, "已有批量任务在跑，等它结束。")
-        return
-    threading.Thread(target=_notion_worker, args=(bot, admin), daemon=True).start()
-
-
-def _notion_worker(bot, admin):
-    try:
-        data = registry.load()
-        # 已打🐶、有 Notion page、标题还没带🐶的群
-        todo = [(name, g) for name, g in data.get("groups", {}).items()
-                if g.get("remark_applied") and g.get("notion_page_id")]
-        if not todo:
-            _send(bot, admin, "没有需要回写的群（可能还没打🐶，或没同步过 Notion）。")
-            return
-        _send(bot, admin, f"开始回写 Notion 群名（{len(todo)} 个）…")
-        ok = fail = 0
-        for name, g in todo:
-            try:
-                notion_sync.update_title_dog(g["notion_page_id"], name)
-                ok += 1
-            except Exception as e:
-                fail += 1
-                log("WARNING", f"回写 Notion 失败 {name}: {e}")
-            time.sleep(0.4)  # Notion 限流友好
-        _send(bot, admin, f"{REPLY_PREFIX} Notion 回写完成：成功 {ok}、失败 {fail}。"
-                          f"表里群名已带🐶，群名再改也锁得住了。")
-    except Exception as e:
-        log("ERROR", f"Notion 回写线程异常: {e}")
-        _send(bot, admin, f"回写 Notion 出错：{e}")
-    finally:
-        _RUNNING.release()
-
-
 # ---------------------------------------------------------------- 指令入口
 
 def handle_batch_command(bot, chat, cfg, text) -> bool:
@@ -190,7 +155,12 @@ def handle_batch_command(bot, chat, cfg, text) -> bool:
     if m:
         run_remark_pass(bot, admin, limit=int(m.group(1))); return True
     if plain in ("回写notion", "回写Notion", "同步备注到notion", "同步备注到Notion", "回写群名"):
-        run_notion_pass(bot, admin); return True
+        # 已下线，但回一句话——不认识这条指令的话，习惯性发它的人会以为机器人挂了
+        from . import panel
+        _send_chat(chat, "「回写notion」已经下线啦：登记表现在就是真相源，"
+                         "打备注成功当场就记下了，不用再往 Notion 抄一份。\n"
+                         "群的分组/权限去面板改：" + panel.panel_url())
+        return True
     return False
 
 

@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<!-- NCC 社群管理独立配置页（PANEL_SPEC.md §3）。独立文件，不改上游 dashboard.html，合并零冲突。
+     所有数据来自 /ncc_community/state，所有写操作走 /ncc_community/action。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NCC 社群管理 · SiverWXbot</title>
+  <style>
+    :root { --bg:#f5f6f8; --card:#fff; --line:#e5e7eb; --text:#1f2328; --muted:#6b7280; --brand:#0d9488; --brand-d:#0f766e; --warn:#b45309; --err:#dc2626; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }
+    .wrap { max-width:1000px; margin:0 auto; padding:24px 20px 60px; }
+    .top { display:flex; align-items:center; justify-content:space-between; margin-bottom:6px; }
+    h1 { font-size:20px; margin:0; }
+    .back { color:var(--brand); text-decoration:none; font-size:14px; }
+    .sub { color:var(--muted); font-size:13px; margin:0 0 14px; }
+    .stats { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }
+    .stat { background:var(--card); border:1px solid var(--line); border-radius:9px; padding:6px 12px; font-size:13px; }
+    .stat b { font-size:15px; }
+    .tabs { display:flex; gap:6px; border-bottom:1px solid var(--line); margin-bottom:16px; flex-wrap:wrap; }
+    .tab { padding:9px 16px; border:1px solid transparent; border-bottom:0; border-radius:9px 9px 0 0; cursor:pointer; font-size:14px; color:var(--muted); }
+    .tab.on { background:var(--card); border-color:var(--line); color:var(--text); font-weight:600; margin-bottom:-1px; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:14px; }
+    .card h2 { font-size:15px; margin:0 0 4px; }
+    .hint { color:var(--muted); font-size:12.5px; margin:0 0 12px; }
+    .row { display:flex; align-items:center; gap:10px; padding:9px 11px; border:1px solid var(--line); border-radius:9px; margin-bottom:7px; background:#fafafa; flex-wrap:wrap; }
+    .row .nm { flex:1; min-width:180px; word-break:break-all; font-weight:500; }
+    .tags { display:flex; gap:5px; flex-wrap:wrap; }
+    .tag { background:#eef2f5; border-radius:6px; padding:1px 7px; font-size:12px; color:var(--muted); }
+    .tag.bad { background:#fee2e2; color:var(--err); }
+    .badge { font-size:11.5px; border-radius:5px; padding:1px 6px; }
+    .b-fwd { background:#ccfbf1; color:var(--brand-d); }
+    .b-spk { background:#e0e7ff; color:#4338ca; }
+    .b-un  { background:#fee2e2; color:var(--err); }
+    .b-dog { background:#fef3c7; color:var(--warn); }
+    input[type=text], input[type=number], select { border:1px solid var(--line); border-radius:8px; padding:7px 10px; font-size:14px; font-family:inherit; color:var(--text); background:#fff; }
+    /* select 的固有宽度由最长的那个群名撑出来，不压成 0 会把整行挤到换行 */
+    select { width:0; min-width:140px; }
+    input[type=text] { min-width:150px; }
+    label.ck { display:inline-flex; align-items:center; gap:5px; font-size:13px; cursor:pointer; }
+    button { background:var(--brand); color:#fff; border:0; border-radius:8px; padding:7px 14px; font-size:13.5px; cursor:pointer; }
+    button:hover { background:var(--brand-d); }
+    button.ghost { background:#eef2f5; color:var(--text); }
+    button.danger { background:#fee2e2; color:var(--err); }
+    .editor { border:1px solid var(--brand); border-top:0; border-radius:0 0 9px 9px; padding:14px; margin:-8px 0 10px; background:#fff; }
+    .editor .grid { display:grid; grid-template-columns:96px 1fr; gap:10px 12px; align-items:start; }
+    .editor .grid > span { color:var(--muted); font-size:13px; padding-top:6px; }
+    .cks { display:flex; flex-wrap:wrap; gap:6px 14px; }
+    .acts { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; align-items:center; }
+    .sep { border-top:1px dashed var(--line); margin:12px 0 0; padding-top:10px; }
+    .empty { color:var(--muted); font-size:13px; padding:8px 2px; }
+    .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--muted); }
+    #msg { position:sticky; bottom:0; padding:12px 0 2px; font-size:13.5px; background:linear-gradient(transparent,var(--bg) 40%); }
+    .ok { color:var(--brand-d); } .err { color:var(--err); }
+    .searchbar { display:flex; gap:10px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>🐶 NCC 社群管理</h1>
+      <a class="back" href="/dashboard">← 返回面板</a>
+    </div>
+    <p class="sub">群的分组 / 转发权限 / 迎新链接、转发分组编号、拉群关键词、新群归类，全部在这里维护，不再依赖 Notion 和微信对话指令。改动下一条微信消息即生效，无需重启。</p>
+    <div class="stats" id="stats"></div>
+
+    <div class="tabs">
+      <div class="tab on" data-tab="groups">群列表</div>
+      <div class="tab" data-tab="groupings">分组管理</div>
+      <div class="tab" data-tab="invites">拉群关键词</div>
+      <div class="tab" data-tab="pending">待归类</div>
+    </div>
+
+    <div id="pane"></div>
+    <div id="msg"></div>
+  </div>
+
+<script>
+let S = null, TAB = 'groups', OPEN = null, Q = '';
+
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const $ = id => document.getElementById(id);
+const el = (h) => { const d = document.createElement('div'); d.innerHTML = h.trim(); return d.firstChild; };
+
+function say(text, cls) { $('msg').innerHTML = '<span class="' + (cls || '') + '">' + esc(text) + '</span>'; }
+
+async function load() {
+  const r = await fetch('/ncc_community/state');
+  const d = await r.json();
+  if (d.status !== 'success') { say('加载失败：' + (d.message || ''), 'err'); return; }
+  S = d.state;
+  render();
+}
+
+async function act(op, payload, confirmText) {
+  if (confirmText && !confirm(confirmText)) return;
+  say('处理中…');
+  try {
+    const r = await fetch('/ncc_community/action', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({op: op, payload: payload || {}})
+    });
+    const d = await r.json();
+    if (d.status === 'success') { OPEN = null; await load(); say('✓ ' + d.message, 'ok'); }
+    else say('✗ ' + (d.message || '操作失败'), 'err');
+  } catch (e) { say('✗ ' + e.message, 'err'); }
+}
+
+// ---------------------------------------------------------------- 渲染
+function render() {
+  const st = S.stats;
+  $('stats').innerHTML =
+    stat('群', st.groups) + stat('可转发', st.forwardable) + stat('不可达', st.unreachable) +
+    stat('待归类', st.pending) + stat('分组', st.groupings) + stat('拉群关键词', st.keywords_on + '/' + st.keywords) +
+    '<div class="stat" style="color:var(--muted)">最后改动：' + esc(S.updated_at || '—') + '</div>';
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === TAB));
+  ({groups: renderGroups, groupings: renderGroupings, invites: renderInvites, pending: renderPending})[TAB]();
+}
+const stat = (k, v) => '<div class="stat">' + k + ' <b>' + esc(v) + '</b></div>';
+
+function groupingChecks(selected, idPrefix) {
+  if (!S.groupings.length) return '<span class="empty">还没有分组，先去「分组管理」建一个。</span>';
+  const set = new Set(selected || []);
+  return '<div class="cks">' + S.groupings.map((g, i) =>
+    '<label class="ck"><input type="checkbox" class="' + idPrefix + '-gp" value="' + esc(g.name) + '"' +
+    (set.has(g.name) ? ' checked' : '') + '>' + esc(g.name) +
+    (g.number == null ? '' : ' <span class="mono">#' + g.number + '</span>') + '</label>').join('') + '</div>';
+}
+const picked = cls => [...document.querySelectorAll('.' + cls + ':checked')].map(x => x.value);
+
+// ---- 群列表 ----
+function renderGroups() {
+  const list = S.groups.filter(g => !Q || g.name.toLowerCase().includes(Q) ||
+    (g.groupings || []).some(x => x.toLowerCase().includes(Q)));
+  let h = '<div class="card"><h2>群列表</h2>' +
+    '<p class="hint">分组决定群发时选哪个编号能发到它；「允许转发」没勾的群任何群发都不会发到。改了群名请用行内的「改名」，别删了重建——那会丢掉备注寻址。</p>' +
+    '<div class="searchbar"><input type="text" id="q" placeholder="搜群名 / 分组" value="' + esc(Q) + '">' +
+    '<span class="empty">显示 ' + list.length + ' / ' + S.groups.length + '</span>' +
+    '<span style="flex:1"></span><input type="text" id="newg" placeholder="手工新增群名"><button id="addg">新增群</button></div>';
+  h += list.map(g => groupRow(g)).join('') || '<div class="empty">没有匹配的群。</div>';
+  $('pane').innerHTML = h + '</div>';
+
+  $('q').oninput = e => { Q = e.target.value.trim().toLowerCase(); render(); $('q').focus(); };
+  $('addg').onclick = () => { const n = $('newg').value.trim(); if (n) act('group.add', {name: n}); };
+  bindRows(list, 'g');
+}
+
+function groupRow(g) {
+  const open = OPEN === 'g:' + g.name;
+  const badges =
+    (g.allow_forward ? '<span class="badge b-fwd">转发</span>' : '') +
+    (g.allow_speak ? '<span class="badge b-spk">发言</span>' : '') +
+    (g.status === 'unreachable' ? '<span class="badge b-un">不可达</span>' : '') +
+    (g.remark_applied ? '<span class="badge b-dog">🐶已打</span>' : '');
+  let h = '<div class="row" style="' + (open ? 'border-color:var(--brand);border-bottom-left-radius:0;border-bottom-right-radius:0;margin-bottom:0' : '') + '">' +
+    '<span class="nm">' + esc(g.name) + '</span>' +
+    '<span class="tags">' + (g.groupings.length ? g.groupings.map(x =>
+      '<span class="tag' + (g.stale_groupings.includes(x) ? ' bad' : '') + '">' + esc(x) + '</span>').join('') :
+      '<span class="tag">未分组</span>') + '</span>' +
+    badges + '<button class="ghost" data-edit="g:' + esc(g.name) + '">' + (open ? '收起' : '编辑') + '</button></div>';
+  if (!open) return h;
+  return h + '<div class="editor"><div class="grid">' +
+    '<span>分组</span><div>' + groupingChecks(g.groupings, 'ed') + '</div>' +
+    '<span>权限</span><div class="cks">' +
+      '<label class="ck"><input type="checkbox" id="ed-fwd"' + (g.allow_forward ? ' checked' : '') + '>允许转发</label>' +
+      '<label class="ck"><input type="checkbox" id="ed-spk"' + (g.allow_speak ? ' checked' : '') + '>允许发言</label></div>' +
+    '<span>迎新链接</span><div><input type="text" id="ed-url" style="width:100%" placeholder="填了就开启该群迎新卡片" value="' + esc(g.welcome_url) + '"></div>' +
+    '<span>寻址</span><div class="mono">' + esc(g.addressing.join('  →  ') || '（无）') +
+      (g.gid ? '　gid=' + esc(g.gid) : '') + '</div>' +
+    '</div><div class="acts"><button id="ed-save">保存</button>' +
+    (g.status === 'unreachable' ? '<button class="ghost" id="ed-restore">恢复可转发</button>' : '') +
+    '</div><div class="sep acts">' +
+    '<input type="text" id="ed-newname" placeholder="群在微信里的新名字"><button class="ghost" id="ed-rename">改名</button>' +
+    '<span style="flex:1"></span><button class="danger" id="ed-del">从登记表删除</button></div></div>';
+}
+
+function bindRows(list, kind) {
+  document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => {
+    OPEN = OPEN === b.dataset.edit ? null : b.dataset.edit; render();
+  });
+  if (!OPEN) return;
+  const name = OPEN.slice(2);
+  const save = $('ed-save');
+  if (save) save.onclick = () => act(kind === 'p' ? 'group.classify' : 'group.save', {
+    name: name, groupings: picked('ed-gp'),
+    allow_forward: $('ed-fwd').checked, allow_speak: $('ed-spk').checked,
+    welcome_url: $('ed-url') ? $('ed-url').value.trim() : ''
+  });
+  if ($('ed-restore')) $('ed-restore').onclick = () => act('group.restore', {name: name});
+  if ($('ed-rename')) $('ed-rename').onclick = () => {
+    const nn = $('ed-newname').value.trim();
+    if (nn) act('group.rename', {name: name, new_name: nn});
+  };
+  if ($('ed-del')) $('ed-del').onclick = () => act('group.delete', {name: name},
+    '确定把「' + name + '」从登记表删掉？指向它的拉群关键词会一并清掉。');
+}
+
+// ---- 分组管理 ----
+function renderGroupings() {
+  let h = '<div class="card"><h2>转发分组</h2>' +
+    '<p class="hint">编号就是管理群里选分组时发的数字（1 被「所有群聊」占用，不能用）。没编号的分组不会出现在选择菜单里。「参与转发」关掉后，整个分组都不会被群发选中。</p>';
+  h += S.groupings.map(g =>
+    '<div class="row"><input type="text" class="gr-name" data-old="' + esc(g.name) + '" value="' + esc(g.name) + '" style="flex:1">' +
+    '<input type="number" class="gr-num" style="width:88px" placeholder="编号" value="' + (g.number == null ? '' : g.number) + '">' +
+    '<label class="ck"><input type="checkbox" class="gr-fwd"' + (g.forward_enabled ? ' checked' : '') + '>参与转发</label>' +
+    '<span class="tag">' + g.forward_count + ' 群可转发 / 共 ' + g.group_count + '</span>' +
+    '<button class="gr-save">保存</button><button class="danger gr-del">删除</button></div>').join('') ||
+    '<div class="empty">还没有分组。</div>';
+  h += '<div class="sep row" style="background:#fff"><input type="text" id="ng-name" placeholder="新分组名" style="flex:1">' +
+    '<input type="number" id="ng-num" style="width:88px" placeholder="编号">' +
+    '<label class="ck"><input type="checkbox" id="ng-fwd" checked>参与转发</label>' +
+    '<button id="ng-add">新增分组</button></div></div>';
+  $('pane').innerHTML = h;
+
+  document.querySelectorAll('.gr-save').forEach((b, i) => b.onclick = () => {
+    const row = b.closest('.row');
+    act('grouping.save', {
+      old_name: row.querySelector('.gr-name').dataset.old,
+      name: row.querySelector('.gr-name').value.trim(),
+      number: row.querySelector('.gr-num').value.trim(),
+      forward_enabled: row.querySelector('.gr-fwd').checked
+    });
+  });
+  document.querySelectorAll('.gr-del').forEach(b => b.onclick = () => {
+    const n = b.closest('.row').querySelector('.gr-name').dataset.old;
+    act('grouping.delete', {name: n}, '删除分组「' + n + '」？会从所有群身上摘掉这个分组。');
+  });
+  $('ng-add').onclick = () => act('grouping.save', {
+    name: $('ng-name').value.trim(), number: $('ng-num').value.trim(),
+    forward_enabled: $('ng-fwd').checked
+  });
+}
+
+// ---- 拉群关键词 ----
+function groupOptions(sel) {
+  return '<option value="">— 选目标群 —</option>' + S.groups.map(g =>
+    '<option value="' + esc(g.name) + '"' + (g.name === sel ? ' selected' : '') + '>' + esc(g.name) + '</option>').join('');
+}
+
+function renderInvites() {
+  let h = '<div class="card"><h2>拉群关键词</h2>' +
+    '<p class="hint">用户<b>私聊</b>机器人发这个词，就会被拉进目标群（群里发关键词不处理）。停用＝保留配置但当前不生效。目标群必须在群列表里。</p>';
+  h += S.invite_keywords.map(k =>
+    '<div class="row"><input type="text" class="kw-key" data-old="' + esc(k.keyword) + '" value="' + esc(k.keyword) + '" style="width:200px">' +
+    '<span>→</span><select class="kw-grp" style="flex:1">' + groupOptions(k.group) + '</select>' +
+    (k.valid ? '' : '<span class="tag bad">群不在登记表</span>') +
+    '<label class="ck"><input type="checkbox" class="kw-on"' + (k.enabled ? ' checked' : '') + '>启用</label>' +
+    '<button class="kw-save">保存</button><button class="danger kw-del">删除</button></div>').join('') ||
+    '<div class="empty">还没有拉群关键词。</div>';
+  h += '<div class="sep row" style="background:#fff"><input type="text" id="nk-key" placeholder="新关键词" style="width:200px">' +
+    '<span>→</span><select id="nk-grp" style="flex:1">' + groupOptions('') + '</select>' +
+    '<button id="nk-add">新增关键词</button></div></div>';
+  $('pane').innerHTML = h;
+
+  document.querySelectorAll('.kw-save').forEach(b => b.onclick = () => {
+    const row = b.closest('.row');
+    act('invite.save', {
+      old_keyword: row.querySelector('.kw-key').dataset.old,
+      keyword: row.querySelector('.kw-key').value.trim(),
+      group: row.querySelector('.kw-grp').value,
+      enabled: row.querySelector('.kw-on').checked
+    });
+  });
+  document.querySelectorAll('.kw-del').forEach(b => b.onclick = () => {
+    const k = b.closest('.row').querySelector('.kw-key').dataset.old;
+    act('invite.delete', {keyword: k}, '删除关键词「' + k + '」？');
+  });
+  $('nk-add').onclick = () => act('invite.save', {
+    keyword: $('nk-key').value.trim(), group: $('nk-grp').value, enabled: true
+  });
+}
+
+// ---- 待归类 ----
+function renderPending() {
+  let h = '<div class="card"><h2>待归类新群</h2>' +
+    '<p class="hint">机器人被拉进新群、群里一有人说话就会自动登记到这里（默认不参与转发，安全）。选好分组和权限点「归类」，它才会进入群发目标。</p>';
+  h += S.pending.map(g => groupRow(g)).join('') || '<div class="empty">没有待归类的新群。</div>';
+  $('pane').innerHTML = h + '</div>';
+  bindRows(S.pending, 'p');
+}
+
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => { TAB = t.dataset.tab; OPEN = null; render(); });
+load();
+</script>
+</body>
+</html>

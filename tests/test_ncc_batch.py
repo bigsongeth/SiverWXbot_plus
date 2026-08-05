@@ -38,7 +38,9 @@ class FakeWx:
         self._cur = who
 
     def ChatInfo(self):
-        return {"chat_type": self.types.get(self._cur, "group"), "chat_name": self._cur}
+        # 真机上没有 remark 字段，且群有备注后 chat_name 显示的就是备注本身
+        return {"chat_type": self.types.get(self._cur, "group"),
+                "chat_name": self.remarks.get(self._cur) or self._cur}
 
     def SetGroupRemark(self, value):
         self.remarks[self._cur] = self.remarks.get(self._cur, "") + value
@@ -177,16 +179,15 @@ class BatchTest(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(calls["limit"], 5)
 
-    def test_command_notion_writeback(self):
-        called = {}
-        orig = batch.run_notion_pass
-        batch.run_notion_pass = lambda bot, admin: called.setdefault("yes", True)
-        try:
-            handled = batch.handle_batch_command(FakeBot(), FakeChat(), {"admin_group": ADMIN}, "回写Notion")
-        finally:
-            batch.run_notion_pass = orig
+    def test_command_notion_writeback_retired(self):
+        """「回写notion」已下线（去 Notion 化），但仍接住并回一句人话，
+        且不能再有任何 Notion 调用。"""
+        chat = FakeChat()
+        handled = batch.handle_batch_command(FakeBot(), chat, {"admin_group": ADMIN}, "回写Notion")
         self.assertTrue(handled)
-        self.assertTrue(called["yes"])
+        self.assertFalse(hasattr(batch, "run_notion_pass"))
+        self.assertIn("下线", chat.sent[-1])
+        self.assertIn("/ncc_community", chat.sent[-1])
 
     def test_command_miss(self):
         self.assertFalse(batch.handle_batch_command(FakeBot(), FakeChat(), {"admin_group": ADMIN}, "随便说句话"))
@@ -210,14 +211,16 @@ class BatchTest(unittest.TestCase):
         self.assertIn("大理一家人", groups)                  # 剥掉🐶
         self.assertTrue(groups["大理一家人"]["notion_marked"])
 
-    def test_upsert_respects_notion_marked(self):
+    def test_upsert_ignores_notion_marked(self):
+        """Notion🐶 不再顶 remark_applied（PANEL_SPEC §1 #7，假绿来源）。
+        remark_applied 只认本地实打实打成功过的那一笔。"""
         groupings = {"大理群": {"number": 4, "forward_enabled": True}}
         groups = {"大理一家人": {"notion_page_id": "r1", "allow_forward": True,
                              "allow_speak": True, "welcome_url": "", "groupings": ["大理群"],
                              "notion_marked": True}}
         registry.upsert_from_notion(groupings, groups)
         data = registry.load()
-        self.assertTrue(data["groups"]["大理一家人"]["remark_applied"])  # Notion🐶 → 已纳管
+        self.assertFalse(data["groups"]["大理一家人"]["remark_applied"])
 
 
 if __name__ == "__main__":

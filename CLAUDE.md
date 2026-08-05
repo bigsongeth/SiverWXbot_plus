@@ -129,7 +129,19 @@ if handled and checkin_reply:
 管理群转发 + 分群迎新卡片 + 关键词拉群，三合一。管理群「NCC 社群管理肥肉售后维权🤖」内成员即管理员（群成员关系替代旧 wxid 白名单）。
 
 - hook 共 4 处：`wxbot_core.py` 的 `message_handle_callback` 里 3 个（friend/self/system 三个分支各一个 `from plugins.ncc_community import ...`），另有 `get_next_new_message` 里 1 个（全局模式下新私聊的首条消息不经过 message_handle_callback，这里补私聊拉群关键词入口，2026-07-12 加）。合并上游后逐个确认还在。
-- 拉群关键词真相源是 Notion「迎新拉群」表（让对方回复→拉入群聊），管理群发「同步」拉进 registry.json 的 `invite_keywords`；「设拉群」是本地覆盖（同名优先）。**拉群只在私聊触发**，群聊发关键词不处理（2026-07-12 定）。
+- ★★ **2026-08-05 起去 Notion 化，真相源改成本地 `data/registry.json` + 面板 `/ncc_community`**（设计与实现记录：`plugins/ncc_community/PANEL_SPEC.md`）。
+  群的分组/允许转发/允许发言/迎新链接、分组编号、拉群关键词、新群归类、不可达群恢复，**全部在面板上改，改完下一条微信消息即生效，不用重启**。
+  - **「同步」「回写notion」两条指令已下线**（还接得住，只是回一句"已下线，去面板"）；`notion_sync.py` 留在库里但**没有任何调用点**，纯粹为 `git revert` 一步回滚。机器人侧不再有任何 Notion 网络调用。
+  - 主菜单编号变了：`1 转发 / 2 面板地址 / 3 待归类 / 4 迎新拉群 / 0 退出`（老的 5 仍映射到迎新拉群，照顾手指记忆）。
+  - **「设拉群/删拉群」现在直写 registry**，和面板同一张表。以前它写 `config.json` 的覆盖层，于是同一个关键词两处各有一份、面板改了被 config 盖掉。`config.json` 里的 `invite.keywords` 只作为遗留覆盖层还读（迁移脚本已并走，正常是空的）。
+  - **`invite_keywords` 结构化成 `{关键词: {"group":.., "enabled":..}}`**，面板上能"停用但保留"。读侧一律走 `registry.invite_map()`（自动跳过停用项、兼容老的纯字符串格式）。
+  - **`remark_applied` 的「Notion 标题带🐶」兜底删掉了**——那是假绿来源：人在 Notion 手敲一个🐶，登记表就以为微信里已打备注，寻址串用「群名🐶」而微信里根本没这备注。本地记录丢了就跑「修备注 全部」从微信侧重建。
+  - **改名不再自动发现**：Notion 时代改标题即隐式迁移，现在群改名要人在面板点「改名」（换 key、保 `gid`、继承微信里那个真实备注、指向它的拉群关键词跟着迁）。隐式批量迁移出过事（幽灵群、同步悄悄复活坏群），显式更好排查。
+  - 群条目多了 `gid`（内部稳定 id），接替 `notion_page_id` 认人；`notion_page_id` 保留为只读遗留字段。
+  - **部署要先跑一次迁移**：`python -m plugins.ncc_community.migrate_notion_off`（补 gid、关键词升级+合并，幂等，`--dry` 可预览，自动备份 `registry.json.bak-<日期>`）。
+  - **写任何面板改动都走 `registry` 的 CRUD**（`set_group_fields`/`rename_group`/`classify_pending`/`restore_reachable`/`set_grouping`/`set_invite_keyword`…），别直接改 dict 落盘——校验（分组存在、编号唯一、目标群存在）和级联（删群连带清关键词、删分组从所有群摘掉）都在那儿。
+  - 面板逻辑在 `panel.py`，**刻意不 import flask、不 import wxbot_core**，所以 mac 上能裸跑单测；`web_server.py` 只有三条薄路由（页/state/action）。
+- **拉群只在私聊触发**，群聊发关键词不处理（2026-07-12 定）。
 - 指令表见群里发「帮助」，或 `forward.py` 的 HELP_TEXT。带空格的群名用 `|` 分隔参数。
 - 运行配置在 `plugins/ncc_community/data/config.json`（分组/迎新/拉群关键词），群内指令实时写盘；**别提交该文件的运行时变更**。
 - 机器人程序化回复统一带 `🤖` 前缀，指令层据此忽略自己的消息防自触发循环——别去掉这个前缀。
@@ -239,7 +251,9 @@ if handled and checkin_reply:
   注册处 + 主循环 `run_pending` 的条件，共 2 处。
   ⚠️ mac 侧走 SMB 读 `task_result.txt` **有读缓存**，看到的可能是上一轮的旧内容，
   拿结果一律 `ssh win-shukong` 从 Windows 侧读。
-- 单测：`PYTHONPATH=. python3 tests/test_ncc_community.py`（92 个，纯 mock 不碰微信）。
+- 单测（纯 mock 不碰微信，mac 上直接跑文件）：`tests/test_ncc_community.py`（97 个）、
+  `tests/test_ncc_engine.py`（38 个）、`tests/test_ncc_batch.py`（14 个）、
+  **`tests/test_ncc_panel.py`（38 个，面板 CRUD / 状态 / 操作 / 迁移脚本，2026-08-05 加）**。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
 知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），469 篇公众号文章 2175 块，
@@ -758,7 +772,7 @@ credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 | 手动启动 | `manual_start_bot.py` |
 | Webhook 发送 | `webhook_send.py` |
 | 签到插件 | `plugins/wechat_checkin/` |
-| NCC 社群插件 | `plugins/ncc_community/` |
+| NCC 社群插件 | `plugins/ncc_community/`（面板 `/ncc_community` + `panel.py`，去 Notion 化见 3.6 与 `PANEL_SPEC.md`） |
 | 知识库开关插件 | `plugins/ncc_kb/` |
 | AI 日报插件 | `plugins/ai_news_note/` |
 | 监听健康 / 自愈插件 | `plugins/listen_health/`（探针采样 `data/probe-*.jsonl`，见 3.18） |

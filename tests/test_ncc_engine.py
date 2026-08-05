@@ -116,9 +116,10 @@ class FakeWx:
         last = self.chatted[-1] if self.chatted else None
         if last is None:
             return {}
-        return {"chat_name": last,
-                "chat_type": self.chat_types.get(last, "group"),
-                "remark": ""}
+        # 真机上 ChatInfo 只有 {'chat_type','chat_name','group_member_count'}：
+        # 没有 remark 字段，而且群一旦有备注，chat_name 显示的就是备注本身。
+        return {"chat_name": self.remarks.get(last) or last,
+                "chat_type": self.chat_types.get(last, "group")}
 
     def GetSubWindow(self, nickname):
         return None
@@ -345,17 +346,15 @@ class EngineTest(unittest.TestCase):
         self.assertIn("还未读到任何要转发的消息", self.admin.sent[-1])
         self.assertEqual(forward._get_state("大松")["state"], forward.S_FWD_COLLECT)
 
-    def test_sync_via_menu(self):
-        called = {}
-        orig = notion_sync.pull
-        notion_sync.pull = lambda: called.setdefault("v", {"groupings": 12, "groups": 86, "forward_on": 75}) or called["v"]
-        try:
-            handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
-            handle_friend_message(self.bot, self.admin, FakeMsg("2"))   # 菜单里 2=同步
-        finally:
-            notion_sync.pull = orig
-        self.assertTrue(called)
-        self.assertIn("同步成功", " ".join(self.admin.sent))
+    def test_menu_2_gives_panel_url(self):
+        """菜单 2 从「同步 Notion」改成了「管理面板地址」（去 Notion 化）。"""
+        handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
+        handle_friend_message(self.bot, self.admin, FakeMsg("2"))
+        self.assertIn("/ncc_community", self.admin.sent[-1])
+
+    def test_menu_no_longer_offers_sync(self):
+        handle_friend_message(self.bot, self.admin, FakeMsg("ncc"))
+        self.assertNotIn("同步 Notion", self.admin.sent[-1])
 
     def test_bare_number_without_state_ignored(self):
         seed_registry()  # 无状态
@@ -513,16 +512,24 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(stat["ok"], 0)
         self.assertIn("整条转发失败", " ".join(m for _, m in self.bot.wx.sent))
 
-    def test_direct_sync_shortcut(self):
+    def test_sync_command_retired_but_answers(self):
+        """「同步」已下线，但仍要回一句人话 —— 直接装不认识的话，
+        习惯性发「同步」的人会以为机器人挂了。且绝不能再打 Notion。"""
         called = {}
         orig = notion_sync.pull
-        notion_sync.pull = lambda: called.setdefault("v", {"groupings": 12, "groups": 86, "forward_on": 75}) or called["v"]
+        notion_sync.pull = lambda: called.setdefault("v", True)
         try:
-            handle_friend_message(self.bot, self.admin, FakeMsg("同步"))
+            handled = handle_friend_message(self.bot, self.admin, FakeMsg("同步"))
         finally:
             notion_sync.pull = orig
-        self.assertTrue(called)
-        self.assertIn("86", " ".join(self.admin.sent))
+        self.assertTrue(handled)
+        self.assertFalse(called, "「同步」不该再调 Notion")
+        self.assertIn("下线", self.admin.sent[-1])
+        self.assertIn("/ncc_community", self.admin.sent[-1])
+
+    def test_backend_command_gives_panel_url(self):
+        handle_friend_message(self.bot, self.admin, FakeMsg("后台"))
+        self.assertIn("/ncc_community", self.admin.sent[-1])
 
     def test_grouping_list_and_pending(self):
         seed_registry()
@@ -560,7 +567,8 @@ class EngineTest(unittest.TestCase):
     def test_discovery_new_group(self):
         seed_registry()
         store.save({"admin_group": ADMIN})
-        # mock notion push
+        # 去 Notion 化后不再往 Notion 推待归类行：本地 add_pending 就够了，
+        # 面板「待归类」页直接能看到并归类。这里守住"绝不再打 Notion"。
         pushed = {}
         orig = notion_sync.push_discovery
         notion_sync.push_discovery = lambda name: pushed.setdefault("name", name)
@@ -573,9 +581,11 @@ class EngineTest(unittest.TestCase):
         self.assertIn("野生新群", data["groups"])
         self.assertEqual(data["groups"]["野生新群"]["status"], "pending")
         self.assertTrue(data["groups"]["野生新群"]["remark_applied"])   # 自动打了备注
-        self.assertEqual(pushed.get("name"), "野生新群")                # 推了 Notion
-        # 管理群收到提醒
-        self.assertTrue(any("发现新群" in (m or "") for _, m in self.bot.wx.sent))
+        self.assertFalse(pushed, "发现新群不该再写 Notion")
+        # 管理群收到提醒，且指向面板
+        alerts = [m for _, m in self.bot.wx.sent if "发现新群" in (m or "")]
+        self.assertTrue(alerts)
+        self.assertIn("/ncc_community", alerts[-1])
 
     def test_discovery_known_group_no_repush(self):
         seed_registry()

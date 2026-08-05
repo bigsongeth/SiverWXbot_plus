@@ -1,29 +1,34 @@
 # -*- coding: utf-8 -*-
-"""本地群登记表（registry.json）—— 引擎的地基。
+"""本地群登记表（registry.json）—— 引擎的地基，也是**唯一真相源**。
 
-真相源是 Notion（人维护分组/权限），本模块是同步下来的运行时缓存，
-机器人的转发/发现/迎新都读它。数据由 notion_sync 写入、discovery 补充。
+2026-08-05 去 Notion 化（PANEL_SPEC.md）：分组/权限/拉群关键词改由 Flask 面板
+`/ncc_community` 维护，直接写本模块；Notion 不再读也不再写。
+机器人的转发/发现/迎新都读它。
 
 数据结构：
 {
-  "synced_at": "2026-07-07T01:00:00",
-  "groupings": {                     # 转发分组（对应 Notion「转发群聊分组」）
+  "synced_at": "2026-07-07T01:00:00",   # 遗留字段：最后一次改动时间
+  "groupings": {                     # 转发分组
     "大理群": {"number": 4, "forward_enabled": true},
     ...
   },
-  "groups": {                        # 键 = 群当前名字（对应 Notion「群名」标题）
+  "groups": {                        # 键 = 群当前名字
     "NCC大理共居一家人👪": {
+      "gid": "3f2a91c7",              # 内部稳定 id，改名时认人用（接替 notion_page_id）
       "name": "NCC大理共居一家人👪",  # 群当前名（寻址用，未打备注前）
       "remark": "NCC大理共居一家人👪🐶", # 目标备注（打上后寻址用这个）
       "remark_applied": false,        # 是否已在微信里打上🐶备注
-      "notion_page_id": "…",
+      "notion_page_id": "…",          # 只读遗留字段，不再使用（回滚保险）
       "allow_forward": true,
       "allow_speak": true,
       "welcome_url": "",
       "groupings": ["大理群"],
-      "status": "active",             # active=Notion 已归类；pending=新发现未归类
+      "status": "active",             # active=已归类；pending=新发现未归类；unreachable=转发找不到
       "last_seen": "2026-07-07T…"
     }
+  },
+  "invite_keywords": {               # 拉群关键词（面板维护，原 Notion「迎新拉群」表）
+    "大理": {"group": "NCC大理共居一家人👪", "enabled": true}
   }
 }
 
@@ -36,6 +41,7 @@ import copy
 import json
 import os
 import threading
+import uuid
 from datetime import datetime
 
 DOG = "\U0001f436"  # 🐶
@@ -74,6 +80,65 @@ def save(data: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, REGISTRY_PATH)
+
+
+def _touch(data: dict) -> None:
+    """记一次改动时间（synced_at 是 Notion 时代的名字，去 Notion 后就是"最后改动"）。"""
+    data["synced_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- 内部稳定 id
+
+def new_gid() -> str:
+    """新群的内部稳定 id。改名时靠它认人——接替原来 notion_page_id 的职责。"""
+    return uuid.uuid4().hex[:8]
+
+
+def ensure_gids(data: dict) -> int:
+    """给还没有 gid 的群补一个（就地改 data，不落盘）。返回补了几个。
+    迁移脚本和面板读取时都会调，保证老数据平滑升级。"""
+    n = 0
+    used = {g.get("gid") for g in data.get("groups", {}).values() if g.get("gid")}
+    for g in data.get("groups", {}).values():
+        if not g.get("gid"):
+            gid = new_gid()
+            while gid in used:
+                gid = new_gid()
+            used.add(gid)
+            g["gid"] = gid
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------- 拉群关键词
+#
+# 面板化之后关键词升级成结构化的 {关键词: {"group": 群名, "enabled": bool}}，
+# 这样面板上可以"临时停用某个关键词"而不用删掉重建。
+# 老格式 {关键词: 群名} 仍然读得动（一期迁移脚本会就地升级，读侧兜底防漏）。
+
+def invite_entry(value) -> dict:
+    """把一条拉群关键词（新旧两种格式）归一成 {"group","enabled"}。"""
+    if isinstance(value, dict):
+        return {"group": str(value.get("group") or "").strip(),
+                "enabled": bool(value.get("enabled", True))}
+    return {"group": str(value or "").strip(), "enabled": True}
+
+
+def invite_map(data: dict) -> dict:
+    """真正生效的 {关键词: 目标群}——停用的和目标群为空的都不出现。"""
+    out = {}
+    for kw, v in (data.get("invite_keywords") or {}).items():
+        e = invite_entry(v)
+        if e["enabled"] and e["group"]:
+            out[str(kw)] = e["group"]
+    return out
+
+
+def invite_items(data: dict) -> list:
+    """面板展示用：[(关键词, {"group","enabled"})]，按关键词排序。"""
+    return sorted(((str(k), invite_entry(v))
+                   for k, v in (data.get("invite_keywords") or {}).items()),
+                  key=lambda x: x[0])
 
 
 # ---------------------------------------------------------------- 寻址
@@ -260,6 +325,7 @@ def add_pending(name: str) -> dict:
         if name in data["groups"]:
             return data["groups"][name]
         g = {
+            "gid": new_gid(),
             "name": name,
             "remark": name + DOG,
             "remark_applied": False,
@@ -310,6 +376,7 @@ def record_managed(name: str, page_id: str = None) -> None:
         g = data["groups"].get(name)
         if not g:
             g = {
+                "gid": new_gid(),
                 "name": name, "remark": name + DOG, "remark_applied": False,
                 "notion_page_id": None, "allow_forward": False, "allow_speak": False,
                 "welcome_url": "", "groupings": [], "status": "pending",
@@ -322,6 +389,293 @@ def record_managed(name: str, page_id: str = None) -> None:
             g["notion_page_id"] = page_id
         save(data)
 
+
+# ---------------------------------------------------------------- 面板 CRUD
+#
+# 去 Notion 化后，"人维护的字段"全部由面板 /ncc_community 经这些函数落盘。
+# 约定：
+#   - 全部在 _LOCK 内 load→改→save，面板与 bot 同进程共享这把锁，无跨进程竞争；
+#   - 参数不合法一律 raise ValueError（中文），由面板层转成错误提示，不静默吞；
+#   - 群名是寻址主键，一切入口都 strip()，禁止空名——Notion 时代一个前导空格
+#     就造出过「幽灵群」（CLAUDE.md 3.6）。
+
+_EDITABLE_FIELDS = ("allow_forward", "allow_speak", "welcome_url", "groupings", "remark")
+
+
+def _clean_name(name: str) -> str:
+    n = str(name or "").strip()
+    if not n:
+        raise ValueError("群名不能为空")
+    return n
+
+
+def _check_groupings(data: dict, names) -> list:
+    """校验分组名都存在——拼错一个字就会造出一个谁也发不到的死分组。"""
+    out = []
+    for x in (names or []):
+        s = str(x).strip()
+        if not s:
+            continue
+        if s not in data.get("groupings", {}):
+            raise ValueError(f"没有「{s}」这个分组")
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def add_group(name: str, **fields) -> dict:
+    """手工新增一个群（Notion 时代是在「群聊列表」加一行）。
+
+    正常路径是群里有人说话时 discovery 自动登记；这个入口是给"群还没说过话，
+    但我现在就想把它配好"用的。默认 active、不参与转发，配置由调用方补。"""
+    name = _clean_name(name)
+    with _LOCK:
+        data = load()
+        if name in data["groups"]:
+            raise ValueError(f"「{name}」已经在登记表里了")
+        g = {
+            "gid": new_gid(),
+            "name": name,
+            "remark": name + DOG,
+            "remark_applied": False,
+            "notion_page_id": None,
+            "allow_forward": False,
+            "allow_speak": False,
+            "welcome_url": "",
+            "groupings": [],
+            "status": "active",
+            "last_seen": None,
+        }
+        if fields:
+            _apply_fields(data, g, fields)
+        data["groups"][name] = g
+        _touch(data)
+        save(data)
+        return g
+
+
+def delete_group(name: str) -> None:
+    """从登记表里删掉一个群（退群/解散后清理）。连带清掉指向它的拉群关键词，
+    否则关键词会指向一个不存在的群，用户一发就是必然失败。"""
+    name = _clean_name(name)
+    with _LOCK:
+        data = load()
+        if name not in data["groups"]:
+            raise ValueError(f"登记表里没有「{name}」")
+        data["groups"].pop(name)
+        for kw, v in list((data.get("invite_keywords") or {}).items()):
+            if invite_entry(v)["group"] == name:
+                data["invite_keywords"].pop(kw, None)
+        _touch(data)
+        save(data)
+
+
+def _apply_fields(data: dict, g: dict, fields: dict) -> None:
+    """把面板传来的字段写进群条目（就地改，调用方负责保存）。"""
+    for k, v in fields.items():
+        if k not in _EDITABLE_FIELDS:
+            raise ValueError(f"不可编辑的字段：{k}")
+        if k == "groupings":
+            g["groupings"] = _check_groupings(data, v)
+        elif k in ("allow_forward", "allow_speak"):
+            g[k] = bool(v)
+        elif k == "remark":
+            g["remark"] = str(v or "").strip()
+        else:
+            g[k] = str(v or "").strip()
+
+
+def set_group_fields(name: str, **fields) -> dict:
+    """改一个群的人管字段（分组/允许转发/允许发言/迎新链接）。"""
+    name = _clean_name(name)
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if not g:
+            raise ValueError(f"登记表里没有「{name}」")
+        _apply_fields(data, g, fields)
+        _touch(data)
+        save(data)
+        return g
+
+
+def rename_group(old: str, new: str) -> dict:
+    """群在微信里改了名，在面板上同步过来：换 key、保 gid、继承备注。
+
+    Notion 时代这一步是隐式的（同步时按 page_id 认人自动迁移），现在改成人
+    显式触发——隐式批量迁移出过事（幽灵群、同步悄悄复活坏群），显式更好排查。
+
+    继承规则复刻 upsert_from_notion 那套：
+    - **打过备注的群继承老 remark**：那是微信里真实存在的会话名，群名改了也照样
+      能靠它寻址；不继承的话 remark 变成「新名🐶」而微信里还是「老名🐶」，必然落空。
+    - 没打过备注的跟新名走（remark = 新名🐶），等打备注时再打。
+    - addressing_hit 若等于老群名则丢弃（那个串已经不存在了），等于备注则留着。
+    - 指向老名的拉群关键词一并改到新名，否则关键词当场失效。"""
+    old, new = _clean_name(old), _clean_name(new)
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(old)
+        if not g:
+            raise ValueError(f"登记表里没有「{old}」")
+        if new == old:
+            return g
+        if new in data["groups"]:
+            raise ValueError(f"「{new}」已经在登记表里了，不能改成重名")
+        g["name"] = new
+        if not g.get("remark_applied"):
+            g["remark"] = new + DOG
+        if str(g.get("addressing_hit") or "") == old:
+            g["addressing_hit"] = None
+        data["groups"].pop(old)
+        data["groups"][new] = g
+        for kw, v in list((data.get("invite_keywords") or {}).items()):
+            e = invite_entry(v)
+            if e["group"] == old:
+                e["group"] = new
+                data["invite_keywords"][kw] = e
+        _touch(data)
+        save(data)
+        return g
+
+
+def classify_pending(name: str, groupings=None, allow_forward: bool = False,
+                     allow_speak: bool = False, welcome_url: str = "") -> dict:
+    """把一个 discovery 发现的新群归类（Notion 时代是去表里选分组+勾权限）。
+    归类后 status 从 pending 变 active，它才会进入转发目标。"""
+    name = _clean_name(name)
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if not g:
+            raise ValueError(f"登记表里没有「{name}」")
+        g["groupings"] = _check_groupings(data, groupings)
+        g["allow_forward"] = bool(allow_forward)
+        g["allow_speak"] = bool(allow_speak)
+        g["welcome_url"] = str(welcome_url or "").strip()
+        g["status"] = "active"
+        g.setdefault("gid", new_gid())
+        _touch(data)
+        save(data)
+        return g
+
+
+def restore_reachable(name: str) -> dict:
+    """人工把一个被标记 unreachable 的群恢复回来（确认它还在、名字也对了之后）。
+
+    Notion 时代"复活"是靠改 Notion + 同步，而同步是【无条件覆盖】的：坏群会在
+    人还没核实的情况下被悄悄恢复成 allow_forward=True，下一轮群发照样卡在它身上。
+    现在必须人在面板上点一下，恢复这件事有据可查。"""
+    name = _clean_name(name)
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if not g:
+            raise ValueError(f"登记表里没有「{name}」")
+        g["status"] = "active"
+        g["allow_forward"] = True
+        g["addressing_hit"] = None      # 上次命中的串多半已失效，重新按候选试
+        _touch(data)
+        save(data)
+        return g
+
+
+def set_grouping(name: str, number=None, forward_enabled: bool = True) -> dict:
+    """新增/修改一个转发分组。number 是群里选择用的编号，必须唯一——
+    重号时 grouping_name_by_number 只会认到第一个，另一个永远选不中。"""
+    name = _clean_name(name)
+    if number in ("", None):
+        number = None
+    else:
+        try:
+            number = int(number)
+        except (TypeError, ValueError):
+            raise ValueError(f"分组编号必须是数字：{number!r}")
+        if number == 1:
+            raise ValueError("编号 1 被「所有群聊」占用了，换一个")
+    with _LOCK:
+        data = load()
+        if number is not None:
+            for other, info in data.get("groupings", {}).items():
+                if other != name and info.get("number") == number:
+                    raise ValueError(f"编号 {number} 已经被分组「{other}」占用")
+        info = data.setdefault("groupings", {}).setdefault(name, {})
+        info["number"] = number
+        info["forward_enabled"] = bool(forward_enabled)
+        _touch(data)
+        save(data)
+        return info
+
+
+def rename_grouping(old: str, new: str) -> dict:
+    """改分组名，并把所有群身上的引用一起改掉（不然那些群会挂在一个死分组上）。"""
+    old, new = _clean_name(old), _clean_name(new)
+    with _LOCK:
+        data = load()
+        if old not in data.get("groupings", {}):
+            raise ValueError(f"没有「{old}」这个分组")
+        if new == old:
+            return data["groupings"][old]
+        if new in data["groupings"]:
+            raise ValueError(f"「{new}」这个分组已经存在")
+        data["groupings"][new] = data["groupings"].pop(old)
+        for g in data.get("groups", {}).values():
+            gs = g.get("groupings") or []
+            if old in gs:
+                g["groupings"] = [new if x == old else x for x in gs]
+        _touch(data)
+        save(data)
+        return data["groupings"][new]
+
+
+def delete_grouping(name: str) -> None:
+    """删一个分组，并从所有群身上摘掉它。"""
+    name = _clean_name(name)
+    with _LOCK:
+        data = load()
+        if name not in data.get("groupings", {}):
+            raise ValueError(f"没有「{name}」这个分组")
+        data["groupings"].pop(name)
+        for g in data.get("groups", {}).values():
+            gs = g.get("groupings") or []
+            if name in gs:
+                g["groupings"] = [x for x in gs if x != name]
+        _touch(data)
+        save(data)
+
+
+def set_invite_keyword(keyword: str, group: str, enabled: bool = True) -> dict:
+    """新增/修改一条拉群关键词。目标群必须在登记表里——拼错群名的关键词
+    是个哑弹：用户发了、机器人找不到群，只会失败退配额。"""
+    kw = str(keyword or "").strip()
+    if not kw:
+        raise ValueError("关键词不能为空")
+    group = _clean_name(group)
+    with _LOCK:
+        data = load()
+        if group not in data.get("groups", {}):
+            raise ValueError(f"登记表里没有「{group}」这个群")
+        entry = {"group": group, "enabled": bool(enabled)}
+        data.setdefault("invite_keywords", {})[kw] = entry
+        _touch(data)
+        save(data)
+        return entry
+
+
+def delete_invite_keyword(keyword: str) -> None:
+    kw = str(keyword or "").strip()
+    with _LOCK:
+        data = load()
+        if kw not in (data.get("invite_keywords") or {}):
+            raise ValueError(f"没有「{kw}」这个拉群关键词")
+        data["invite_keywords"].pop(kw)
+        _touch(data)
+        save(data)
+
+
+# ---------------------------------------------------------------- 遗留：Notion 同步
+#
+# 2026-08-05 起【无任何调用点】（去 Notion 化，见 PANEL_SPEC.md）。
+# 保留代码是为了 git revert 能一步回滚，别在新代码里再挂上它。
 
 def upsert_from_notion(groupings: dict, groups: dict, invite_keywords: dict | None = None) -> dict:
     """用 Notion 拉取结果覆盖分组与群的【人管字段】，保留机器人管的字段
@@ -348,9 +702,14 @@ def upsert_from_notion(groupings: dict, groups: dict, invite_keywords: dict | No
                     old = merged[prev_key]
                     renamed.append((prev_key, name))
             old = old or {}
-            # 人管字段以 Notion 为准；remark_applied 取「本地已标记 或 Notion 标题带🐶」
-            applied = old.get("remark_applied", False) or bool(incoming.get("notion_marked"))
+            # 人管字段以 Notion 为准；remark_applied **只认本地实打实标记过的**。
+            # 原来这里还认「Notion 标题带🐶」当兜底，是 8/4 事故的假绿来源之一：
+            # 人在 Notion 里手敲一个🐶，登记表就以为微信里已有备注，寻址串用
+            # 「群名🐶」而微信里根本没这备注（CLAUDE.md 3.6）。本地记录丢了就跑
+            # 「修备注 全部」从微信侧重建，别再让 Notion 替微信作证。
+            applied = old.get("remark_applied", False)
             g = {
+                "gid": old.get("gid") or new_gid(),
                 "name": name,
                 # 打过备注才继承老 remark（那是微信里真实存在的会话名，改名后靠它寻址）；
                 # 没打过就跟着新名走，等 apply_remark 去打
