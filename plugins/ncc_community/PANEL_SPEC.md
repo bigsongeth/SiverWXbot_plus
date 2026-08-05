@@ -176,7 +176,36 @@ registry.py 纯 Python 无 wxautox 依赖，bot 未启动时面板页照常可�
   每个操作（增删改群/分组/关键词、归类、改名、恢复）与错误路径逐个跑过，
   改动确认落盘、级联清理干净。
 
-### 还没做（§0 判据 4）
+### 部署前的落地体检（2026-08-05，全程只读，没碰生产）
 
-生产验收：在 win-shukong 上跑一次迁移脚本 → 重启面板 → 面板改一个拉群关键词 →
-微信私聊发该关键词 → 确认正确拉群。部署步骤见 §6。
+- **改前 vs 改后行为等价**（对上判据 2）：拿**真实生产 registry.json**（120 群 /
+  16 分组 / 17 关键词）分别跑 `HEAD~1` 和 `HEAD` 的代码，四项机器人侧输出
+  **逐字节一致**——转发目标 105 个、所有群聊寻址串 105 个、分组选择菜单 11 项、
+  生效拉群关键词 18 条。
+- ★ **新代码吃【未迁移】的老数据完全正常**：没有 gid、关键词还是纯字符串时，
+  `invite_map` 走兼容分支、转发/分组/寻址全部照常。
+  **所以迁移脚本不是部署的硬前提** —— 万一 ui_watchdog 在迁移前自动重启，
+  也不会出事；面板首次打开时 `ensure_gids` 会顺手把 gid 补上并落盘。
+  迁移脚本额外做的只有"把 config.json 的 invite.keywords 并进 registry"这件收编工作。
+- **生产 Python（3.12.8 / flask 3.1.3）编译通过**：在 win-shukong 上对本 worktree
+  跑 `py_compile`，并用 ast 确认三条路由 `/ncc_community`、`/state`、`/action` 注册正常。
+- 生产工作树当时在 `main` 且干净（无其它会话的未提交改动）。
+
+### 还没做（§0 判据 4）—— 需要人点头
+
+生产部署会改动共享工作树、并要重启面板进程，按 CLAUDE.md 第 2 节的约定先跟人确认。
+步骤：
+
+```bash
+ssh win-shukong "cd /d C:\Users\Admin\SiverWXbot_plus-main && git merge --no-ff claude/panel-spec-implementation-748ea5"
+```
+
+```bash
+ssh win-shukong "cd /d C:\Users\Admin\SiverWXbot_plus-main && python -m plugins.ncc_community.migrate_notion_off --dry"
+```
+
+去掉 `--dry` 真跑 → 清 `plugins\ncc_community\__pycache__`（SMB 直编辑坑，CLAUDE.md 3.6）
+→ `schtasks /run /tn SWXPanelRestart` → 面板里启动机器人。
+
+验收：打开面板改一个拉群关键词 → 微信私聊发该关键词 → 确认正确拉群；
+再把一个 unreachable 群点「恢复可转发」→ 下轮群发包含它。
