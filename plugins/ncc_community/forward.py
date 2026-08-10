@@ -53,7 +53,13 @@ DELAY = {  # 防风控/防卡死延迟（可被 config.forward.delay 覆盖）
     "max_retries": 2,
     # 单次 forward 调用的硬超时（秒）。wxautox 自己那个 timeout 只管对话框弹出，
     # 搜不到目标时它无限等且攥着全局 uilock，必须我们兜（见 _forward_call）。
-    "call_timeout": 25.0,
+    # 12 秒是权衡：搜得到的群一两秒就返回，搜不到的等再久也是白等，而每个群最多试
+    # 2 个候选串 —— 定成 25 秒的话，105 个群全搜不到要干等 87 分钟。
+    "call_timeout": 12.0,
+    "locate_timeout": 60.0,   # 定位要滚 120 条历史，给足，但不能没有上限
+    # 连续多少个群一个都搜不到就中止整轮：寻址串要是普遍不对（比如登记表里全是微信里
+    # 不存在的备注），越往下跑越白跑，早点收手叫人来查
+    "give_up_after_misses": 3,
 }
 
 # 收集时忽略的消息类型：只跳真噪音。视频号是 'other'，必须收集。
@@ -244,6 +250,31 @@ def _dismiss_windows(hwnds) -> int:
     return n
 
 
+def _ui_call(fn, timeout: float, label: str):
+    """限时跑一个 wxautox UI 调用。返回 (完成了吗, 返回值, 异常)。
+
+    为什么每一步都要限时（2026-08-04 第二次卡死）：上一版只给 forward() 加了超时，
+    结果两次卡死都停在 `_locate` 里 —— GetAllMessage / roll_into_view 同样会无限等，
+    照样攥着 wxautox 的全局 uilock 把整个进程拖死，日志停在「回调触发停止」一动不动。
+    凡是进 wxautox 的调用都得有闸。超时后线程还活着（Python 杀不掉），uilock 不会还
+    回来，所以调用方拿到 done=False 就该按"这条线已经废了"处理，别接着往下试。"""
+    box = {}
+
+    def run():
+        try:
+            box["r"] = fn()
+        except Exception as e:                      # noqa: BLE001 —— 原样带回
+            box["e"] = e
+
+    t = threading.Thread(target=run, daemon=True, name=f"ncc-ui-{label}")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        log("ERROR", f"UI 调用「{label}」超过 {timeout}s 未返回（wxautox 全局锁多半已经废了）")
+        return False, None, None
+    return True, box.get("r"), box.get("e")
+
+
 def _forward_call(element, group, timeout: float) -> tuple[bool, str]:
     """调一次 `element.forward(group)`，但【限时】。返回 (成功, 错误)。
 
@@ -292,20 +323,27 @@ def _forward_one_shot(cache_box, bot, source, sig, occ, spec, d) -> tuple[bool, 
     返回 (成功, 错误, 命中的寻址串)。"""
     last = ""
     cands = spec.get("cands") or [spec.get("name")]
-    timeout = float(d.get("call_timeout", 25))
+    timeout = float(d.get("call_timeout", 12))
+    locate_timeout = float(d.get("locate_timeout", 60))
     for _ in range(int(d["max_retries"])):
         with MAIN_WINDOW_LOCK:
             if cache_box[0] is None:
-                cache_box[0] = _locate(bot, source, sig, occ)
+                # 定位要滚 120 条历史，慢是正常的，但不能没有上限 —— 8/4 两次卡死都卡在这儿
+                done, el, err = _ui_call(lambda: _locate(bot, source, sig, occ),
+                                         locate_timeout, "locate")
+                if not done:
+                    return False, f"{STUCK_MARK}（定位消息时卡死）", ""
+                if err is not None:
+                    return False, str(err), ""
+                cache_box[0] = el
             if cache_box[0] is None:
                 last = "视图中定位不到该消息"
             else:
                 for cand in cands:
                     try:
-                        try:
-                            cache_box[0].roll_into_view()
-                        except Exception:
-                            pass
+                        done, _, _ = _ui_call(cache_box[0].roll_into_view, 15, "roll")
+                        if not done:
+                            return False, f"{STUCK_MARK}（滚动到消息时卡死）", ""
                         ok, err = _forward_call(cache_box[0], cand, timeout)
                         if ok:
                             return True, "", cand
@@ -334,6 +372,8 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
     gone = []
     failed = []
     stuck = False
+    miss_streak = 0
+    give_up_after = int(d.get("give_up_after_misses", 3))
     for i, spec in enumerate(targets):
         g = spec["name"]
         if i > 0 and i % int(d["batch_every"]) == 0:
@@ -342,6 +382,7 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
         keepalive()          # 转发仍在推进，给主窗口闸门续期（别让它半路失效被人抢窗口）
         if success:
             ok += 1
+            miss_streak = 0                         # 有一个成功就说明寻址整体没坏
             if hit and hit != (spec.get("cands") or [None])[0]:
                 # 首选串没搜到、备选串命中 → 登记表里的寻址状态是错的，就地纠正
                 log("INFO", f"「{g}」用备选串「{hit}」命中，纠正登记表寻址")
@@ -358,6 +399,13 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
             failed.append(f"{g}: {err}")            # 源消息定位不到，非群的问题
         elif TIMEOUT_MARK in err or _is_gone(err):
             gone.append(g)                          # 候选串都搜不到 → 该群不可达
+            miss_streak += 1
+            if give_up_after and miss_streak >= give_up_after:
+                # 寻址普遍失效时（登记表里的名字微信里都不存在），越往下跑越白跑：
+                # 每个群白等 2×call_timeout，105 个群能干耗掉半小时以上。早点收手叫人。
+                failed.append(f"连续 {miss_streak} 个群都搜不到，已中止本条（寻址串多半普遍不对）")
+                log("ERROR", f"连续 {miss_streak} 个群搜不到，中止本条转发")
+                break
         else:
             # 超时、UI 异常这类说不清的错，只汇报不下结论：gone 会被 mark_unreachable
             # 写进 registry（allow_forward=False），之后所有转发都跳过这个群，

@@ -2,6 +2,8 @@
 """ncc_community 插件公共工具：日志与统一回复。"""
 from __future__ import annotations
 
+import sys
+
 # 机器人程序化回复的统一前缀。
 # 指令解析层会忽略带此前缀的消息，保证机器人自己的回复（在管理群里
 # 属于 self 消息，会重新进入回调）不会被当成指令二次处理。
@@ -17,6 +19,15 @@ except Exception:  # 单测环境没有项目根的 logger
 def log(level: str, message: str) -> None:
     try:
         _log(level=level, message=f"[ncc_community] {message}")
+    except Exception:
+        pass
+    # 立即刷盘。logger.log_server 只是 print 到 stdout，而 bot 在后台跑时 stdout 是
+    # 【带缓冲】的 —— 一条日志几十字节，要攒满几 KB 才落到 panel_logs。
+    # 2026-08-04 排查转发卡死时在这上面栽了：超时逻辑到底跑没跑无从判断，因为该出现的
+    # WARNING 还压在缓冲区里，我据此误判成"代码没执行"，白绕了一大圈。
+    # 卡死类问题恰恰是"最后一行日志"最值钱，绝不能等缓冲区攒满。
+    try:
+        sys.stdout.flush()
     except Exception:
         pass
 
