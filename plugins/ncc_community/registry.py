@@ -160,17 +160,24 @@ def address_candidates(group: dict) -> list:
     转发的"发送给"对话框搜出来一律无结果，第一个群就把整条线卡死。
     （而「检查群组」用的是宽容得多的主窗口搜索，105/105 全报可达，假绿。）
 
-    群名排在前面：它是 Notion 同步下来的真实群名，没打备注时就是微信里的显示名；
-    真打了备注的群，微信搜索同样能按原名命中，所以群名优先更安全。
-    上次实测命中过的串（addressing_hit）排最前，改过名的群才不用每次先白等一次超时。
+    ★ 顺序按【微信里的显示名】猜，而不是按"哪个名字更真"（2026-08-10 实测修正）：
+    "发送给"对话框里，wxautox 要在搜索结果里找**显示名与目标串一致**的项才勾得中。
+    群一旦打了🐶备注，微信显示的就是备注本身，这时拿群名去搜——**搜得到，但勾不中**：
+    结果列出来了，单选框没勾上，"发送"是灰的，send() 在里面死等。
+    8/4 我反过来把群名排在了前面（当时以为备注根本没打上），结果每个已打🐶的群都要
+    先白等一次超时才换备注，105 个群平白多耗 20 分钟。实测日志（8/10 23:45）
+    「昆山NCC林克岛的朋友们2」正是靠备选串「…2🐶」命中的。
 
-    ⚠️ 特意【不】看 remark_applied：那个字段还兼着"Notion 标题带🐶=已纳管"的语义，
-    是给备注工作流用的，不能当作"微信里确实存在这个备注"的依据。"""
+    所以：标着已打备注的群，备注优先；没打过的，群名优先。两个都留着依次试——
+    remark_applied 未必可信（它还兼着"Notion 标题带🐶=已纳管"的语义），
+    猜错顶多多花一次超时，猜不到才会真的发不出去。
+    上次实测命中过的串（addressing_hit）永远排最前，第二轮起就不用再猜。"""
     name = str(group.get("name") or "").strip()
     remark = str(group.get("remark") or "").strip()
     hit = str(group.get("addressing_hit") or "").strip()
+    order = (hit, remark, name) if group.get("remark_applied") else (hit, name, remark)
     out = []
-    for c in (hit, name, remark):
+    for c in order:
         if c and c not in out:
             out.append(c)
     return out

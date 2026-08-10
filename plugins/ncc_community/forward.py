@@ -371,6 +371,7 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
     ok = 0
     gone = []
     failed = []
+    sent = []          # 成功收到本条的群（人要的"到底发给了谁"）
     stuck = False
     miss_streak = 0
     give_up_after = int(d.get("give_up_after_misses", 3))
@@ -382,6 +383,7 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
         keepalive()          # 转发仍在推进，给主窗口闸门续期（别让它半路失效被人抢窗口）
         if success:
             ok += 1
+            sent.append(g)
             miss_streak = 0                         # 有一个成功就说明寻址整体没坏
             if hit and hit != (spec.get("cands") or [None])[0]:
                 # 首选串没搜到、备选串命中 → 登记表里的寻址状态是错的，就地纠正
@@ -416,9 +418,9 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
     # 保护：整条一个群都没成功 → 判定是这条消息本身转不了，别冤枉群（不标记任何群不可达）
     if ok == 0 and (gone or failed):
         if stuck:
-            return 0, [], failed      # 卡死的真相要原样带出去，别被"消息不支持转发"盖掉
-        return 0, [], ["整条转发失败（该消息可能不支持转发，未标记任何群）"]
-    return ok, gone, failed
+            return 0, [], failed, []   # 卡死的真相要原样带出去，别被"消息不支持转发"盖掉
+        return 0, [], ["整条转发失败（该消息可能不支持转发，未标记任何群）"], []
+    return ok, gone, failed, sent
 
 
 def _forward_worker():
@@ -587,14 +589,16 @@ def _deliver(task) -> dict:
 
     ok = fail = 0
     gone_all = set()          # 无结果/不可达的群（去重）
+    sent_all = set()          # 至少成功收到过一条的群（去重）
     fail_detail = []
 
     aborted = False
     for mi, (sig, occ) in enumerate(sigs):
-        okc, gone, failed = _forward_located_message(bot, admin, sig, occ, targets, d)
+        okc, gone, failed, sent = _forward_located_message(bot, admin, sig, occ, targets, d)
         ok += okc
         fail += len(gone) + len(failed)
         gone_all.update(gone)
+        sent_all.update(sent)
         if failed:
             fail_detail.extend(f"第{mi+1}条 {x}" for x in failed[:5])
         if any(STUCK_MARK in x for x in failed):
@@ -620,8 +624,14 @@ def _deliver(task) -> dict:
     except Exception:
         pass
 
+    missed = [t["name"] for t in targets if t["name"] not in sent_all]
     lines = [f"{REPLY_PREFIX} {'转发中止！' if aborted else '转发完成！'}{label}",
-             f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。"]
+             f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。",
+             f"📊 收到的群 {len(sent_all)} 个，没收到的 {len(missed)} 个。"]
+    if missed:
+        # 人要的是"到底哪几个群没发到"——只给数字，事后还得自己一个个去翻
+        lines.append("❌ 没收到的群：\n" + "\n".join(f" - {m}" for m in missed[:20])
+                     + (f"\n…另有 {len(missed) - 20} 个" if len(missed) > 20 else ""))
     if aborted:
         lines.append("⛔ 微信 UI 锁没能释放，剩下的没转。请重启程序（SWXPanelRestart）后重来。")
     if marked:

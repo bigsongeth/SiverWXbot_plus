@@ -386,12 +386,17 @@ class EngineTest(unittest.TestCase):
 
     # ---------- 寻址候选 / 卡死兜底（2026-08-04 全量转发第一个群就卡死那次）----------
 
-    def test_address_candidates_prefers_name_then_remark(self):
+    def test_address_candidates_order_follows_display_name(self):
+        # 顺序要按【微信里的显示名】猜：wxautox 得在搜索结果里找显示名一致的项才勾得中，
+        # 打了🐶的群显示的就是备注，拿群名去搜是"搜得到但勾不中"（8/10 实测）
         g = {"name": "甲群", "remark": "甲群🐶", "remark_applied": True}
-        # 特意不看 remark_applied：它还兼着「Notion 标题带🐶」的语义，不代表微信里真有这个备注
+        self.assertEqual(registry.address_candidates(g), ["甲群🐶", "甲群"])
+        # 没打备注的群，显示名就是群名
+        g2 = {"name": "乙群", "remark": "乙群🐶", "remark_applied": False}
+        self.assertEqual(registry.address_candidates(g2), ["乙群", "乙群🐶"])
+        # 实测命中过的永远排最前，第二轮起不用再猜
+        g["addressing_hit"] = "甲群"
         self.assertEqual(registry.address_candidates(g), ["甲群", "甲群🐶"])
-        g["addressing_hit"] = "甲群🐶"      # 实测命中过 → 排最前，省掉一次白等
-        self.assertEqual(registry.address_candidates(g), ["甲群🐶", "甲群", ])
 
     def test_forward_falls_back_to_remark_candidate(self):
         # 首选串搜不到 → 自动换备选串，并把实测结果记进 addressing_hit
