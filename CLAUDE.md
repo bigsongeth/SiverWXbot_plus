@@ -436,7 +436,17 @@ Python 层杀不掉线程 —— 唯一出路是整进程重启。插件两种�
 - **`schtasks` 必须用 `%SystemRoot%\System32\schtasks.exe` 绝对路径**：面板进程的 PATH 里可能没有
   System32，裸名字 `Popen` 直接 FileNotFoundError —— 2026-07-30 03:20 它就是这么哑火的
   （日志：`触发重启失败: schtasks not found`），看门狗白装了一晚。
-- 单测：`PYTHONPATH=. python3 tests/test_ui_watchdog.py`（25 个）。
+- ★★ **触发重启 = 写自启动标记 + 调 `schtasks`，两步缺一不可**。写标记的实现是模块级
+  `write_autostart_flag(reason, now)`（带 3 次重试和错误处理），`Watchdog._write_autostart_flag`
+  和 `listen_health._trigger_restart` **共用同一份**。
+  **任何新增的"触发 SWXPanelRestart"调用方都必须先调它** —— 只触发重启而不写标记，
+  面板会起来、机器人却是停的，等于把机器人整个搞下线（2026-08-11 listen_health 就是这么
+  丢了 1.5 小时，见 3.18）。
+- ⚠️ **`tests/test_ui_watchdog.py` 在 win-shukong 上跑会【真的】触发重启**：用例会走到
+  `schtasks /run /tn SWXPanelRestart`。在 mac 上跑是安全的（没有 `schtasks`，日志里会看到
+  `触发重启失败: schtasks not found`）。**要在生产机上跑就先把 `_trigger` 换成 mock**，
+  跟 `listen_health` 的 `TestProbe` 关掉 `auto_restart` 是同一个道理。
+- 单测：`PYTHONPATH=. python3 tests/test_ui_watchdog.py`（26 个）。
 
 ### 3.15 上下文守卫插件 `plugins/context_guard/`（2026-07-30 加）★ 治"模型一本正经胡编"
 起因：松爸私聊问"今天有什么 AI 新闻"，肥肉张口就编，还说自己"刚刷了刷 X（推特）"，
@@ -535,10 +545,67 @@ hook 3 处，合并上游后逐个确认：
 - 人设里那条"不要用 Markdown"**要把原因一起写上**（"会原样显示成一堆星号"），
   实测比干说一句"禁用 Markdown"管用得多。
 
-### 3.14 wxautox 参数 `SEARCH_CHAT_TIMEOUT`（`wxbot_core.py`）
-40.1.15 装出来的默认值是 **2 秒**（不是文档说的 5）。`ChatWith` 在会话列表里找不到目标就走
-搜索框，微信搜索结果常常 2 秒内还没渲染完，于是静默返回 `failure("未找到会话")`。
-我们改成 5 秒。**合并上游 / 升级 wxautox 后确认这行还在。**
+### 3.14 wxautox4 版本、升级与 `SEARCH_CHAT_TIMEOUT`（`wxbot_core.py`）
+
+**当前版本：41.1.1.post1**（2026-08-11 从 40.1.15 升上来，配 wx 客户端 4.1.9.35、Python 3.12.8）。
+
+`SEARCH_CHAT_TIMEOUT`：40.1.15 装出来的默认值是 **2 秒**（不是文档说的 5）。`ChatWith` 在会话
+列表里找不到目标就走搜索框，微信搜索结果常常 2 秒内还没渲染完，于是静默返回
+`failure("未找到会话")`。我们改成 5 秒。**合并上游 / 升级 wxautox 后确认这行还在。**
+
+#### ★★ 升级 wxautox4 前必读（2026-08-11 全套踩完）
+
+- **PyPI 上 40.x 已全部下架**，`pip index versions wxautox4` 只剩 41.1.1 / 41.1.1.post1，
+  **pip 回滚不了**。本地 pip 缓存里也没有旧 wheel。
+  唯一退路是手工备份：`site-packages` 下的 `wxautox4/` + `wxautox4-<版本>.dist-info/`
+  打包成 zip，出事解压盖回去（同机、同 Python、同平台，这么退是通的）。
+  **40.1.15 的备份在 `C:\Users\Admin\wxautox4-40.1.15-backup-20260811.zip`（3.96 MB，55 个条目），别删。**
+  升级前先打包、并且**验证 zip 能读**（列条目、确认 `.pyd` 齐全），没验证过的备份等于没有。
+- ★★ **别在机器人跑着的时候升级它正在用的库**。pip 装完那一刻起，磁盘上是新版、
+  进程内存里是旧版，而 Python 的 import 是**懒加载**的 —— 老进程一旦触发某个还没
+  加载过的子模块，就会把新版代码塞进旧版运行时。这跟 2026-08-05 那次
+  「迁移改了数据格式、没重启的老进程当场 TypeError」是同一类病（见 3.6）。
+  正确姿势：**先停机器人 → 再升级 → 再启动**，别赌那段窗口没人发消息。
+- **pip 删不掉被占用的旧目录时会改名**成 `~i` / `~sgs` / `~tils` 留在 `wxautox4/` 下
+  （日志里是 `WARNING: Failed to remove contents in a temporary directory`）。
+  它们不是合法模块名、Python 不会 import，属于纯垃圾，**等重启之后**再删。
+- ★★ **升级后必须给面板启动脚本设 `PYTHONIOENCODING=utf-8`，否则 41.x 直接起不来。**
+  见下条，这是本次升级唯一的硬阻断。
+
+#### ★★ 41.x 的 emoji 日志 + GBK stdout = 机器人必然起不来（2026-08-11）
+
+升级后机器人初始化 **100% 失败**，报
+`'gbk' codec can't encode character '\U0001f436' in position 15`，
+被 `init_wx_listeners` 的 except 接住，只留一句
+**「初始化微信监听器失败，请检查微信是否启动登录正确」—— 完全指错方向**，
+微信自始至终好好登着。中间三次手动重启全败在这上面，白耗一个多小时。
+
+`\U0001f436` 是 🐶。崩的是 41.x **新增**的那句缓存日志：
+`初始化成功，获取到已登录窗口：🐶肥肉（使用缓存）`
+数到第 15 个字符正好是 🐶 —— 本机微信登录昵称就叫「🐶肥肉」。
+`restart_panel.bat` 用 `>> panel_logs\panel_restart.log 2>&1` 把 stdout 重定向进文件，
+Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句日志，所以以前没事。
+
+已修：`restart_panel.bat` 里加了 `set PYTHONIOENCODING=utf-8`
+（`C:\Users\Admin\swx_run.cmd` 早就有这一行，同一台机器上用它跑的脚本打同样这句话毫无问题）。
+**以后新增任何会启动 Python 的 .bat / .cmd，都照抄这一行** —— 只要日志里可能出现
+群名、昵称里的 emoji（我们满地都是🐶），迟早撞上。
+
+- ★ **排查弯路，别重走**：一度以为是 `GetMyInfo()` 的 API 被破坏 ——
+  `wx_id = my_info.get('id', f'{self.wx.nickname}')` 一旦回落到昵称，
+  记忆目录就会从 `memory/FeiRou_NCC/` 变成 `memory/🐶肥肉/`，61 个会话的历史全部失联。
+  **实测否掉了**：41.x 的 `GetMyInfo()` 返回
+  `{"display_name": "🐶肥肉", "id": "FeiRou_NCC"}`，`id` 键健在，记忆目录没事。
+  教训：别拿报错里的 `position N` 去凑猜想中的字符串，**把每个候选逐字数一遍**，
+  一分钟就能定位到真正那一行。
+- **诊断脚本必须在会话 2 跑**（`SWXRun` → `swx_run.cmd`，见 3.8）：任何要连微信的脚本，
+  SSH 在 session 0 上 UIA 看不到微信窗口。输出写 UTF-8 文件再读，别指望控制台。
+
+#### 41.x 升级后仍未解决的
+
+- **`MoveWindow 1400`（监听窗口丢失）照旧存在**，2026-08-11 16:04 实测触发。
+  上游 V4.7.30 版本日志写的"修复监听偶尔丢失系统消息的bug"**不是这个问题**，
+  别再指望升级能治它 —— 兜底仍然靠 `plugins/listen_health/`（见 3.18）。
 
 ### 3.16 模型故障转移插件 `plugins/model_fallback/`（2026-08-03 加）★ 一个模型挂了自动换下一个
 面板原来只能"选一个接口用"，挂了就直接回"在忙，我稍后回复您"。本插件让接口失败时
@@ -642,11 +709,24 @@ hook 3 处，合并上游后逐个确认：
   不落盘会陷入无限重启。
 - **重启触发复用 `ui_watchdog._default_trigger`**，别自己再写一遍 —— 那里踩过
   `schtasks` 裸名字 `FileNotFoundError` 的坑（见 3.13）。
+- ★★ **自愈 = 写自启动标记 + 触发重启，只做后半截等于把机器人搞下线（2026-08-11 血泪）**：
+  `_trigger_restart` 原来只调了 `_default_trigger`，**漏了 `write_autostart_flag`** ——
+  那段注释还写着"直接复用 ui_watchdog 的实现，别自己再写一遍"，schtasks 的坑是避开了，
+  标记这一半却漏了。8-11 16:05 首次真触发自愈：探针判定窗口丢失 → 重启 → **面板起来了、
+  机器人没被拉起**，一路下线到人发现为止（1.5 小时），期间消息全部无人应答。
+  **比不自愈更糟**：本来只是监听坏了（丢部分消息），自愈之后变成机器人整个没了（丢全部消息），
+  而且没有任何告警说"我重启完但没起来"。
+  现已改为两步都做，回归测试见 `TestTriggerRestartWritesAutostartFlag`。
+- ★ **`TestHeal` 会污染模块级函数，写新用例小心**：它的 `setUp` 把 `_trigger_restart` /
+  `_alert` / `load_state` / `save_state` 四个名字全替换成 mock。原来没有 `tearDown`，
+  跑完模块里就留着一堆假货，**任何想测「真」`_trigger_restart` 的用例都会静默测到 mock 上**
+  （新增的回归测试单跑全绿、全量跑全红，就是撞的这个）。已补 `tearDown` 逐个还原。
+  **以后 setUp 里替换模块级名字，一律配套 tearDown 还回去。**
 - **探针绝不能另起进程/线程**跑微信 UI 操作，只能挂在 bot 的 schedule 主循环里串行执行
   （见 3.11 的血泪）。靶子用「文件传输助手」这种系统会话，不打扰真人、不产生已读。
 - `data/` 整个不进库（默认值写在 `config.py` 的 `DEFAULTS`，文件缺失自动回落）。
   注意 `.gitignore` 第 4 行有全局 `config.json` 规则，插件的默认配置文件放不进库。
-- 单测：`PYTHONPATH=. python3 tests/test_listen_health.py`（34 个，纯 mock）、
+- 单测：`PYTHONPATH=. python3 tests/test_listen_health.py`（37 个，纯 mock）、
   `tests/test_main_window_chat.py`（8 个，用 ast 摘类出来 exec，不 import wxbot_core；
   其中一个用例会扫 `process_message` / `wx_send_ai` / `message_handle_callback` 里所有
   `chat.xxx` 读取，逐个校验回落通道答得上来——以后再漏属性直接测试失败）。
@@ -658,23 +738,55 @@ hook 3 处，合并上游后逐个确认：
 
 ## 4. 同步上游的标准流程
 
-做过很多次（V4.7.23 → V4.7.27），套路固定：
+做过很多次（V4.7.23 → V4.7.30），套路固定：
 
 1. `git fetch upstream --tags --prune`，看 `git diff --stat HEAD..upstream/main`。
+   ⚠️ 这个 diff 会把**我们有、上游没有的插件全列成"删除"**（方向造成的假象，merge 不会删）。
+   要看上游到底改了什么，得用 merge base：
+   `git diff --stat $(git merge-base HEAD upstream/main)..upstream/main`。
 2. 在当前自用分支上 `git merge --no-ff upstream/main -m "merge upstream Vx.x.x with local customizations"`。
 3. **冲突处理原则：定制区一律以我们的版本为准。** 重点检查 `wxbot_core.py`、`web_server.py`、`templates/dashboard.html`、`webhook_send.py`。
 4. 合并后按第 3 节逐项确认定制点还在，特别是：
    - `web_server.py` 的 `app.run(host='0.0.0.0', ...)` 没被改回 `127.0.0.1`（见 3.1）；
    - `wxbot_core.py` 的 wechat_checkin hook 还在（见 3.2）；
    - DusAPI 定制按 `AI_COLLABORATION_GUIDE.md` 第 4.5 节清单逐项过，删掉重新冒出来的 DusAPI 广告（见 3.5）。
-5. 若上游要求 `wxautox4` 升级（历史上 40.1.14 → 40.1.15 配合微信 PC 版本），同步 pip 升级。
+5. 若上游要求 `wxautox4` 升级（历史上 40.1.14 → 40.1.15、40.1.15 → 41.1.1.post1），
+   **先读 3.14 那一节再动手** —— 旧版从 PyPI 下架回滚不了、必须先手工备份 zip、
+   必须先停机器人再升级、升完要确认 `PYTHONIOENCODING=utf-8`。别直接 `pip install -U`。
 6. 验证：
    ```
    python -m py_compile wxbot_core.py web_server.py webhook_send.py plugins/wechat_checkin/handler.py plugins/wechat_checkin/store.py
    python -m unittest tests.test_wechat_checkin tests.test_webhook_send -v
    ```
+   **外加一条查重复定义**（上游改写历史时必查，见下）：
+   ```bash
+   python3 -c "
+   import ast,collections
+   t=ast.parse(open('wxbot_core.py',encoding='utf-8').read())
+   for n in ast.walk(t):
+       if isinstance(n,(ast.ClassDef,ast.Module)):
+           names=[x.name for x in n.body if isinstance(x,(ast.FunctionDef,ast.ClassDef))]
+           for k,c in collections.Counter(names).items():
+               if c>1: print('重复:',getattr(n,'name','<module>')+'.'+k,c)"
+   ```
 7. **运行时数据别乱提交**：`checkin.sqlite3`、`imports/*.json`、`config/config.json` 里的密钥都保持工作区状态，不进 commit（2026-07-30 起已由 `.gitignore` 兜住，见第 5 节）。
 8. commit 后清楚汇报改了啥 + commit ID。
+
+### ★★ 上游会 force-push 重写历史，合出来的"新功能"可能是我们早有的（2026-08-11）
+
+合 V4.7.30 时撞上：**V4.7.28（tag `3e63e09`，我们 7-28 就合过）被从 `upstream/main` 上摘掉了**，
+它的内容重新打包进了 V4.7.29。于是 merge base 从 V4.7.28 退回 **V4.7.27**，
+git 把我们早已拥有的「关键词回复引用/@」整套当成上游新改动**又放了一遍**。
+
+- **怎么认**：`docs/version.json` 里我们的版本号比 merge base 还新（我们 V4.7.28 vs base V4.7.27）；
+  `git log --all --source -S'V4.7.28' -- docs/version.json` 能看到那个 tag 还在、但已不在 main 的历史里。
+- **后果**：同名方法被合进来两份 —— 这次是 `WXBot._send_group_reply` 和 `_send_keyword_reply`
+  各两份（我方一份、上游重放一份，**逐字节相同**）。Python 只让后一份生效，
+  所以功能没差异、`py_compile` 也不报错，**属于静默冗余**：下次改代码时改了前一份会纳闷怎么不生效。
+  所以第 6 步那条查重复定义的命令不是可选项。
+- **反过来也是个好信号**：`dashboard.html` / `web_server.py` 因两边内容完全一致而自动合并、
+  **净变化为零** —— 看到这个就说明"上游这版对这些文件的改动我们本来就有"。
+- **处理原则不变**：定制区一律以我们的为准；重复定义删掉后加进来的那份。
 
 历史依赖坑：`dingtalk-stream` 和 `websockets` 版本不兼容（15.0.1 崩，降到 14.2 好了）——这是 gateway 层的，不是本项目，但同一台机器上都遇到过。
 
@@ -771,6 +883,8 @@ credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 | 主入口（Flask 面板） | `web_server.py` |
 | 机器人核心 / AI 调用 / 插件 hook | `wxbot_core.py` |
 | 手动启动 | `manual_start_bot.py` |
+| 整进程重启脚本（计划任务 `SWXPanelRestart` 跑它） | `restart_panel.bat`（★ 含 `set PYTHONIOENCODING=utf-8`，缺了 41.x 起不来，见 3.14） |
+| wxautox4 40.1.15 回滚备份 | `C:\Users\Admin\wxautox4-40.1.15-backup-20260811.zip`（PyPI 已下架 40.x，这是唯一退路，别删） |
 | Webhook 发送 | `webhook_send.py` |
 | 签到插件 | `plugins/wechat_checkin/` |
 | NCC 社群插件 | `plugins/ncc_community/`（面板 `/ncc_community` + `panel.py`，去 Notion 化见 3.6 与 `PANEL_SPEC.md`） |
