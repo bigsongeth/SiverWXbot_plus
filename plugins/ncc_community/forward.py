@@ -947,36 +947,59 @@ def _check_groups(bot, chat, name) -> bool:
     if not specs:
         reply(chat, "该分组没有允许转发的群可检查。")
         return True
-    reply(chat, f"开始检查 {len(specs)} 个群的可达性，请稍等…")
-    ok_list, fail_list, fixed = [], [], []
+    reply(chat, f"开始检查 {len(specs)} 个群，顺便学习每个群在微信里的真实显示名，请稍等…")
+    ok_list, fail_list, fixed, odd = [], [], [], []
     wx = getattr(bot, "wx", None)
     for spec in specs:
-        # 候选串依次试，记下哪个串真的切得过去 —— 只报"可达"而不说清是靠哪个名字，
-        # 就是 8/4 那次 105/105 假绿的由来
-        hit = None
+        # ★ 不只判"切没切过去"，还要把【微信里的显示名】读回来存下。
+        # 转发的"发送给"对话框是按显示名精确勾选的（8/10 实测：拿群名去搜一个已打🐶的群，
+        # 搜得到但勾不中，send() 在里面死等）。显示名才是唯一该用的寻址串——
+        # 与其每次转发靠 remark_applied 去猜、猜错白等一次超时，不如在这里一次性学准。
+        hit, seen_name = None, ""
         for cand in spec["cands"]:
             with MAIN_WINDOW_LOCK:
-                if _switched(wx, cand, exact=False):
-                    hit = cand
+                if not _switched(wx, cand, exact=False):
+                    seen_name = ""
+                else:
+                    try:
+                        info = wx.ChatInfo() or {}
+                    except Exception:
+                        info = {}
+                    seen_name = str(info.get("chat_name") or "").strip()
+                    if not seen_name:
+                        hit = cand        # 读不到显示名，退回用"切成功的这个串"
+            if hit:
+                break
+            if seen_name:
+                # ★ 安全闸：ChatWith 是模糊匹配，完全可能切到【别的群】。显示名剥掉🐶后
+                # 必须等于登记表里的群名，否则就是切歪了或群改了名 —— 绝不能把别人的名字
+                # 学进来，那会让之后每一次转发都稳定地发错群，比现在的卡死更糟。
+                if seen_name.rstrip(audit.DOG).strip() == spec["name"]:
+                    hit = seen_name
                     break
+                odd.append(f"{spec['name']}：搜「{cand}」切到的是「{seen_name}」")
             time.sleep(0.3)
         if hit:
             ok_list.append(spec["name"])
             if hit != spec["cands"][0]:
                 fixed.append(f"{spec['name']} → 「{hit}」")
-                try:
-                    registry.mark_addressing(spec["name"], hit)
-                except Exception as e:
-                    log("WARNING", f"回写寻址状态失败 {spec['name']}: {e}")
+            try:
+                registry.mark_addressing(spec["name"], hit)   # 学准了就记住，之后一次命中
+            except Exception as e:
+                log("WARNING", f"回写寻址状态失败 {spec['name']}: {e}")
         else:
             fail_list.append(spec["name"])
         time.sleep(0.5)
-    lines = [f"检查完成：{len(ok_list)}/{len(specs)} 可达。",
-             "⚠️ 这里验的是主窗口搜索，比转发用的「发送给」对话框宽容得多，"
-             "能切过去不等于转发一定搜得到（8/4 就是这么假绿的）。"]
+    lines = [f"检查完成：{len(ok_list)}/{len(specs)} 可达，已学到 {len(ok_list)} 个群的真实显示名。",
+             "（显示名 = 转发时唯一能勾中的那个串，学过之后转发不用再猜、也不用白等超时）"]
     if fixed:
-        lines.append(f"🔧 {len(fixed)} 个群的寻址串已按实测纠正：\n" + "\n".join(f" - {x}" for x in fixed[:10])
-                     + ("…" if len(fixed) > 10 else ""))
+        lines.append(f"🔧 {len(fixed)} 个群的寻址串跟原来猜的不一样，已按实测纠正：\n"
+                     + "\n".join(f" - {x}" for x in fixed[:10])
+                     + (f"\n…另有 {len(fixed) - 10} 个" if len(fixed) > 10 else ""))
+    if odd:
+        lines.append(f"⚠️ {len(odd)} 处搜到的是别的群（模糊匹配切歪或群改了名，没敢学）：\n"
+                     + "\n".join(f" - {x}" for x in odd[:8])
+                     + (f"\n…另有 {len(odd) - 8} 处" if len(odd) > 8 else ""))
     if fail_list:
         lines.append("不可达（可能改了群名/退群，去面板「群列表」改名或删除）：")
         lines.extend(f" - {t}" for t in fail_list)
