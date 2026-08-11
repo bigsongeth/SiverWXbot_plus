@@ -857,10 +857,11 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
+            "探搜索": lambda: _probe_search(bot, chat, name),
             "检查群组": lambda: _check_groups(bot, chat, name),
             "核对备注": lambda: _audit_remarks(bot, chat, name),
             "修备注": lambda: _fix_remarks(bot, chat, name),
@@ -1077,7 +1078,120 @@ def _scan_groups(bot, chat) -> bool:
         return True
     desc = audit.describe_raw(raw)
     log("INFO", f"扫群耗时 {time.time() - t0:.1f}s\n{desc}")
+
+    # ★ 把【全量显示名】也吐出来。只给前 5 个样本足够看清返回结构，但拿它跟登记表
+    # 离线比对时必须要全量 —— 那是唯一能一刀切开"这个群真没了"和"名字挂在别的群头上"
+    # 的证据，否则只能一个个切窗口去试（104 个群要 15 分钟，还会占着微信主窗口）。
+    names = audit.extract_names(raw) if hasattr(audit, "extract_names") else []
+    if not names:
+        names = [str(r[0]) if isinstance(r, (list, tuple)) and r else str(r) for r in (raw or [])]
     reply(chat, f"耗时 {time.time() - t0:.1f} 秒。\n{desc}")
+    reply(chat, "【全量显示名 %d 个】\n%s" % (len(names), "\n".join(names)))
+    return True
+
+
+def _probe_search(bot, chat, keyword) -> bool:
+    """「探搜索 <词>」：在主窗口搜索框里输入关键词，把搜索结果的控件树打出来。只读。
+
+    为什么需要它（2026-08-11）：备注被打错群之后，登记表和微信就对不上了，而
+    `ChatInfo()` 只给【显示名】（有备注时就是备注本身），读不到真实群名 —— 所以
+    "「A群名🐶」这个备注到底挂在哪个群头上"一直只能靠人一个个去微信里搜。
+    但微信的搜索结果里有：有备注的群会多显示一行「群聊名称：真实群名」。
+    那正是我们缺的那半边。wxautox 没暴露主窗口搜索，只能自己操作 UI，
+    而 UI 代码不摸清控件结构就是瞎写 —— 先用这条只读指令把结构打出来。"""
+    wx = getattr(bot, "wx", None)
+    if wx is None:
+        reply(chat, "拿不到 wx 实例"); return True
+
+    out = []
+    with MAIN_WINDOW_LOCK:
+        try:
+            wx.Show()
+        except Exception as e:
+            out.append(f"Show() 失败：{e}")
+        # 主窗口控件对象藏在哪个属性上，各版本不一样，挨个试；都不行就按句柄取
+        root = None
+        # wx 上真正挂着 UI 的是这三个 Box（41.x 实测），先看看它们自带什么方法
+        for box in ("SessionBox", "NavigationBox", "ChatBox"):
+            o = getattr(wx, box, None)
+            if o is None:
+                continue
+            meths = [a for a in dir(o) if not a.startswith("_")]
+            out.append(f"wx.{box} → {type(o).__name__}：{', '.join(meths[:18])}")
+        for path in ("SessionBox", "NavigationBox", "ChatBox", "control", "core"):
+            obj = getattr(wx, path, None)
+            if obj is None:
+                continue
+            cand = getattr(obj, "control", obj)
+            if cand is not None and hasattr(cand, "GetChildren"):
+                root = cand
+                out.append(f"主窗口控件取自 wx.{path}")
+                break
+        if root is None:
+            for owner, label in ((wx, "wx"), (getattr(wx, "core", None), "wx.core")):
+                hwnd = getattr(owner, "HWND", None) if owner is not None else None
+                if hwnd:
+                    try:
+                        from wxautox4 import uia
+                        root = uia.ControlFromHandle(int(hwnd))
+                        out.append(f"主窗口控件按句柄取自 {label}.HWND={hwnd}")
+                        break
+                    except Exception as e:
+                        out.append(f"{label}.HWND={hwnd} 取控件失败：{e}")
+        if root is None:
+            attrs = [a for a in dir(wx) if not a.startswith("__")][:40]
+            reply(chat, "找不到主窗口控件。wx 的属性：\n" + ", ".join(attrs))
+            return True
+
+        # wxautox 自带 SessionBox.search()，别自己去摸搜索框控件
+        sb = getattr(wx, "SessionBox", None)
+        edit = None
+        try:
+            r = sb.search(keyword)
+            out.append(f"SessionBox.search() 返回 {type(r).__name__}：{repr(r)[:400]}")
+            time.sleep(1.2)
+        except Exception as e:
+            out.append(f"SessionBox.search 失败：{e}")
+            try:
+                edit = root.EditControl(searchDepth=10)
+                edit.Click(simulateMove=False)
+                time.sleep(0.3)
+                edit.SendKeys(keyword, waitTime=0.3)
+                time.sleep(1.2)
+            except Exception as e2:
+                out.append(f"回退手动输入也失败：{e2}")
+                reply(chat, "\n".join(out)); return True
+
+        # 把树打出来：只要 Name 非空的，深度 8 以内
+        rows = []
+
+        def walk(c, depth=0):
+            if depth > 8 or len(rows) > 160:
+                return
+            try:
+                kids = c.GetChildren()
+            except Exception:
+                return
+            for ch in kids:
+                try:
+                    nm = (ch.Name or "").strip()
+                    if nm:
+                        rows.append("%s%s | %s" % ("· " * depth, ch.ControlTypeName, nm[:48]))
+                except Exception:
+                    pass
+                walk(ch, depth + 1)
+
+        walk(root)
+        out.append(f"搜「{keyword}」后，Name 非空的控件 {len(rows)} 个：")
+        out.extend(rows)
+        try:                                          # 收尾：别把主窗口留在搜索页
+            if edit is not None:
+                edit.SendKeys("{Esc}", waitTime=0.2)
+            elif getattr(sb, "searchbox", None) is not None:
+                sb.searchbox.SendKeys("{Esc}", waitTime=0.2)
+        except Exception:
+            pass
+    reply(chat, "\n".join(out))
     return True
 
 
