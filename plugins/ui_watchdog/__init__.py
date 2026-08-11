@@ -374,27 +374,8 @@ class UIWatchdog:
             _log('ERROR', f'【看门狗】记录重启历史失败: {e}')
 
     def _write_autostart_flag(self):
-        """写入自启动标记文件，带重试和错误处理。"""
-        try:
-            os.makedirs(_DATA_DIR, exist_ok=True)
-        except Exception as e:
-            _log('ERROR', f'【看门狗】创建数据目录失败: {e}')
-            return False
-
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                with open(_FLAG_FILE, 'w', encoding='utf-8') as f:
-                    json.dump({'ts': self._now(), 'reason': 'ui_stall_restart'}, f)
-                _log('INFO', f'【看门狗】自启动标记已写入: {_FLAG_FILE}')
-                return True
-            except Exception as e:
-                _log('WARNING', f'【看门狗】写入自启动标记失败（第 {attempt+1} 次尝试）: {e}')
-                if attempt < max_retries - 1:
-                    time.sleep(0.5)
-
-        _log('ERROR', f'【看门狗】写入自启动标记最终失败，已耗尽重试次数')
-        return False
+        """写入自启动标记文件（实现见模块级 write_autostart_flag，两边共用一份）。"""
+        return write_autostart_flag('ui_stall_restart', self._now)
 
     def _notify_best_effort(self, title, content):
         try:
@@ -424,6 +405,36 @@ def heartbeat():
 
 def disarm():
     _get_watchdog().disarm()
+
+
+def write_autostart_flag(reason='restart', now=time.time):
+    """写入自启动标记：整进程重启后 web_server 读到它会自动拉起机器人。
+
+    ★ 任何触发 SWXPanelRestart 的调用方都必须先调这个。只触发重启而不写标记，
+    面板会起来、机器人却是停的 —— 那比不自愈更糟：本来只是监听坏了（丢部分消息），
+    自愈之后变成机器人整个下线（丢全部消息），还得等人发现。
+    2026-08-11 listen_health 首次真触发自愈时就是这样，机器人下线 1.5 小时无人知。
+    """
+    try:
+        os.makedirs(_DATA_DIR, exist_ok=True)
+    except Exception as e:
+        _log('ERROR', f'【自启动标记】创建数据目录失败: {e}')
+        return False
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with open(_FLAG_FILE, 'w', encoding='utf-8') as f:
+                json.dump({'ts': now(), 'reason': reason}, f)
+            _log('INFO', f'【自启动标记】已写入（{reason}）: {_FLAG_FILE}')
+            return True
+        except Exception as e:
+            _log('WARNING', f'【自启动标记】写入失败（第 {attempt+1} 次尝试）: {e}')
+            if attempt < max_retries - 1:
+                time.sleep(0.5)
+
+    _log('ERROR', '【自启动标记】写入最终失败，已耗尽重试次数')
+    return False
 
 
 def consume_autostart_flag(now=time.time, flag_valid_seconds=None):

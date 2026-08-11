@@ -66,8 +66,13 @@ def _trigger_restart(task_name: str) -> None:
     直接复用 ui_watchdog 的实现，别自己再写一遍 —— 那里踩过 schtasks 裸名字
     FileNotFoundError 的坑（2026-07-30 看门狗因此哑火一晚），已经改成
     %SystemRoot%\\System32 绝对路径。
+
+    ★ 必须先写自启动标记再触发重启，两步缺一不可。2026-08-11 这里只复用了
+    触发那一半、漏了写标记：面板重启起来了，机器人却没被拉起，从 16:05 一直
+    下线到人发现为止（1.5 小时）。自愈把"监听坏了"升级成了"机器人没了"。
     """
-    from plugins.ui_watchdog import _default_trigger
+    from plugins.ui_watchdog import _default_trigger, write_autostart_flag
+    write_autostart_flag('listen_probe_restart')
     _default_trigger(task_name)
 
 

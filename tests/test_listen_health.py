@@ -273,16 +273,26 @@ class TestRegister(unittest.TestCase):
 class TestHeal(unittest.TestCase):
     """自愈：连续失败 -> 自动重启；冷却期内再失败 -> 判定重启无效，叫人。"""
 
+    # setUp 替换的模块级名字，tearDown 逐个还回去
+    _PATCHED = ('_trigger_restart', '_alert', 'load_state', 'save_state')
+
     def setUp(self):
         from plugins.listen_health import heal as heal_mod
         self.heal = heal_mod
         self.restarts = []
         self.alerts = []
         self.state = {}
+        # 原值先存好再替换 —— 少了这一步，本类跑完后模块里留着一堆假货，
+        # 后面任何想测「真」_trigger_restart 的用例都会静默测到 mock 上（踩过）。
+        self._orig = {name: getattr(heal_mod, name) for name in self._PATCHED}
         heal_mod._trigger_restart = lambda task: self.restarts.append(task)
         heal_mod._alert = lambda bot, title, content: self.alerts.append((title, content))
         heal_mod.load_state = lambda: dict(self.state)
         heal_mod.save_state = lambda s: self.state.update(s)
+
+    def tearDown(self):
+        for name, orig in self._orig.items():
+            setattr(self.heal, name, orig)
 
     def _cfg(self, **over):
         cfg = {'auto_restart': True, 'restart_after_consecutive': 2,
@@ -386,6 +396,58 @@ class TestBackoffConstant(unittest.TestCase):
         self.assertIsNotNone(found, 'wxbot_core 里找不到 RETRY_BACKOFF')
         self.assertEqual(list(found), sorted(found), '退避间隔必须递增')
         self.assertGreater(sum(found), 16, '总等待时间要明显长于改造前的 4 次 x 0.5 秒')
+
+
+class TestTriggerRestartWritesAutostartFlag(unittest.TestCase):
+    """★ 自愈重启必须连自启动标记一起写，否则面板起来了、机器人是停的。
+
+    2026-08-11 真出过事：_trigger_restart 只复用了 ui_watchdog 的触发那一半、
+    漏了写标记，机器人从 16:05 一直下线到人发现（1.5 小时）。
+    注意 TestHeal 整个把 _trigger_restart 换成了 mock，所以那批用例天然测不到
+    它内部干了什么 —— 这里必须调真正的 _trigger_restart，只替掉它下游的
+    _default_trigger（不然会真去跑 schtasks）。
+    """
+
+    def setUp(self):
+        from plugins.listen_health import heal as heal_mod
+        from plugins import ui_watchdog as wd_mod
+        self.heal_mod = heal_mod
+        self.wd_mod = wd_mod
+        self.calls = []
+
+        self._orig_trigger = wd_mod._default_trigger
+        self._orig_flag_file = wd_mod._FLAG_FILE
+        self._orig_data_dir = wd_mod._DATA_DIR
+
+        self.tmp = tempfile.mkdtemp()
+        wd_mod._DATA_DIR = self.tmp
+        wd_mod._FLAG_FILE = os.path.join(self.tmp, 'autostart.flag')
+        wd_mod._default_trigger = lambda task: self.calls.append(('trigger', task))
+
+    def tearDown(self):
+        self.wd_mod._default_trigger = self._orig_trigger
+        self.wd_mod._FLAG_FILE = self._orig_flag_file
+        self.wd_mod._DATA_DIR = self._orig_data_dir
+
+    def test_flag_written_and_restart_triggered(self):
+        self.heal_mod._trigger_restart('SWXPanelRestart')
+
+        self.assertTrue(os.path.exists(self.wd_mod._FLAG_FILE),
+                        '触发了重启却没写自启动标记 —— 机器人重启后不会被拉起')
+        self.assertEqual([('trigger', 'SWXPanelRestart')], self.calls)
+
+    def test_flag_is_fresh_enough_to_be_consumed(self):
+        """标记写完要能被 consume_autostart_flag 认可，否则等于没写。"""
+        self.heal_mod._trigger_restart('SWXPanelRestart')
+        self.assertTrue(self.wd_mod.consume_autostart_flag(flag_valid_seconds=600))
+
+    def test_flag_written_before_trigger(self):
+        """顺序不能反：先写标记再触发重启，否则可能进程已被杀、标记还没落盘。"""
+        order = []
+        self.wd_mod._default_trigger = lambda task: order.append(
+            'trigger:flag_exists=%s' % os.path.exists(self.wd_mod._FLAG_FILE))
+        self.heal_mod._trigger_restart('SWXPanelRestart')
+        self.assertEqual(['trigger:flag_exists=True'], order)
 
 
 if __name__ == '__main__':
