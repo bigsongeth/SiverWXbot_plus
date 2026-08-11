@@ -2697,6 +2697,14 @@ class WXBot:
         except Exception as e:
             log(level="ERROR", message=f"ai_news_note 注册失败：{e}")
 
+        # gh_trending_note 插件 hook：每日 GitHub 趋势 -> 微信收藏笔记 -> 发群
+        # （逻辑在 plugins/gh_trending_note，与 ai_news_note 平行；它会等 AI 日报先发完）
+        try:
+            from plugins.gh_trending_note import register_trending_note
+            register_trending_note(self, schedule)
+        except Exception as e:
+            log(level="ERROR", message=f"gh_trending_note 注册失败：{e}")
+
         # ncc_community 插件 hook：后台任务触发器（写 data/task_request.txt 即在 bot 进程内
         # 执行一条管理指令）。微信操作必须在本进程内跑，独立进程会抢主窗口。
         try:

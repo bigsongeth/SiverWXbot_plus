@@ -364,7 +364,7 @@ def log_server(level, msg):
     log_messages.append(log_entry)
     if len(log_messages) > 1000:
         log_messages.pop(0)
-    print(f"[{timestamp}] [{level}] {msg}")
+    print(f"[{timestamp}] [{level}] {msg}", flush=True)
 
 # ----------------------------------------------------------
 # Prompt 文件管理辅助函数
@@ -2158,13 +2158,48 @@ def main():
         # 定时启停
         time_start_stop()
         # ui_watchdog plugin hook: 看门狗触发的重启，10 秒后自动拉起机器人
+        autostart_triggered = False
         try:
             from plugins.ui_watchdog import consume_autostart_flag
             if consume_autostart_flag():
                 log('WARNING', '【看门狗】检测到自动重启标记，10 秒后自动启动机器人')
                 threading.Timer(10.0, _watchdog_autostart_bot).start()
+                autostart_triggered = True
         except Exception as _wd_e:
             log('ERROR', f'【看门狗】自启动检查失败: {_wd_e}')
+
+        # 备用方案：如果主机制失败，检查最后一次重启时间
+        if not autostart_triggered:
+            try:
+                import json
+                restart_history_path = os.path.join(
+                    os.path.dirname(__file__),
+                    'plugins', 'ui_watchdog', 'data', 'restart_history.json'
+                )
+                log('DEBUG', f'【看门狗】检查备用重启历史: {restart_history_path}')
+                if os.path.exists(restart_history_path):
+                    with open(restart_history_path, 'r', encoding='utf-8') as f:
+                        restart_times = json.load(f)
+                    if restart_times and isinstance(restart_times, list) and len(restart_times) > 0:
+                        last_restart = max(restart_times)
+                        current_time = time.time()
+                        time_diff = current_time - last_restart
+                        log('DEBUG', f'【看门狗】最后重启: {last_restart:.1f}, 当前: {current_time:.1f}, 差值: {time_diff:.1f}秒')
+                        # 扩大时间窗口到 120 秒（web_server 启动需要时间）
+                        if time_diff < 120:
+                            log('WARNING', f'【看门狗】检测到最近的重启（{time_diff:.0f}秒前），将在 10 秒后自动启动机器人')
+                            threading.Timer(10.0, _watchdog_autostart_bot).start()
+                            autostart_triggered = True
+                        else:
+                            log('DEBUG', f'【看门狗】重启时间过久（{time_diff:.0f}秒），不自动启动')
+                    else:
+                        log('WARNING', '【看门狗】重启历史为空或格式错误')
+                else:
+                    log('DEBUG', '【看门狗】重启历史文件不存在')
+            except Exception as _wd_backup_e:
+                import traceback
+                log('WARNING', f'【看门狗】备用自启检查失败: {_wd_backup_e}')
+                log('WARNING', f'【看门狗】堆栈: {traceback.format_exc()}')
         if siver_panel_manager is not None:
             siver_panel_manager.set_local_port_provider(get_panel_server_port)
             siver_panel_manager.start()

@@ -312,7 +312,8 @@ class UIWatchdog:
 
         _log('ERROR', f'【看门狗】{detail}，正在触发整进程重启...')
         try:
-            self._write_autostart_flag()
+            # 写自启动标记（失败不阻止重启）
+            flag_ok = self._write_autostart_flag()
             self._record_restart()
             self._notify_best_effort(
                 'wxbot 看门狗自动重启',
@@ -320,6 +321,8 @@ class UIWatchdog:
             self._trigger(self.cfg['restart_task_name'])
             _log('WARNING', f'【看门狗】已触发计划任务 {self.cfg["restart_task_name"]}，'
                             '等待进程被重启...')
+            if not flag_ok:
+                _log('WARNING', f'【看门狗】自启动标记写入失败，但重启继续执行；web_server 将使用备用自启机制')
             return True
         except Exception as e:
             _log('ERROR', f'【看门狗】触发重启失败: {e}')
@@ -359,16 +362,39 @@ class UIWatchdog:
         return len(recent) < self.cfg['max_restarts_per_hour']
 
     def _record_restart(self):
-        history = [t for t in self._load_history() if self._now() - t < 3600]
-        history.append(self._now())
-        os.makedirs(_DATA_DIR, exist_ok=True)
-        with open(_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(history, f)
+        """记录重启时间，带错误处理。"""
+        try:
+            history = [t for t in self._load_history() if self._now() - t < 3600]
+            history.append(self._now())
+            os.makedirs(_DATA_DIR, exist_ok=True)
+            with open(_HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(history, f)
+            _log('INFO', f'【看门狗】重启历史已记录: {_HISTORY_FILE}')
+        except Exception as e:
+            _log('ERROR', f'【看门狗】记录重启历史失败: {e}')
 
     def _write_autostart_flag(self):
-        os.makedirs(_DATA_DIR, exist_ok=True)
-        with open(_FLAG_FILE, 'w', encoding='utf-8') as f:
-            json.dump({'ts': self._now(), 'reason': 'ui_stall_restart'}, f)
+        """写入自启动标记文件，带重试和错误处理。"""
+        try:
+            os.makedirs(_DATA_DIR, exist_ok=True)
+        except Exception as e:
+            _log('ERROR', f'【看门狗】创建数据目录失败: {e}')
+            return False
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with open(_FLAG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump({'ts': self._now(), 'reason': 'ui_stall_restart'}, f)
+                _log('INFO', f'【看门狗】自启动标记已写入: {_FLAG_FILE}')
+                return True
+            except Exception as e:
+                _log('WARNING', f'【看门狗】写入自启动标记失败（第 {attempt+1} 次尝试）: {e}')
+                if attempt < max_retries - 1:
+                    time.sleep(0.5)
+
+        _log('ERROR', f'【看门狗】写入自启动标记最终失败，已耗尽重试次数')
+        return False
 
     def _notify_best_effort(self, title, content):
         try:

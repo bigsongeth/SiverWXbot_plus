@@ -127,6 +127,25 @@ def _find_global(pred):
 _TOPMOSTED = set()
 
 
+def _hw(h):
+    """把窗口句柄归一化成有符号 32 位，用于比较两个来源不同的 hwnd。
+
+    2026-08-09 定位到的老 bug：uiautomation 的 NativeWindowHandle 在句柄高位为 1 时
+    给的是**无符号**大整数（如 18446744072896907420），而 pywin32 的
+    GetForegroundWindow() 给的是**有符号**值（-812644196）—— 两者是同一个窗口，
+    但直接 `==` 永远不相等，于是被误判成"没抢到前台"而中止发送。
+
+    这就是所谓"间歇性抢焦点故障"的真正根因：句柄由系统分配，高位是不是 1 全看运气，
+    所以同一套代码时好时坏（8/3 早上连挂三次、当晚手动跑却一次过）。
+    凡是拿 win32gui 返回值和 NativeWindowHandle 比较的地方，两边都要过这个函数。
+    """
+    try:
+        h = int(h) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return h
+    return h - 0x100000000 if h >= 0x80000000 else h
+
+
 def _describe_hwnd(hwnd):
     """把一个窗口画成一行可读信息，专供"抢不到前台"时留证据用。
 
@@ -167,7 +186,9 @@ def _describe_hwnd(hwnd):
             ucls = f" uia={c.ClassName!r}/{(c.Name or '')[:30]!r}"
     except Exception:
         pass
-    return (f"hwnd={hwnd} class={cls!r} proc={pname}(pid={pid}) "
+    # 句柄一律按归一化后的值打印，否则同一个窗口在日志里会出现两种写法
+    # （无符号 18446744072896907420 / 有符号 -812644196），对不上号。
+    return (f"hwnd={_hw(hwnd)} class={cls!r} proc={pname}(pid={pid}) "
             f"title={title[:60]!r} topmost={topmost}{ucls}")
 
 
@@ -184,7 +205,7 @@ def _log_fg(prefix):
 def _force_foreground(hwnd):
     try:
         fg = win32gui.GetForegroundWindow()
-        if fg == hwnd:
+        if _hw(fg) == _hw(hwnd):
             return True
         tid_me = win32api.GetCurrentThreadId()
         tid_fg = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
@@ -207,7 +228,7 @@ def _force_foreground(hwnd):
                 pass
     except Exception:
         pass
-    return win32gui.GetForegroundWindow() == hwnd
+    return _hw(win32gui.GetForegroundWindow()) == _hw(hwnd)
 
 
 def _raise_hwnd(hwnd, tag=""):
@@ -264,13 +285,32 @@ def _drop_topmost():
     _TOPMOSTED.clear()
 
 
+def _pid_of(hwnd):
+    try:
+        return win32process.GetWindowThreadProcessId(hwnd)[1]
+    except Exception:
+        return 0
+
+
 def _owns_point(hwnd, x, y):
-    """这个屏幕坐标点下去，是不是真的落在 hwnd 这个窗口上。"""
+    """这个屏幕坐标点下去，是不是真的落在 hwnd 这个窗口上。
+
+    除了"就是它 / 它的子窗口"，还接受**同一进程的另一个顶层窗口**：
+    微信的搜索结果弹层、下拉菜单这些是独立顶层窗口（如 mmui::SearchContentPopover，
+    class=Qt51514QWindowToolSaveBits），GA_ROOT 拿到的根跟主窗口不是同一个，
+    按老逻辑会被判成"被挡住"而放弃点击 —— 但那层弹窗本来就是要点的目标 UI。
+    2026-08-09 实测：搜索"文件传输助手"后点结果项，就栽在这个误判上。
+
+    真正该拦的是"别的程序盖在上面"（面板 Chrome、别的应用），那些进程不同，仍会被拦下。
+    """
     try:
         h = win32gui.WindowFromPoint((int(x), int(y)))
         if not h:
             return False
-        return h == hwnd or win32gui.GetAncestor(h, 2) == hwnd   # GA_ROOT=2
+        if _hw(h) == _hw(hwnd) or _hw(win32gui.GetAncestor(h, 2)) == _hw(hwnd):  # GA_ROOT=2
+            return True
+        pid_hit, pid_target = _pid_of(h), _pid_of(hwnd)
+        return bool(pid_hit) and pid_hit == pid_target
     except Exception:
         return True   # 判不了就别拦着
 
@@ -493,12 +533,12 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
     r = note.BoundingRectangle
     nh = note.NativeWindowHandle
     _raise_hwnd(nh, "笔记编辑器")
-    if win32gui.GetForegroundWindow() != nh:
+    if _hw(win32gui.GetForegroundWindow()) != _hw(nh):
         # 键盘走前台焦点：编辑器不在前台，Ctrl+V 会粘到别的窗口去，
         # 结果存出一条空笔记（或干脆不存），后面还会误发历史笔记。
         _log_fg(f"编辑器(hwnd={nh})第一次没拿到前台，此刻")
         _raise_hwnd(nh, "笔记编辑器-重试")
-        if win32gui.GetForegroundWindow() != nh:
+        if _hw(win32gui.GetForegroundWindow()) != _hw(nh):
             # 中止前把现场记全：谁占着前台、编辑器自己什么状态、有没有更新弹窗挡着。
             # 没有这几行，事后只剩一句"没拿到键盘焦点"，根因无从查起（8/3 就是这样）。
             _log_fg(f"编辑器(hwnd={nh})两次都没拿到前台，中止；此刻")
@@ -596,11 +636,11 @@ def _open_target(target):
     if not _click(sb, hwnd, "搜索框"):
         return False, None, "搜索框被别的窗口挡住，点不到"
     time.sleep(0.6)
-    if win32gui.GetForegroundWindow() != hwnd:
+    if _hw(win32gui.GetForegroundWindow()) != _hw(hwnd):
         # 键盘走的是前台焦点，没拿到焦点粘贴会进别的窗口 —— 直接判失败，别静默跑空。
         _force_foreground(hwnd)
         time.sleep(0.5)
-        if win32gui.GetForegroundWindow() != hwnd:
+        if _hw(win32gui.GetForegroundWindow()) != _hw(hwnd):
             _log_fg(f"搜索框输入前主窗口(hwnd={hwnd})没拿到前台，中止；此刻")
             return False, None, "微信没拿到键盘焦点（被别的窗口占着），中止"
     _clip_text(target)
