@@ -1138,10 +1138,23 @@ def _search_display_name(wx, group_name: str, out_detail=None):
             queries.append(longest)
 
     for q in queries:
-        try:
-            res = sb.search(q) or []
-        except Exception as e:
-            return None, f"搜索失败：{e}"
+        # ★ 搜之前把框清空：不清的话上一次的词会残留，于是接连几个不同的群搜出来的是
+        # 【同一批结果】。2026-08-13 实测，连着 4 个群的失败详情都是
+        # 「…最近在搜、旅居交流群、旅居交流群🐶」——那是上一个群留下的。
+        #
+        # ★★ 但这两步都必须限时。同一天的教训：这句 SendKeys 第一版没加闸，直接把
+        # 整个 bot 进程卡死 38 分钟（task_result 和 wxauto 日志双双停在同一秒）。
+        # "凡是进 wxautox 的调用都得有闸"这条今晚立了三次，我自己写新代码时还是漏了。
+        box = getattr(sb, "searchbox", None)
+        if box is not None:
+            _ui_call(lambda: box.SendKeys("{Ctrl}a{Delete}", waitTime=0.15), 6, "clear-search")
+            time.sleep(0.2)
+        done, res, err = _ui_call(lambda: sb.search(q), 20, f"search:{q[:12]}")
+        if not done:
+            return None, f"{STUCK_MARK}（搜索「{q}」卡住，UI 锁多半没释放）"
+        if err is not None:
+            return None, f"搜索失败：{err}"
+        res = res or []
         for el in res:
             c = str(getattr(el, "content", "") or "").strip()
             if not c or c in cands:
@@ -1196,7 +1209,12 @@ def _search_display_name(wx, group_name: str, out_detail=None):
         # 实测「【大理】春节串门一起玩！（看公告」同时命中它自己的🐶备注和一个
         # 前面多了个 A 的同名群，靠这一条能自动选对，不必退回人工。
         exact = [c for c in matches if audit.strip_dog(_norm_name(c)) == want]
-        if len(exact) == 1:
+        # 微信里可能同时存在「旅居交流群」和「旅居交流群🐶」两个会话，剥掉🐶后都等于
+        # 群名、都算 exact。带🐶的那个才是我们纳管过的，选它。
+        dogged = [c for c in exact if audit.has_dog(c)]
+        if len(dogged) == 1:
+            best = dogged[0]
+        elif len(exact) == 1:
             best = exact[0]
         else:
             return None, ("有 %d 个都像，不敢学（怕以后每次都发错群）：%s"
@@ -1250,6 +1268,12 @@ def _fix_addressing(bot, chat, scope) -> bool:
                     log("INFO", f"「{g}」第一次没搜到，重试命中")
                 else:
                     why = f"{why}｜重试仍失败：{why2}"
+        if shown is None and STUCK_MARK in (why or ""):
+            failed.append(f"{g}：{why}")
+            log("ERROR", f"搜索卡死，中止本轮：{why}")
+            reply(chat, f"⛔ 搜索卡住了（UI 锁多半没释放），已中止。已处理 {len(learned)} 个群，"
+                        f"请重启程序（SWXPanelRestart）后再跑一次。")
+            break
         if shown:
             old = (data["groups"].get(g, {}) or {}).get("addressing_hit")
             learned.append(g)
