@@ -77,6 +77,7 @@ MAIN_MENU = (
     "  检查群组 全部 —— 群还在不在（可达性）\n"
     "  核对备注 全部 —— 🐶备注有没有打错群\n"
     "  扫群 —— 微信里到底有多少个群\n"
+    "  查新群 —— 挑出没打🐶标签的群（新建的群用它）\n"
     "  修备注 预览 / 修备注 全部 —— 把每个群的备注修成「群名🐶」"
 )
 
@@ -854,6 +855,8 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain == "迎新列表":
         reply(chat, _format_welcomes(cfg)); return True
 
+    if plain in ("查新群", "新群检查", "没打标签"):
+        return _find_unmarked(bot, chat)
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
@@ -976,7 +979,7 @@ def _check_groups(bot, chat, name) -> bool:
                 # ★ 安全闸：ChatWith 是模糊匹配，完全可能切到【别的群】。显示名剥掉🐶后
                 # 必须等于登记表里的群名，否则就是切歪了或群改了名 —— 绝不能把别人的名字
                 # 学进来，那会让之后每一次转发都稳定地发错群，比现在的卡死更糟。
-                if seen_name.rstrip(audit.DOG).strip() == spec["name"]:
+                if audit.strip_dog(seen_name) == spec["name"]:
                     hit = seen_name
                     break
                 odd.append(f"{spec['name']}：搜「{cand}」切到的是「{seen_name}」")
@@ -1149,7 +1152,7 @@ def _search_display_name(wx, group_name: str, out_detail=None):
             #           ② 显示名是群名的【截断】——微信群备注上限 48 字节，长群名打备注
             #              会被截掉尾巴，实测「数字游民信息共享群」在微信里就是
             #              「数字游民信息共享🐶」，少一个"群"字。差 3 字以内才认。
-            bare = cn.rstrip(audit.DOG).strip()
+            bare = audit.strip_dog(cn)
             hit_fwd = want and want in cn and len(cn) - len(want) <= 8
             hit_trunc = (bare and len(bare) >= 6 and bare in want
                          and len(want) - len(bare) <= 3)
@@ -1192,7 +1195,7 @@ def _search_display_name(wx, group_name: str, out_detail=None):
         # 多个候选时，剥掉🐶后与群名【严格相等】的那个才是本尊。
         # 实测「【大理】春节串门一起玩！（看公告」同时命中它自己的🐶备注和一个
         # 前面多了个 A 的同名群，靠这一条能自动选对，不必退回人工。
-        exact = [c for c in matches if _norm_name(c).rstrip(audit.DOG).strip() == want]
+        exact = [c for c in matches if audit.strip_dog(_norm_name(c)) == want]
         if len(exact) == 1:
             best = exact[0]
         else:
@@ -1321,6 +1324,59 @@ def _bring_wx_front() -> str:
             return f"主窗口 hwnd={h} 已置前（SetForegroundWindow 兜底）"
         except Exception as e2:
             return f"主窗口 hwnd={h} 置前失败：{e} / {e2}"
+
+
+def _find_unmarked(bot, chat, arg=None) -> bool:
+    """「查新群」：扫一遍微信里的群，把【没打狗标记】的挑出来 —— 那就是还没纳管的。
+
+    判据就一条：显示名里有没有小狗（任意变体，见 audit.DOG_MARKS）。打过标签的群
+    显示名以🐶结尾，没打过的还是光秃秃的群名。人照着这张单子决定要不要纳管。
+
+    分两类报，因为处置方式不同：
+      · 不在登记表里 → 新群，要先在面板归类（分组/允许转发）再打标签
+      · 在登记表里但没标签 → 漏打了，直接「修备注」就能补上
+    """
+    wx = getattr(bot, "wx", None)
+    reply(chat, "开始扫描微信里的群，挑出没打🐶标签的…")
+    t0 = time.time()
+    try:
+        with MAIN_WINDOW_LOCK:
+            raw = wx.GetAllRecentGroups()
+    except Exception as e:
+        reply(chat, f"扫描失败：{e}")
+        return True
+
+    names = audit.extract_group_names(raw)
+    data = registry.load()
+    known = set(data.get("groups", {}))
+    # 登记表里的群还可能是靠 addressing_hit 认人的，一并算作"已知"
+    known |= {str(g.get("addressing_hit") or "") for g in data.get("groups", {}).values()}
+    known |= {audit.strip_dog(x) for x in known if x}
+    skip = _admin_group_names(store.load())
+
+    fresh, missed_tag = [], []
+    for n in names:
+        if not n or n in skip or audit.strip_dog(n) in skip:
+            continue
+        if audit.has_dog(n):
+            continue                      # 打过标签的，不用管
+        (missed_tag if (n in known or audit.strip_dog(n) in known) else fresh).append(n)
+
+    lines = [f"扫了 {len(names)} 个群，耗时 {time.time() - t0:.0f} 秒。"]
+    if fresh:
+        lines.append(f"🆕 {len(fresh)} 个【新群】（登记表里没有，也没打🐶）：\n"
+                     + "\n".join(f" - {n}" for n in fresh[:25])
+                     + (f"\n…另有 {len(fresh) - 25} 个" if len(fresh) > 25 else "")
+                     + "\n处置：先去面板『群列表』归类（选分组 + 勾允许转发），再发「修备注」打标签。")
+    if missed_tag:
+        lines.append(f"⚠️ {len(missed_tag)} 个群在登记表里【但没打🐶】：\n"
+                     + "\n".join(f" - {n}" for n in missed_tag[:25])
+                     + (f"\n…另有 {len(missed_tag) - 25} 个" if len(missed_tag) > 25 else "")
+                     + "\n处置：直接发「修备注 全部」补打。")
+    if not fresh and not missed_tag:
+        lines.append("✅ 扫到的群全都打过🐶标签了，没有漏网的。")
+    reply(chat, "\n".join(lines))
+    return True
 
 
 def _probe_search(bot, chat, keyword) -> bool:
@@ -1659,7 +1715,7 @@ def _fix_remarks(bot, chat, scope) -> bool:
         return True
 
     skip_names = _admin_group_names(store.load())
-    names = [n for n in names if n not in skip_names and n.rstrip(audit.DOG) not in skip_names]
+    names = [n for n in names if n not in skip_names and audit.strip_dog(n) not in skip_names]
     known = set(registry.load().get("groups", {}))
     overrides = (store.load().get("remark_overrides") or {})
     reply(chat, f"扫到 {len(names)} 个群（已排除管理群），开始逐个核对备注"
@@ -1700,7 +1756,7 @@ def _fix_remarks(bot, chat, scope) -> bool:
     # 落盘；微信里扫到但登记表里没有的群，走面板「待归类」归类。
     if not dry:
         known = set(registry.load().get("groups", {}))
-        unknown = [n for n in done_names if n and n.rstrip(audit.DOG) not in known
+        unknown = [n for n in done_names if n and audit.strip_dog(n) not in known
                    and n not in known]
         if unknown:
             msg += (f"\n\n以下 {len(unknown)} 个群微信里有、登记表里没有，"

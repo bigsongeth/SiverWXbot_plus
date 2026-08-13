@@ -16,7 +16,33 @@
 """
 from __future__ import annotations
 
-DOG = "\U0001f436"  # 🐶
+DOG = "\U0001f436"  # 🐶 —— 我们【打】备注时统一用这个
+
+# 但【认】的时候必须放宽：2026-08-13 实测，微信里同一批群打的狗不是同一个字符 ——
+# 「黄山NCC黑多岛·好朋友们1️⃣🐕」用的是 U+1F415（侧面狗），而「…二期内测中！🐶」
+# 是 U+1F436（狗脸）。人在手机上打字选的是"一只狗"，选中哪个码点全看输入法。
+# 只认 U+1F436 的话，凡是打了别的狗的群，剥标记时剥不掉、比对必然落空，
+# 于是被判成"群没了"。
+DOG_MARKS = (
+    "\U0001f436",  # 🐶 狗脸
+    "\U0001f415",  # 🐕 狗
+    "\U0001f429",  # 🐩 贵宾犬
+    "\U0001f9ae",  # 🦮 导盲犬
+    "\U0001f416",  # 🐖 猪（形近误选，认了不吃亏）
+)
+
+
+def strip_dog(s: str) -> str:
+    """剥掉结尾的狗标记（任意变体，可能不止一个），并去掉首尾空白。"""
+    t = str(s or "").strip()
+    while t and t[-1] in DOG_MARKS:
+        t = t[:-1].strip()
+    return t
+
+
+def has_dog(s: str) -> bool:
+    """这个名字带狗标记吗（任意变体）—— 判断一个群"纳管了没有"就看它。"""
+    return any(m in str(s or "") for m in DOG_MARKS)
 
 # 判定结果
 OK = "ok"                      # 名实相符
@@ -123,8 +149,8 @@ def plan_remark(display, known_names=(), overrides=None) -> tuple[str, str]:
             return FIX_SKIP, f"指定的备注「{ov}」有 {nb} 字节，超过上限 {REMARK_MAX_BYTES}"
         return FIX_APPLY, ov
 
-    if name.endswith(DOG):
-        base = name[:-len(DOG)].strip()
+    if has_dog(name):
+        base = strip_dog(name)
         if DOG in base:
             return FIX_CONFLICT, f"备注是追加出来的垃圾「{name}」，只能人工清空重打"
         if not base:
