@@ -857,11 +857,12 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|查寻址|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
             "探搜索": lambda: _probe_search(bot, chat, name),
+            "查寻址": lambda: _fix_addressing(bot, chat, name),
             "检查群组": lambda: _check_groups(bot, chat, name),
             "核对备注": lambda: _audit_remarks(bot, chat, name),
             "修备注": lambda: _fix_remarks(bot, chat, name),
@@ -1090,6 +1091,140 @@ def _scan_groups(bot, chat) -> bool:
     return True
 
 
+def _search_display_name(wx, group_name: str, out_detail=None):
+    """用微信搜索查一个群的【实际显示名】。返回 (显示名, 诊断串) 或 (None, 原因)。
+
+    2026-08-13 实测发现的关键事实：显示名可以带我们不知道的装饰前缀 ——
+    搜「泰国清迈旅居交流1群」返回的 content 是「🟪泰国清迈旅居交流1群🐶」。
+    我们拿「群名」「群名🐶」两个候选去找，对这类群一个都对不上，于是它们被
+    「检查群组」判成"不可达"、被当成退群或改名，其实群好好的，只是名字前面多了个方块。
+
+    判据：显示名必须【包含】群名，且多出来的装饰不超过 8 个字符 —— 只放行"加了点缀"，
+    不放行"搜到了另一个群"。宁可漏一个也不能学错：学错等于以后每次转发都稳定发错群。"""
+    sb = getattr(wx, "SessionBox", None)
+    if sb is None:
+        return None, "拿不到 SessionBox"
+    try:
+        res = sb.search(group_name) or []
+    except Exception as e:
+        return None, f"搜索失败：{e}"
+    best, cands = None, []
+    for el in res:
+        c = str(getattr(el, "content", "") or "").strip()
+        if not c:
+            continue
+        cands.append(c)
+        if group_name in c and len(c) - len(group_name) <= 8:
+            best = c
+            break
+    try:                                  # 收尾：关掉搜索面板，别把主窗口留在搜索页
+        if res:
+            res[0].close()
+    except Exception:
+        pass
+    if out_detail is not None:
+        out_detail.extend(cands[:6])
+    if best:
+        return best, ""
+    return None, ("搜到 %d 项但都对不上：%s" % (len(cands), "、".join(cands[:4]))
+                  if cands else "搜不到")
+
+
+def _fix_addressing(bot, chat, scope) -> bool:
+    """「查寻址 全部 / 缺失 / <群名>」：把每个群的实际显示名查出来存进 addressing_hit。
+
+    存在的理由：转发的"发送给"对话框按显示名精确勾选，而显示名可能带 emoji 前缀、
+    带🐶备注、或两者都有 —— 靠"群名/备注"两个候选去猜，对装饰过的群必然全军覆没。
+    搜一次抄下来，比猜可靠得多，也比逐个 ChatWith 切窗口快。"""
+    wx = getattr(bot, "wx", None)
+    data = registry.load()
+    if scope in ("全部", "所有", "all"):
+        specs = registry.forward_specs(data)
+    elif scope in ("缺失", "没学到", "missing"):
+        specs = [s for s in registry.forward_specs(data)
+                 if not (data["groups"].get(s["name"], {}) or {}).get("addressing_hit")]
+    elif scope in data.get("groupings", {}):
+        specs = registry.forward_specs(data, scope)
+    else:
+        specs = [s for s in registry.forward_specs(data) if s["name"] == scope]
+        if not specs:
+            reply(chat, f"没有「{scope}」这个群或分组。"); return True
+
+    reply(chat, f"开始查 {len(specs)} 个群的实际显示名（微信搜索，只读不发消息）…")
+    learned, changed, failed = [], [], []
+    for spec in specs:
+        g = spec["name"]
+        with MAIN_WINDOW_LOCK:
+            _bring_wx_front()
+            shown, why = _search_display_name(wx, g)
+        if shown:
+            old = (data["groups"].get(g, {}) or {}).get("addressing_hit")
+            learned.append(g)
+            if shown != old:
+                changed.append(f"{g} → 「{shown}」")
+                try:
+                    registry.mark_addressing(g, shown)
+                except Exception as e:
+                    log("WARNING", f"回写寻址失败 {g}: {e}")
+        else:
+            failed.append(f"{g}：{why}")
+        time.sleep(0.6)
+
+    lines = [f"查完 {len(specs)} 个群：认出 {len(learned)} 个，其中 {len(changed)} 个的寻址串变了。"]
+    if changed:
+        lines.append("🔧 新学到/更正的显示名：\n" + "\n".join(f" - {x}" for x in changed[:25])
+                     + (f"\n…另有 {len(changed) - 25} 个" if len(changed) > 25 else ""))
+    if failed:
+        lines.append(f"❌ 仍然认不出的 {len(failed)} 个（可能真退群了，或被打了别人的备注）：\n"
+                     + "\n".join(f" - {x}" for x in failed[:20])
+                     + (f"\n…另有 {len(failed) - 20} 个" if len(failed) > 20 else ""))
+    reply(chat, "\n".join(lines))
+    return True
+
+
+def _bring_wx_front() -> str:
+    """把微信主窗口拉到前台并置为活动窗口。
+
+    为什么必须（2026-08-13 实测）：搜索框那个 EditControl【不是常驻控件】，
+    窗口不在前台时 UIA 拿不到它 —— wxautox 自己的 SessionBox.search() 和手动遍历
+    都会报 Find Control Timeout，看起来像"控件不存在"，其实只是窗口没激活。
+    8/11 那次能成功，是因为主窗口刚被 wake_wx 唤起并置前。"""
+    try:
+        import psutil
+        import win32con
+        import win32gui
+        import win32process
+    except Exception as e:
+        return f"置前跳过（缺 win32）：{e}"
+    found = []
+
+    def cb(h, _):
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(h)
+            if psutil.Process(pid).name().lower() not in ("weixin.exe", "wechat.exe"):
+                return
+            if win32gui.GetWindowText(h) in ("微信", "Weixin", "WeChat"):
+                found.append(h)
+        except Exception:
+            return
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception as e:
+        return f"枚举窗口失败：{e}"
+    if not found:
+        return "没找到微信主窗口（可能又被关进托盘了，跑 wake_wx.py）"
+    h = found[0]
+    try:
+        win32gui.ShowWindow(h, win32con.SW_RESTORE)
+        time.sleep(0.2)
+        win32gui.SetForegroundWindow(h)
+    except Exception as e:
+        return f"主窗口 hwnd={h} 置前失败（不一定致命）：{e}"
+    time.sleep(0.8)
+    return f"主窗口 hwnd={h} 已置前"
+
+
 def _probe_search(bot, chat, keyword) -> bool:
     """「探搜索 <词>」：在主窗口搜索框里输入关键词，把搜索结果的控件树打出来。只读。
 
@@ -1109,6 +1244,7 @@ def _probe_search(bot, chat, keyword) -> bool:
             wx.Show()
         except Exception as e:
             out.append(f"Show() 失败：{e}")
+        out.append(_bring_wx_front())
         # 主窗口控件对象藏在哪个属性上，各版本不一样，挨个试；都不行就按句柄取
         root = None
         # wx 上真正挂着 UI 的是这三个 Box（41.x 实测），先看看它们自带什么方法
@@ -1148,16 +1284,88 @@ def _probe_search(bot, chat, keyword) -> bool:
         edit = None
         try:
             r = sb.search(keyword)
-            out.append(f"SessionBox.search() 返回 {type(r).__name__}：{repr(r)[:400]}")
             time.sleep(1.2)
+            out.append(f"SessionBox.search() 返回 {type(r).__name__}，{len(r)} 项")
+            for i, el in enumerate(list(r)[:10]):
+                attrs = [a for a in dir(el) if not a.startswith("_")]
+                out.append(f"[{i}] {type(el).__name__} attrs={attrs}")
+                for a in ("name", "Name", "text", "title", "subtitle", "info", "content", "nickname"):
+                    if hasattr(el, a):
+                        try:
+                            out.append(f"      .{a} = {getattr(el, a)!r}")
+                        except Exception as e2:
+                            out.append(f"      .{a} 读取失败：{e2}")
+                # 副标题「群聊名称：xxx」多半是结果项底下的子控件，把子树也打出来
+                c = getattr(el, "control", None)
+                if c is not None:
+                    try:
+                        for ch in c.GetChildren():
+                            nm = (ch.Name or "").strip()
+                            if nm:
+                                out.append(f"      child {ch.ControlTypeName}: {nm[:60]}")
+                            for gc in ch.GetChildren():
+                                gnm = (gc.Name or "").strip()
+                                if gnm:
+                                    out.append(f"        · {gc.ControlTypeName}: {gnm[:60]}")
+                    except Exception as e2:
+                        out.append(f"      子控件读取失败：{e2}")
         except Exception as e:
             out.append(f"SessionBox.search 失败：{e}")
+            # ★ 别用 root.EditControl(searchDepth=N)：41.x 上它和 wxautox 自己的
+            # search() 一样报 Find Control Timeout，可手动遍历树【能】找到那个
+            # Name='搜索' 的 EditControl。所以是查找方式失效，不是控件不存在。
+            def _find_edit(c, depth=0):
+                if depth > 8:
+                    return None
+                try:
+                    kids = c.GetChildren()
+                except Exception:
+                    return None
+                for ch in kids:
+                    try:
+                        if ch.ControlTypeName == "EditControl":
+                            return ch
+                    except Exception:
+                        pass
+                    got = _find_edit(ch, depth + 1)
+                    if got is not None:
+                        return got
+                return None
+
             try:
-                edit = root.EditControl(searchDepth=10)
+                edit = _find_edit(root)
+                if edit is None:
+                    out.append("遍历树也没找到 EditControl")
+                    reply(chat, "\n".join(out)); return True
+                out.append(f"遍历树找到搜索框：Name={edit.Name!r}")
                 edit.Click(simulateMove=False)
-                time.sleep(0.3)
-                edit.SendKeys(keyword, waitTime=0.3)
-                time.sleep(1.2)
+                time.sleep(0.4)
+                edit.SendKeys("{Ctrl}a", waitTime=0.1)
+                edit.SendKeys(keyword, waitTime=0.4)
+                time.sleep(1.5)
+                rows2 = []
+
+                def _walk2(c, depth=0):
+                    if depth > 9 or len(rows2) > 60:
+                        return
+                    try:
+                        kids = c.GetChildren()
+                    except Exception:
+                        return
+                    for ch in kids:
+                        try:
+                            nm = (ch.Name or "").strip()
+                            if nm:
+                                rows2.append("%s%s | %s" % ("· " * depth, ch.ControlTypeName,
+                                                            nm.replace("\n", " ⏎ ")[:70]))
+                        except Exception:
+                            pass
+                        _walk2(ch, depth + 1)
+
+                _walk2(root)
+                out.append(f"搜「{keyword}」的结果控件 {len(rows2)} 个：")
+                out.extend(rows2)
+                reply(chat, "\n".join(out)); return True
             except Exception as e2:
                 out.append(f"回退手动输入也失败：{e2}")
                 reply(chat, "\n".join(out)); return True
