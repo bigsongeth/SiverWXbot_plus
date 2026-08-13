@@ -372,7 +372,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(stat["gone"], [])
         self.assertEqual(sorted(m.forwarded), sorted(f"群{i}" for i in range(12)))
 
-    def test_deliver_gone_group_marked_and_skipped(self):
+    def test_deliver_reports_gone_group_but_does_not_disable_it(self):
         # 群1 已没了(无结果)：单群转发返回无结果→只把群1判不可达，其余照发
         m = FakeMsg("素材", mtype="text"); m.gone_set = {"群1"}
         build_timeline(self.bot, m)
@@ -382,7 +382,7 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(stat["gone"], ["群1"])
         self.assertEqual(stat["ok"], 2)
         self.assertEqual(sorted(m.forwarded), ["群0", "群2"])
-        self.assertIn("搜不到", " ".join(mm for _, mm in self.bot.wx.sent))
+        self.assertIn("没搜到", " ".join(mm for _, mm in self.bot.wx.sent))
 
     # ---------- 寻址候选 / 卡死兜底（2026-08-04 全量转发第一个群就卡死那次）----------
 
@@ -464,6 +464,23 @@ class EngineTest(unittest.TestCase):
         finally:
             wxlock.set_forwarding(False)
             wxlock._MAX_HOLD = orig
+
+    def test_deliver_never_auto_disables_a_group(self):
+        # ★ 搜不到的群只报告、绝不自动禁：微信搜索被实测证明会抖（同一个群这轮搜到、
+        # 下轮搜不到），一次抖动就永久禁掉一个好群，而且没人会立刻发现，
+        # 只会某天觉得"这个群怎么一直没收到"。
+        seed_registry()
+        m = FakeMsg("素材", mtype="text")
+        m.gone_set = {"大理B群"}
+        build_timeline(self.bot, m)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": ["大理A群", "大理B群"], "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["gone"], ["大理B群"])
+        g = registry.load()["groups"]["大理B群"]
+        self.assertTrue(g["allow_forward"])          # 没被禁
+        self.assertNotEqual(g.get("status"), "unreachable")
+        self.assertIn("禁群", " ".join(mm for _, mm in self.bot.wx.sent))   # 告诉人怎么处置
 
     def test_deliver_two_images_both_sent(self):
         # 两张图片签名一模一样（wxautox 里图片 content 固定是「图片」）：

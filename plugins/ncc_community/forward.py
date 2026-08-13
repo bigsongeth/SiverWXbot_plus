@@ -609,14 +609,13 @@ def _deliver(task) -> dict:
             break
         time.sleep(random.uniform(d["msg_min"], d["msg_max"]))
 
-    # 无结果的群 → 本地标记不可达（后续转发自动跳过），并提醒人去面板核对/恢复
-    marked = []
-    for g in gone_all:
-        try:
-            name = registry.mark_unreachable(g)
-            marked.append(name or g)
-        except Exception as e:
-            log("WARNING", f"标记不可达群失败 {g}: {e}")
+    # ★ 搜不到的群【只报告，不自动禁】（2026-08-13 定，人的决定）。
+    # 原来是一失败就 mark_unreachable（allow_forward=False），省事但会误伤：
+    # 微信搜索被实测证明会抖 —— 同一个群这一轮搜到、下一轮搜不到（「爱和未来」
+    # 「全国旅居2群」都这样过）。一次抖动就把一个好群永久禁掉，而且没人会立刻发现，
+    # 只会某天觉得"这个群怎么没收到"。群列表要精准，就不能让机器悄悄改它。
+    # 现在把清单交给人，确认后用「禁群 <群名>」或面板处理。
+    marked = sorted(gone_all)
 
     # 收尾：主窗口回到最新
     try:
@@ -636,9 +635,10 @@ def _deliver(task) -> dict:
     if aborted:
         lines.append("⛔ 微信 UI 锁没能释放，剩下的没转。请重启程序（SWXPanelRestart）后重来。")
     if marked:
-        lines.append(f"🚫 {len(marked)} 个群搜不到（候选名字都试过了，可能被踢/解散/改名），已本地标记跳过："
-                     + "、".join(marked[:10]) + ("…" if len(marked) > 10 else "")
-                     + "\n（去面板「群列表」核对这些群，确认还在就点「恢复可转发」）")
+        lines.append(f"🚫 {len(marked)} 个群没搜到（**没有自动禁**，微信搜索会抖，可能只是这次没搜着）：\n"
+                     + "\n".join(f" - {m}" for m in marked[:15])
+                     + (f"\n…另有 {len(marked) - 15} 个" if len(marked) > 15 else "")
+                     + "\n👉 在微信里确认一下：确实没了就发「禁群 <群名>」移出列表，还在就重发一次。")
     if fail_detail:
         show = fail_detail[:10]
         lines.append("其它失败：\n" + "\n".join(show) + ("…" if len(fail_detail) > 10 else ""))
@@ -860,12 +860,15 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|查寻址|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|探备注面板|查寻址|禁群|恢复群|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
             "探搜索": lambda: _probe_search(bot, chat, name),
+            "探备注面板": lambda: _probe_remark_panel(bot, chat, name),
             "查寻址": lambda: _fix_addressing(bot, chat, name),
+            "禁群": lambda: _disable_group(chat, name),
+            "恢复群": lambda: _enable_group(chat, name),
             "检查群组": lambda: _check_groups(bot, chat, name),
             "核对备注": lambda: _audit_remarks(bot, chat, name),
             "修备注": lambda: _fix_remarks(bot, chat, name),
@@ -1412,6 +1415,108 @@ def _find_unmarked(bot, chat, arg=None) -> bool:
     if not fresh and not missed_tag:
         lines.append("✅ 扫到的群全都打过🐶标签了，没有漏网的。")
     reply(chat, "\n".join(lines))
+    return True
+
+
+def _disable_group(chat, name) -> bool:
+    """「禁群 <群名>」：把一个群移出转发列表。
+
+    转发搜不到的群【不再自动禁】——微信搜索会抖，一次失败就禁掉会误伤好群，
+    而且没人会立刻发现。所以转发只给清单，由人在微信里确认后用这条指令处置。"""
+    got = registry.mark_unreachable(name)
+    if got:
+        reply(chat, f"「{got}」已移出转发列表。发「恢复群 {got}」可以放回来。")
+    else:
+        reply(chat, f"登记表里没有「{name}」，名字要跟「群列表」里的一致。")
+    return True
+
+
+def _enable_group(chat, name) -> bool:
+    """「恢复群 <群名>」：把之前移出的群放回转发列表，并清掉可能过期的寻址串
+    （让它下次「查寻址」重新学一个准的）。"""
+    data = registry.load()
+    g = data.get("groups", {}).get(name)
+    if not g:
+        reply(chat, f"登记表里没有「{name}」。")
+        return True
+    g["allow_forward"] = True
+    g["status"] = "active"
+    g["addressing_hit"] = None
+    registry.save(data)
+    reply(chat, f"「{name}」已放回转发列表，寻址串已清空。\n发「查寻址 {name}」重新学一个准的。")
+    return True
+
+
+def _probe_remark_panel(bot, chat, group_name) -> bool:
+    """「探备注面板 <群名>」：切到该群、打开"聊天信息"面板，把控件树打出来。【只读】。
+
+    目的：找到备注输入框，验证"自己清空再写"这条路通不通。
+    `SetGroupRemark` 对已有备注是【追加】、空串也清不掉，所以打错的备注至今只能人工清；
+    但它既然能把字写进去，就说明 wxautox 内部够得着那个输入框 —— 8/3 摸了三轮没找到
+    入口（`ChatMoreInfoWnd(wx.ChatBox)` 的 control 是 None、"聊天信息"按钮扫不到），
+    现在有两把当时没有的钥匙：窗口置前（不激活时控件会凭空消失，搜索框就是这么骗了我
+    两轮），以及 wx.ChatBox.edit_info 这个方法。
+
+    ⚠️ 只 dump 结构，一个字都不写。要动手也必须先拿「肥肉测试1」这类测试群验。"""
+    wx = getattr(bot, "wx", None)
+    out = []
+    with MAIN_WINDOW_LOCK:
+        out.append(_bring_wx_front())
+        if not _switched(wx, group_name, exact=False):
+            reply(chat, f"切不到「{group_name}」，先确认这个群还在")
+            return True
+        time.sleep(0.6)
+
+        cb = getattr(wx, "ChatBox", None)
+        if cb is None:
+            reply(chat, "拿不到 wx.ChatBox")
+            return True
+        out.append("ChatBox 方法：" + ", ".join(a for a in dir(cb) if not a.startswith("_"))[:300])
+
+        # 试着打开"聊天信息"面板 —— edit_info 是最像正门的那个
+        opened = None
+        for meth in ("edit_info", "get_info"):
+            fn = getattr(cb, meth, None)
+            if fn is None:
+                continue
+            done, r, err = _ui_call(fn, 12, f"chatbox.{meth}")
+            out.append(f"ChatBox.{meth}() → done={done} err={err!r} 返回={type(r).__name__}:{repr(r)[:160]}")
+            if done and err is None:
+                opened = r
+                break
+
+        # 面板开没开，看微信多了什么窗口 + 把当前控件树里的 Edit 都找出来
+        try:
+            from wxautox4 import uia
+            root = getattr(cb, "control", None)
+            edits = []
+
+            def walk(c, depth=0):
+                if depth > 8 or len(edits) > 25:
+                    return
+                try:
+                    kids = c.GetChildren()
+                except Exception:
+                    return
+                for ch in kids:
+                    try:
+                        if ch.ControlTypeName in ("EditControl", "TextControl", "ButtonControl"):
+                            nm = (ch.Name or "").strip()
+                            if nm:
+                                edits.append(f"{'· ' * depth}{ch.ControlTypeName} | {nm[:40]}")
+                    except Exception:
+                        pass
+                    walk(ch, depth + 1)
+
+            if root is not None:
+                walk(root)
+            out.append(f"ChatBox 里的可交互控件 {len(edits)} 个：")
+            out.extend(edits[:25])
+            _ = uia
+        except Exception as e:
+            out.append(f"遍历控件失败：{e}")
+
+    reply(chat, "\n".join(out))
     return True
 
 
