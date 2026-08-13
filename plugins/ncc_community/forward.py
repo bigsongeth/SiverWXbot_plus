@@ -1238,6 +1238,18 @@ def _fix_addressing(bot, chat, scope) -> bool:
         with MAIN_WINDOW_LOCK:
             _bring_wx_front()
             shown, why = _search_display_name(wx, g)
+            if not shown:
+                # ★ 微信搜索会抽风：同一个群上一轮搜得到、这一轮"搜不到"，失败详情里
+                # 还常带着"最近在搜"——那是关键词压根没输进去，返回的是历史建议。
+                # 更硬的反证：某些群能作为【别的词】的搜索结果冒出来（还带着🐶），
+                # 按自己的名字搜却报搜不到。所以单次失败不能判"这个群没了"，重来一次。
+                time.sleep(1.6)
+                shown2, why2 = _search_display_name(wx, g)
+                if shown2:
+                    shown, why = shown2, why2
+                    log("INFO", f"「{g}」第一次没搜到，重试命中")
+                else:
+                    why = f"{why}｜重试仍失败：{why2}"
         if shown:
             old = (data["groups"].get(g, {}) or {}).get("addressing_hit")
             learned.append(g)

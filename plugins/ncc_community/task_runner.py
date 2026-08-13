@@ -26,7 +26,7 @@ import traceback
 
 from . import store
 from .common import log
-from .wxlock import set_forwarding
+from .wxlock import keepalive, set_forwarding
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_DIR, "data")
@@ -129,16 +129,32 @@ def _run(bot, text: str) -> None:
 
     log("INFO", f"后台任务开始：{text}")
     set_forwarding(True)       # 主循环让路，别跟我抢主窗口
+    # ★ 闸门会在久无续期后自动失效（_MAX_HOLD=300 秒，防的是"任务线程死了却把闸门
+    # 永远举着"）。可「查寻址 全部」「检查群组 全部」「修备注 全部」这类任务动辄跑
+    # 5~10 分钟，闸门一到点就过期 → 主循环恢复 → listen_health 探针照常触发
+    # AddListenChat → 开出独立聊天窗口抢走前台 → 后面每一次搜索都报
+    # Find Control Timeout。2026-08-13 实测：查寻址跑了 571 秒，前 5 分钟一切正常，
+    # 之后 10 个群成片失败，而它们上一轮全是通过的。
+    # 所以在这儿起一根心跳去续期：任务活着闸门就一直举着，任务一结束立刻落闸。
+    stop_beat = threading.Event()
+
+    def _beat():
+        while not stop_beat.wait(30):
+            keepalive()
+
+    beat = threading.Thread(target=_beat, name="ncc-task-keepalive", daemon=True)
+    beat.start()
     t0 = time.time()
     try:
         handled = forward._try_direct_command(bot, sink, store.load(), _SENDER, text)
         if not handled:
-            sink.SendMsg(msg=f"不认识的指令「{text}」。支持：扫群 / 修备注 预览 / "
-                             f"修备注 全部 / 核对备注 全部 / 检查群组 全部 / 同步 / 待归类")
+            sink.SendMsg(msg=f"不认识的指令「{text}」。支持：扫群 / 查新群 / 查寻址 全部 / "
+                             f"修备注 预览 / 修备注 全部 / 核对备注 全部 / 检查群组 全部 / 同步 / 待归类")
     except Exception as e:
         sink.SendMsg(msg=f"执行出错：{e}\n{traceback.format_exc()}")
         log("ERROR", f"后台任务「{text}」出错：{e}")
     finally:
+        stop_beat.set()
         set_forwarding(False)
         sink.SendMsg(msg=f"=== 任务结束，耗时 {time.time() - t0:.1f} 秒 ===")
         log("INFO", f"后台任务结束：{text}（{time.time() - t0:.1f}s）")
