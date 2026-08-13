@@ -1091,6 +1091,17 @@ def _scan_groups(bot, chat) -> bool:
     return True
 
 
+def _norm_name(s) -> str:
+    """比对用的归一化：全角标点转半角 + 去掉所有空白。
+
+    2026-08-13 实测：登记表里是「游牧岛｜全国旅居2群」（全角竖线 U+FF5C），
+    微信里显示的是「游牧岛 | 全国旅居2群🐶」（半角竖线 + 两侧空格）—— 同一个群，
+    字符不同，直接比对必然对不上，于是被判成"这个群没了"。NFKC 正好把全角
+    标点折叠成半角等价物，emoji 和汉字不受影响。"""
+    import unicodedata
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", str(s or "")))
+
+
 def _search_display_name(wx, group_name: str, out_detail=None):
     """用微信搜索查一个群的【实际显示名】。返回 (显示名, 诊断串) 或 (None, 原因)。
 
@@ -1104,28 +1115,95 @@ def _search_display_name(wx, group_name: str, out_detail=None):
     sb = getattr(wx, "SessionBox", None)
     if sb is None:
         return None, "拿不到 SessionBox"
-    try:
-        res = sb.search(group_name) or []
-    except Exception as e:
-        return None, f"搜索失败：{e}"
-    best, cands = None, []
-    for el in res:
-        c = str(getattr(el, "content", "") or "").strip()
-        if not c:
-            continue
-        cands.append(c)
-        if group_name in c and len(c) - len(group_name) <= 8:
-            best = c
+
+    want = _norm_name(group_name)
+    best, cands, spliced, matches = None, [], [], []
+
+    # 整名搜不到就用前缀再搜一轮：微信搜索对长串/特殊符号时灵时不灵，而判据始终是
+    # "归一化后必须包含【完整】群名"，所以放宽的只是搜索词，不是匹配标准。
+    # 搜索词也要给几个变体：微信搜索对全角分隔符不友好 —— 拿「游牧岛｜全国旅居2群」
+    # （全角竖线）搜是 0 结果，可它明明存在，搜别的词时会以「游牧岛 | 全国旅居2群🐶」
+    # 冒出来。所以除原名外，再给归一化名和"最长的一段连续文字"。
+    queries = [group_name]
+    normed = _norm_name(group_name)
+    if normed and normed != group_name:
+        queries.append(normed)
+    segs = [x for x in re.split(r"[\s|｜/／\-—·、,，:：!！?？()（）\[\]【】]+", group_name) if len(x) >= 4]
+    if segs:
+        longest = max(segs, key=len)
+        if longest not in queries:
+            queries.append(longest)
+
+    for q in queries:
+        try:
+            res = sb.search(q) or []
+        except Exception as e:
+            return None, f"搜索失败：{e}"
+        for el in res:
+            c = str(getattr(el, "content", "") or "").strip()
+            if not c or c in cands:
+                continue
+            cands.append(c)
+            cn = _norm_name(c)
+            # 双向匹配：① 显示名包含群名（带装饰，如 🟪xxx🐶）
+            #           ② 显示名是群名的【截断】——微信群备注上限 48 字节，长群名打备注
+            #              会被截掉尾巴，实测「数字游民信息共享群」在微信里就是
+            #              「数字游民信息共享🐶」，少一个"群"字。差 3 字以内才认。
+            bare = cn.rstrip(audit.DOG).strip()
+            hit_fwd = want and want in cn and len(cn) - len(want) <= 8
+            hit_trunc = (bare and len(bare) >= 6 and bare in want
+                         and len(want) - len(bare) <= 3)
+            # ★ 副标题才是身份证：备注被打错群之后，主标题显示的是【那个错备注】，
+            # 微信会在下面补一行「群聊名称：真实群名」。只看主标题就会判"对不上"，
+            # 而这一行直接告诉我们"这个群就是它，只是顶着别人的名字"。
+            hit_sub = False
+            try:
+                full = _norm_name(el.get_all_text() or "")
+                if want and "群聊名称" in full and want in full:
+                    hit_sub = True
+                    if out_detail is not None:
+                        out_detail.append(f"[副标题命中] {c} ⇦ {group_name}")
+            except Exception:
+                pass
+            if hit_fwd or hit_trunc or hit_sub:
+                # ★ 不能一命中就收工：短群名用包含判据太宽松，「NCC的朋友们」同时是
+                # 「NCC的朋友们16群」「…26群」的前缀，先撞上谁就学谁 = 掷骰子决定
+                # 以后往哪个群发消息。所以全收集起来，多于一个就判歧义、宁可不学。
+                if c not in matches:
+                    matches.append(c)
+                continue
+            try:
+                if audit.looks_spliced(c):
+                    spliced.append(c)
+            except Exception:
+                pass
+        try:                              # 收尾：关掉搜索面板，别把主窗口留在搜索页
+            if res:
+                res[0].close()
+        except Exception:
+            pass
+        if matches:
             break
-    try:                                  # 收尾：关掉搜索面板，别把主窗口留在搜索页
-        if res:
-            res[0].close()
-    except Exception:
-        pass
+        time.sleep(0.3)
+
+    if len(matches) == 1:
+        best = matches[0]
+    elif len(matches) > 1:
+        # 多个候选时，剥掉🐶后与群名【严格相等】的那个才是本尊。
+        # 实测「【大理】春节串门一起玩！（看公告」同时命中它自己的🐶备注和一个
+        # 前面多了个 A 的同名群，靠这一条能自动选对，不必退回人工。
+        exact = [c for c in matches if _norm_name(c).rstrip(audit.DOG).strip() == want]
+        if len(exact) == 1:
+            best = exact[0]
+        else:
+            return None, ("有 %d 个都像，不敢学（怕以后每次都发错群）：%s"
+                          % (len(matches), "、".join(matches[:3])))
     if out_detail is not None:
         out_detail.extend(cands[:6])
     if best:
         return best, ""
+    if spliced:
+        return None, f"备注被追加过，需人工清空后重打：「{spliced[0]}」"
     return None, ("搜到 %d 项但都对不上：%s" % (len(cands), "、".join(cands[:4]))
                   if cands else "搜不到")
 
@@ -1151,7 +1229,7 @@ def _fix_addressing(bot, chat, scope) -> bool:
             reply(chat, f"没有「{scope}」这个群或分组。"); return True
 
     reply(chat, f"开始查 {len(specs)} 个群的实际显示名（微信搜索，只读不发消息）…")
-    learned, changed, failed = [], [], []
+    learned, changed, failed, mismatched = [], [], [], []
     for spec in specs:
         g = spec["name"]
         with MAIN_WINDOW_LOCK:
@@ -1160,6 +1238,9 @@ def _fix_addressing(bot, chat, scope) -> bool:
         if shown:
             old = (data["groups"].get(g, {}) or {}).get("addressing_hit")
             learned.append(g)
+            # 显示名跟群名八竿子打不着 = 它顶着别人的备注（备注被打错群）
+            if _norm_name(g) not in _norm_name(shown):
+                mismatched.append(f"{g} 顶着「{shown}」")
             if shown != old:
                 changed.append(f"{g} → 「{shown}」")
                 try:
@@ -1174,6 +1255,9 @@ def _fix_addressing(bot, chat, scope) -> bool:
     if changed:
         lines.append("🔧 新学到/更正的显示名：\n" + "\n".join(f" - {x}" for x in changed[:25])
                      + (f"\n…另有 {len(changed) - 25} 个" if len(changed) > 25 else ""))
+    if mismatched:
+        lines.append(f"🔴 {len(mismatched)} 个群顶着别人的备注（备注打错群，需人工清空后重打）：\n"
+                     + "\n".join(f" - {x}" for x in mismatched[:15]))
     if failed:
         lines.append(f"❌ 仍然认不出的 {len(failed)} 个（可能真退群了，或被打了别人的备注）：\n"
                      + "\n".join(f" - {x}" for x in failed[:20])
@@ -1218,11 +1302,25 @@ def _bring_wx_front() -> str:
     try:
         win32gui.ShowWindow(h, win32con.SW_RESTORE)
         time.sleep(0.2)
-        win32gui.SetForegroundWindow(h)
+    except Exception:
+        pass
+    # SetForegroundWindow 在【非前台进程】里会被 Windows 直接拒绝 —— bot 进程平时不在
+    # 前台，所以它基本没用（8/13 实测：主窗口可见、尺寸正常，前台却是 cmd.exe，
+    # 搜索框照样找不到）。UIA 的 SwitchToThisWindow 不受这个限制，wxautox 自己
+    # 的 _show() 走的也是它。另外别用 wx.Show()：它作用在缓存的旧 HWND 上，
+    # 而主窗口句柄会在进程不重启的情况下被销毁重建。
+    try:
+        from wxautox4 import uia
+        uia.ControlFromHandle(h).SwitchToThisWindow()
+        time.sleep(0.9)
+        return f"主窗口 hwnd={h} 已置前（SwitchToThisWindow）"
     except Exception as e:
-        return f"主窗口 hwnd={h} 置前失败（不一定致命）：{e}"
-    time.sleep(0.8)
-    return f"主窗口 hwnd={h} 已置前"
+        try:
+            win32gui.SetForegroundWindow(h)
+            time.sleep(0.8)
+            return f"主窗口 hwnd={h} 已置前（SetForegroundWindow 兜底）"
+        except Exception as e2:
+            return f"主窗口 hwnd={h} 置前失败：{e} / {e2}"
 
 
 def _probe_search(bot, chat, keyword) -> bool:
