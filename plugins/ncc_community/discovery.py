@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import threading
 
-from . import registry, remark
+from . import audit, registry, remark
 from .common import log, notify_admin
 
 # 本次运行已处理过的新群，避免同一群每条消息都触发一轮
@@ -36,6 +36,20 @@ def handle_discovery(bot, chat, msg, cfg) -> None:
     data = registry.load()
     if registry.is_known(data, who):
         registry.touch_last_seen(_registry_name(data, who))
+        # ★ 已登记 ≠ 已纳管。判"纳管了没有"的唯一客观依据是【微信显示名带不带狗标记】，
+        # 不是我们登记表里怎么记的 —— 2026-08-13 血泪：登记表说 remark_applied=True
+        # 的群，微信里根本没那个备注（那个 True 是从 Notion 标题的🐶推断来的），
+        # 结果 105 个群的转发寻址串全是幻影，第一个群就把整条线卡死。
+        # 所以这里也提醒一次：登记了但没打上标签的群，转发只能按群名寻址，群一改名就失联。
+        if not audit.has_dog(who):
+            with _SEEN_LOCK:
+                if who in _SEEN:
+                    return
+                _SEEN.add(who)
+            from . import panel
+            _notify_admin(bot, cfg,
+                          f"群「{who}」在登记表里，但微信显示名没有🐶标签（备注多半没打上）。\n"
+                          f"发「修备注 全部」补打；或去面板核对：{panel.panel_url()}")
         return
 
     with _SEEN_LOCK:
