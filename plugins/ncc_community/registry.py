@@ -175,7 +175,16 @@ def address_candidates(group: dict) -> list:
     name = str(group.get("name") or "").strip()
     remark = str(group.get("remark") or "").strip()
     hit = str(group.get("addressing_hit") or "").strip()
-    order = (hit, remark, name) if group.get("remark_applied") else (hit, name, remark)
+
+    # ★ 实测过的串就【只用它】，不再挂候选（2026-08-13 定）。
+    # 候选兜底看着稳妥，实则是发错群的来源：拿群名去搜是【包含】匹配，
+    # 「NCC的朋友们」会命中「NCC的朋友们26群」，首选一旦失效就悄悄发进另一个群 ——
+    # 那比"这条没发出去"严重得多。宁可报失败让人来看，也不要猜。
+    if hit:
+        return [hit]
+
+    # 没实测过的才回落到猜，并且照旧按"微信显示名长什么样"排序
+    order = (remark, name) if group.get("remark_applied") else (name, remark)
     out = []
     for c in order:
         if c and c not in out:

@@ -394,9 +394,11 @@ class EngineTest(unittest.TestCase):
         # 没打备注的群，显示名就是群名
         g2 = {"name": "乙群", "remark": "乙群🐶", "remark_applied": False}
         self.assertEqual(registry.address_candidates(g2), ["乙群", "乙群🐶"])
-        # 实测命中过的永远排最前，第二轮起不用再猜
+        # ★ 实测命中过就【只用它】，不再挂候选：候选是"猜"，而拿群名去搜是包含匹配，
+        # 「NCC的朋友们」会命中「NCC的朋友们26群」——首选一旦失效就悄悄发进另一个群，
+        # 比"这条没发出去"严重得多。宁可报失败让人来看。
         g["addressing_hit"] = "甲群"
-        self.assertEqual(registry.address_candidates(g), ["甲群", "甲群🐶"])
+        self.assertEqual(registry.address_candidates(g), ["甲群"])
 
     def test_forward_falls_back_to_remark_candidate(self):
         # 首选串搜不到 → 自动换备选串，并把实测结果记进 addressing_hit
