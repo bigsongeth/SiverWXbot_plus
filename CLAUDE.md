@@ -71,6 +71,27 @@ netstat -ano | findstr LISTEN | findstr :100
 
 策略：**核心文件只加最小 hook，业务逻辑全丢进 `plugins/`**。以下每一条在合并上游后都要确认还活着。
 
+> **编号说明**：3.x 的编号按"加入时间"累加，**不代表本文件里的先后顺序**（3.8 在 3.10 后面、
+> 3.14 在 3.17 后面）。找某一节请直接搜标题关键词，别按数字往下翻。
+
+**插件总览**（详细坑在各自小节）：
+
+| 插件 | 干什么 | hook 位置（合并上游后逐个确认） | 单测 |
+|------|--------|------------------------------|------|
+| `wechat_checkin` | 私聊「签到」发兑换码 | `wxbot_core.wx_send_ai` 前 ×1 | `test_wechat_checkin.py` |
+| `ncc_community` | 管理群转发 / 迎新 / 拉群 + 面板 | `message_handle_callback` ×3、`get_next_new_message` ×1 | `test_ncc_community.py` / `_engine` / `_batch` / `_panel` |
+| `ncc_kb` | 群/私聊接知识库（换接口+换人设） | 四个 getter `_get_{group,chat}_{api,prompt}` ×4 | `test_ncc_kb.py` |
+| `model_fallback` | 接口挂了自动换下一个 | `_get_group_api` / `_get_chat_api` ×2 | `test_model_fallback.py` |
+| `context_guard` | 治胡编：注日期+能力边界、洗历史 | `MemoryManager.get_messages` ×1、两个 `_get_*_prompt` ×2 | `test_context_guard.py` |
+| `reply_shape` | 分条回复形状 + 剥 Markdown | `_build_split_prompt` / `_parse_split_reply` ×2 | `test_reply_shape.py` |
+| `ai_news_note` | 每日 AI 日报 → 微信笔记 → 发群 | `register_daily_note` ×1、`_ai_news_note_enabled` ×1 | `test_ai_news_trigger.py` |
+| `gh_trending_note` | 每日 GitHub 趋势笔记（跟在日报后面） | 定时任务注册处 ×1（紧邻 ai_news_note） | 插件内 `selftest.py` / `test_follow.py` |
+| `ui_watchdog` | 卡死/日志异常 → 整进程重启 | 主循环 `heartbeat()` / `disarm()`、`web_server` 消费标记 ×3 | `test_ui_watchdog.py` |
+| `listen_health` | 监听窗口丢失探针 + 自愈 | `MainWindowChat` 等 ×5（见 3.18） | `test_listen_health.py` / `test_main_window_chat.py` |
+
+另有不成插件的核心内改动：3.1 面板监听地址、3.10 时间戳清洗与接话闸门（`test_reply_gate.py`）、
+3.12 绕开系统代理的 `HTTP` 会话、3.14 `SEARCH_CHAT_TIMEOUT`。
+
 ### 3.1 面板局域网访问（`web_server.py` 的 `host='0.0.0.0'`）★ 容易被合并冲掉
 我们对面板的远程访问是靠**开放局域网监听**实现的：`web_server.py` 末尾的
 ```python
@@ -253,7 +274,7 @@ if handled and checkin_reply:
   ⚠️ mac 侧走 SMB 读 `task_result.txt` **有读缓存**，看到的可能是上一轮的旧内容，
   拿结果一律 `ssh win-shukong` 从 Windows 侧读。
 - 单测（纯 mock 不碰微信，mac 上直接跑文件）：`tests/test_ncc_community.py`（97 个）、
-  `tests/test_ncc_engine.py`（38 个）、`tests/test_ncc_batch.py`（14 个）、
+  `tests/test_ncc_engine.py`（46 个）、`tests/test_ncc_batch.py`（14 个）、
   **`tests/test_ncc_panel.py`（38 个，面板 CRUD / 状态 / 操作 / 迁移脚本，2026-08-05 加）**。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
@@ -483,7 +504,7 @@ hook 3 处，合并上游后逐个确认：
 偶尔还会复读一句"知识库还在更新中"——那是合法的用户消息，没法通用地过滤掉。
 
 配置 `plugins/context_guard/data/config.json`（三个开关 + 兜底文案黑名单），默认值进库。
-单测：`PYTHONPATH=. python3 tests/test_context_guard.py`（13 个，纯函数不发请求）。
+单测：`PYTHONPATH=. python3 tests/test_context_guard.py`（18 个，纯函数不发请求）。
 
 **注意**：`memory_context_count` 目前是 1000（面板「上下文条数」），松爸那段对话实际喂了 40+ 条历史，
 复读和跑偏跟这个也有关系，建议调到 20–30。
@@ -607,7 +628,7 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
   上游 V4.7.30 版本日志写的"修复监听偶尔丢失系统消息的bug"**不是这个问题**，
   别再指望升级能治它 —— 兜底仍然靠 `plugins/listen_health/`（见 3.18）。
 
-### 3.16 模型故障转移插件 `plugins/model_fallback/`（2026-08-03 加）★ 一个模型挂了自动换下一个
+### 3.19 模型故障转移插件 `plugins/model_fallback/`（2026-08-03 加）★ 一个模型挂了自动换下一个
 面板原来只能"选一个接口用"，挂了就直接回"在忙，我稍后回复您"。本插件让接口失败时
 自动沿备用链换模型、拿同样的上下文重答同一个问题，用户不用重发。
 
@@ -629,7 +650,7 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 - 顺带处理了两个坑：备用接口签名不兼容时按 `inspect.signature` 裁掉多余 kwarg
   （Dify/Coze 的 `chat()` 没有 `image_path`，原样透传会 TypeError 白费一个备用）；
   按 `(base_url, 模型, key 前 8 位)` 去重，避免链上和当前会话用的是同一个接口时重复试。
-- 单测：`PYTHONPATH=. python3 tests/test_model_fallback.py`（26 个，纯 mock 不发请求）。
+- 单测：`PYTHONPATH=. python3 tests/test_model_fallback.py`（31 个，纯 mock 不发请求）。
   `chain.py` 刻意不 import `wxbot_core`（会连带拉起 wxautox），所以 mac 上能裸跑。
 - 设计与决策记录：`plugins/model_fallback/SPEC.md`。
 
@@ -726,13 +747,40 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
   （见 3.11 的血泪）。靶子用「文件传输助手」这种系统会话，不打扰真人、不产生已读。
 - `data/` 整个不进库（默认值写在 `config.py` 的 `DEFAULTS`，文件缺失自动回落）。
   注意 `.gitignore` 第 4 行有全局 `config.json` 规则，插件的默认配置文件放不进库。
-- 单测：`PYTHONPATH=. python3 tests/test_listen_health.py`（37 个，纯 mock）、
+- 单测：`PYTHONPATH=. python3 tests/test_listen_health.py`（41 个，纯 mock）、
   `tests/test_main_window_chat.py`（8 个，用 ast 摘类出来 exec，不 import wxbot_core；
   其中一个用例会扫 `process_message` / `wx_send_ai` / `message_handle_callback` 里所有
   `chat.xxx` 读取，逐个校验回落通道答得上来——以后再漏属性直接测试失败）。
 
 **根因仍未知**，已把现象整理成一段话发社区问了。探针数据攒够之后回来看失败样本的共同点：
 失败那一刻 `fg_proc` 是谁、`rustdesk_conns` 是不是 0、`wx_main_hwnd` 有没有变。
+
+---
+
+### 3.20 GitHub 趋势笔记插件 `plugins/gh_trending_note/`（未在本文档记录过，2026-08-15 补）
+
+和 `ai_news_note` **平行的第二条笔记管线**：每天把 GitHub 趋势榜（今日/本周/本月 Top5）
+渲染成微信收藏笔记发到群。配置、数据源、防重文件、日志各自独立，所以改这条不会碰坏日报。
+
+- **数据源**：mac-mini 的 launchd `com.bigsong.gh-trending`（每天 07:30）scp 推
+  `C:\Users\Admin\gh_trending\latest.json`，超过 `MAX_AGE_HOURS`(20h) 不发。
+- ★★ **它 import 了 `ai_news_note.sender` 的 10 个私有函数**（`_create_note_from_clipboard`
+  `_open_target` `_send_favorite` `_close_all_editors` `_drop_topmost` 等）——
+  UIA 原语一行都不自己写，因为那套是 2026-07~08 一堆线上事故换来的。
+  **改 `ai_news_note/sender.py` 里任何带下划线的函数签名，都要同步看这里**，
+  否则 gh_trending 会在导入时就炸。
+- **两条日报的先后顺序**靠 `WAIT_FOR_AI_NEWS` —— 读 `ai_news_note/last_sent.txt` 是不是今天，
+  没发完就返回 ⚠️ 等 15 分钟再来。不靠时间先后（时间只是兜底）。
+- **`FOLLOW_AI_NEWS` 跟随模式**：日报一发完就接着发（隔 `FOLLOW_DELAY_SEC`=90 秒让微信 UI 缓过来），
+  两条消息在群里连着出现。★ 跟随只在 `FOLLOW_WINDOW`(08:00–13:00) 内允许触发 ——
+  **bot 半夜重启会把内存里的 `_followed_on` 闸门清掉**，没有这个窗口就会凌晨三点往群里刷屏。
+  手动 flag 触发和 `SEND_TIME` 定时不受窗口限制（那是人明确要的）。
+- `_followed_on` 每天只放行一次：发送失败时 `already_sent_today()` 仍是 False，
+  没有这个闸门就会变成每 10 秒重跑一轮。失败退避交给 `_arm_retry`（15 分钟 ×4），别绕过它。
+- **它复用 ai_news_note 立的 `bot._ai_news_note_enabled` 旗子**来让 `schedule.run_pending()`
+  无条件跑。所以**禁用 AI 日报不会连带禁用它**，反之亦然——两边都关才是真的关。
+- 面板上**没有它的页**（不像 `/ai_news`），改开关/时间/目标群要手改 `data/settings.json`。
+- 自测在插件目录内（不在 `tests/`）：`selftest.py`、`test_follow.py`。
 
 ---
 
@@ -753,10 +801,10 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 5. 若上游要求 `wxautox4` 升级（历史上 40.1.14 → 40.1.15、40.1.15 → 41.1.1.post1），
    **先读 3.14 那一节再动手** —— 旧版从 PyPI 下架回滚不了、必须先手工备份 zip、
    必须先停机器人再升级、升完要确认 `PYTHONIOENCODING=utf-8`。别直接 `pip install -U`。
-6. 验证：
-   ```
-   python -m py_compile wxbot_core.py web_server.py webhook_send.py plugins/wechat_checkin/handler.py plugins/wechat_checkin/store.py
-   python -m unittest tests.test_wechat_checkin tests.test_webhook_send -v
+6. 验证（**跑全量单测，不是只跑两个**；`python -m unittest tests.xxx` 在 mac 上会导错模块，见 5.5）：
+   ```bash
+   python3 -m py_compile wxbot_core.py web_server.py webhook_send.py plugins/*/*.py
+   for f in tests/test_*.py; do echo "== $f"; PYTHONPATH=. python3 "$f" 2>&1 | grep -E '^(Ran|OK|FAILED)'; done
    ```
    **外加一条查重复定义**（上游改写历史时必查，见下）：
    ```bash
@@ -876,7 +924,55 @@ credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 
 ---
 
-## 7. 关键路径速查
+## 7. 常用命令
+
+没有构建步骤、没有 linter，只有语法检查和一堆纯 mock 单测。依赖 `requirements.txt`
+（`wxautox4` 只在 Windows 装得上，所以 mac 上只能跑不碰微信的那部分）。
+
+**在 mac 这份 checkout 上（日常开发都在这儿跑）：**
+
+```bash
+cd /Volumes/SiverWXbot_plus-main && for f in tests/test_*.py; do echo "== $f"; PYTHONPATH=. python3 "$f" 2>&1 | grep -E '^(Ran|OK|FAILED)'; done
+```
+
+跑单个测试文件 / 单个用例（**必须直接跑文件**，`-m unittest tests.xxx` 会被 anaconda 自带的
+`tests` 包遮蔽，见 5.5）：
+
+```bash
+cd /Volumes/SiverWXbot_plus-main && PYTHONPATH=. python3 tests/test_ncc_panel.py -v
+```
+
+```bash
+cd /Volumes/SiverWXbot_plus-main && PYTHONPATH=. python3 tests/test_listen_health.py TestHeal -v
+```
+
+语法检查（提交前必跑）：
+
+```bash
+cd /Volumes/SiverWXbot_plus-main && python3 -m py_compile wxbot_core.py web_server.py webhook_send.py plugins/*/*.py
+```
+
+- ⚠️ **两个测试文件在 win-shukong 上跑会【真的】重启机器人**：`test_ui_watchdog.py`
+  会走到 `schtasks /run /tn SWXPanelRestart`；`test_listen_health.py` 的探针用例会推过自愈阈值
+  （已显式关掉 `auto_restart`，新增用例照做）。**在 mac 上跑是安全的**（没有 `schtasks`）。
+- 用例数量会随迭代漂移，各小节里写的数字只是当时的快照，**以实际输出为准**。
+- 改了插件代码而行为没变 → 先清 `__pycache__`（SMB 挂载下 `.pyc` 不刷新，见 3.6）。
+
+**在 win-shukong 上（`ssh win-shukong`）：**
+
+| 要干的事 | 怎么做 |
+|----------|--------|
+| 只重启机器人线程（没改核心代码） | 面板 POST `/stop_bot` → `/start_bot`（admin/123456） |
+| 改了 `wxbot_core.py` / 插件代码，要整进程重启 | `schtasks /run /tn SWXPanelRestart`，之后面板里再启动机器人 |
+| 在会话 2（有 UI 的桌面）跑任意命令 | 改 `C:\Users\Admin\swx_payload.cmd` → `schtasks /run /tn SWXRun` → 读 `swx_run_out.txt` |
+| 看谁在跑 | `netstat -ano \| findstr LISTEN \| findstr :100` |
+| 看中文输出 | 一律走 PowerShell，别用 CMD（GBK 乱码） |
+
+⚠️ **永远不要按端口杀进程**——微信客户端自己也监听 1000x，杀了它就下线，登录必须人在屏幕点（见 3.8）。
+
+---
+
+## 8. 关键路径速查
 
 | 用途 | 路径 |
 |------|------|
@@ -889,8 +985,11 @@ credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 | 签到插件 | `plugins/wechat_checkin/` |
 | NCC 社群插件 | `plugins/ncc_community/`（面板 `/ncc_community` + `panel.py`，去 Notion 化见 3.6 与 `PANEL_SPEC.md`） |
 | 知识库开关插件 | `plugins/ncc_kb/` |
-| AI 日报插件 | `plugins/ai_news_note/` |
+| AI 日报插件 | `plugins/ai_news_note/`（面板 `/ai_news`） |
+| GitHub 趋势笔记插件 | `plugins/gh_trending_note/`（无面板页，配置手改 `data/settings.json`，见 3.20） |
 | 监听健康 / 自愈插件 | `plugins/listen_health/`（探针采样 `data/probe-*.jsonl`，见 3.18） |
+| UI 看门狗插件 | `plugins/ui_watchdog/`（卡死/日志异常 → 整进程重启，见 3.13） |
+| 上下文守卫 / 分条形状 / 故障转移 | `plugins/context_guard/`（3.15）、`plugins/reply_shape/`（3.16）、`plugins/model_fallback/`（3.19 + `SPEC.md`） |
 | 码池拉取导入 | `plugins/wechat_checkin/pull_and_import.py`（计划任务 `WechatCheckinPull` 每天 8:05） |
 | 面板模板 | `templates/dashboard.html` |
 | 配置 | `config/config.json` |
