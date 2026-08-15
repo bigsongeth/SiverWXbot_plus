@@ -2399,6 +2399,106 @@ class WXBot:
             return result.get('message', str(result))
         return str(result)
 
+    def _is_already_listening(self, result):
+        """
+        判断 AddListenChat 的失败是不是「wxautox 说这个会话已经在监听了」。
+        只认这一种失败，别的失败（窗口句柄无效等）不走清理僵尸注册那条路。
+        """
+        if result:
+            return False
+        return 'already has a listener' in self._listen_add_error(result).lower()
+
+    # 微信主窗口标题，关残留独立窗口时必须避开
+    MAIN_WINDOW_TITLES = ('微信', 'WeChat')
+
+    def _close_orphan_chat_window(self, nickname):
+        """
+        关掉不归 wxautox 管的残留独立聊天窗口。
+
+        2026-08-15 实测（会话 2 枚举顶层窗口）：失败的两个群各自有一个独立窗口还开着，
+        rect 是 (-32000,-32000,...) —— 被最小化了。wxautox 看见窗口已存在就回
+        `chat already has a listener` 拒绝重建，可它自己的注册表里又没有这条
+        （RemoveListenChat 回「未找到监听对象」），于是谁也接不了这个群的消息，死锁。
+        只能从窗口这一侧下手：把这个孤儿窗口关掉，让 AddListenChat 重新开一个。
+
+        只在「wxautox 说已在监听 + 它自己又没有这个子窗口」时调用，别拿它当通用清理。
+        """
+        try:
+            import win32gui
+            import win32con
+        except Exception as e:
+            log(level="WARNING", message=f"关闭 {nickname} 残留独立窗口失败（win32gui 不可用）: {e}")
+            return False
+
+        if nickname in self.MAIN_WINDOW_TITLES:
+            return False
+
+        main_hwnd = getattr(self.wx, 'HWND', None)
+        targets = []
+
+        def _collect(hwnd, _):
+            try:
+                if hwnd and hwnd != main_hwnd and win32gui.GetWindowText(hwnd) == nickname:
+                    targets.append(hwnd)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(_collect, None)
+        except Exception as e:
+            log(level="WARNING", message=f"枚举顶层窗口失败: {e}")
+            return False
+
+        if not targets:
+            return False
+
+        for hwnd in targets:
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                log(level="WARNING", message=f"{nickname} 残留独立窗口 hwnd={hwnd} 已发关闭")
+            except Exception as e:
+                log(level="WARNING", message=f"关闭 {nickname} 残留独立窗口 hwnd={hwnd} 失败: {e}")
+        time.sleep(1)
+        return True
+
+    def _purge_stale_listener(self, nickname):
+        """
+        处理「wxautox 说这个会话已经在监听了，可它自己又没有这个子窗口」的死锁。
+
+        2026-08-15 的现场：四个群（含管理群）整晚收不到消息，群消息只在
+        GetNextNewMessage 的全局私聊扫描里露一面，然后被「收到群聊消息，跳过」丢掉。
+        AddListenChat 每次都回 `chat already has a listener`，重试多少轮都一样。
+
+        两道一起下手，因为拒绝可能来自两边：
+        1. RemoveListenChat 清 wxautox 自己的注册表（面板只重启 bot 线程时，
+           WeChat() 走缓存复活同一实例，上一轮的注册会留下来）；
+        2. 关掉残留的独立聊天窗口——实测那两个群的窗口都还开着且被最小化
+           （rect = -32000），而 RemoveListenChat 回的是「未找到监听对象」，
+           说明拒绝来自窗口这一侧，光清注册表不够。
+
+        只在「子窗口确认不存在」且「wxautox 报 already has a listener」时调用，
+        免得把活着的监听误关了。
+        """
+        # 动手前先用 GetSubWindow 这个【另一个 API】复核一遍：只要它认这是个活着的
+        # 子窗口，就当 GetAllSubWindow 那笔是漏报，什么都不动。
+        # 关窗口不可逆（关掉就得重新弹，而弹不出来正是本机的老毛病），宁可不救也别关错。
+        if self._get_verified_subwindow(nickname):
+            log(level="WARNING", message=f"{nickname} GetSubWindow 复核到活的子窗口，不做清理")
+            return False
+
+        removed = False
+        try:
+            result = self.wx.RemoveListenChat(nickname)
+            removed = True
+            detail = "成功" if result else self._listen_add_error(result)
+        except Exception as e:
+            detail = repr(e)
+        log(level="WARNING",
+            message=f"{nickname} 报「已在监听」但子窗口不存在，判定僵尸监听，清理注册表（{detail}）")
+        closed = self._close_orphan_chat_window(nickname)
+        return removed or closed
+
     def _subwindow_who(self, chat):
         """读取子窗口对象的 who 属性，读取失败时返回 None。"""
         try:
@@ -2473,7 +2573,12 @@ class WXBot:
         for attempt in range(1, retry_count + 1):
             for nickname in missing:
                 time.sleep(0.5)
-                self._add_listen_chat_once(nickname, "初始化重试")
+                result = self._add_listen_chat_once(nickname, "初始化重试")
+                # 子窗口不在（missing 里就是这么来的）却被告知「已在监听」= 僵尸注册，
+                # 清掉再加，否则重试多少轮都是同一句拒绝（见 _purge_stale_listener）。
+                if self._is_already_listening(result) and self._purge_stale_listener(nickname):
+                    time.sleep(0.5)
+                    self._add_listen_chat_once(nickname, "清理僵尸注册后重加")
             listened_names = self._get_all_subwindow_names()
             missing = [nickname for nickname in missing if nickname not in listened_names]
             if not missing:
@@ -2506,8 +2611,13 @@ class WXBot:
                     message=f"{nickname} 动态监听校验失败，{wait} 秒后进行第 {attempt - 1} 次重试")
                 time.sleep(wait)
 
-            self._add_listen_chat_once(nickname, "动态监听")
+            result = self._add_listen_chat_once(nickname, "动态监听")
             sub_chat = self._get_verified_subwindow(nickname)
+            # 拿不到子窗口却被告知「已在监听」= 僵尸注册，清掉再加一次（见 _purge_stale_listener）
+            if not sub_chat and self._is_already_listening(result) and self._purge_stale_listener(nickname):
+                time.sleep(0.5)
+                self._add_listen_chat_once(nickname, "清理僵尸注册后重加")
+                sub_chat = self._get_verified_subwindow(nickname)
             if sub_chat:
                 if attempt > 1:
                     log(message=f"{nickname} 第 {attempt - 1} 次重试后添加成功")
