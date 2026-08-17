@@ -146,6 +146,20 @@ if handled and checkin_reply:
 ### 3.5 DusAPI / 模型兼容定制（详见 AI_COLLABORATION_GUIDE.md 第 4 节）
 简述：`wxbot_core.py` 的 `DusAPI` 类把 GPT 分支改成 `else` 兜底（支持 grok/gemini 等），加了 `reasoning_content` 兜底提取和标准 Chat Completions SSE 解析。**合并上游时这几处极易被覆盖，务必按那份文件的检查清单逐项确认。** 另外去掉 dashboard 里所有 DusAPI 广告文案（保留功能，去掉推广）。
 
+★ **`OpenAIAPI._try_responses_api` 也是定制过的，别被上游合回去**：无图时我们走**绕开系统
+代理的 `HTTP` 直连 Chat Completions**（见 3.12），而不是上游的 `client.responses.create` ——
+中转站上大量模型压根没有 Responses API，走它等于备用方案必然也失败。带图片才用 Responses API。
+上游 V4.7.31 对这个函数做的三处改进已采纳：两条分支都把 `history` 带进去（否则降级之后模型
+突然失忆，用户看到的是答非所问而不是报错）、图片分支改成 system+history+user 结构并去掉
+`reasoning={"effort":"none"}`、输出提取改成遍历 `output` 找 `type=='message'` 的条目。
+
+★ **SDK 显示名 2026-08-17（上游 V4.7.31）改了**：「OpenAI SDK」→「OpenAI API 格式兼容接口」。
+上游给了 `OPENAI_SDK_NAME` / `OPENAI_SDK_ALIASES`（两个名字都认）和 `config.json` 的自动迁移。
+**凡是自己按 sdk 名字分支的代码都要改用 `OPENAI_SDK_ALIASES`** —— `plugins/ncc_kb/_build_api`
+就踩到了：它读的是插件自己那份 `data/config.json`，不吃上游的自动迁移，硬编码旧名会在改名后
+**静默落到 DusAPI 分支**上（不报错，只是接口用错了）。dashboard 那边我方定制是「OpenAI 兼容
+接口排第一并默认选中、不留 DusAPI 推广位」，合并时保我方排序、只采新显示名。
+
 ### 3.6 NCC 社群插件 `plugins/ncc_community/`（2026-07-05 加）
 管理群转发 + 分群迎新卡片 + 关键词拉群，三合一。管理群「NCC 社群管理肥肉售后维权🤖」内成员即管理员（群成员关系替代旧 wxid 白名单）。
 
@@ -372,6 +386,10 @@ if handled and checkin_reply:
 ### 3.10 回复清洗与接话闸门（2026-07-08 加，改在 `wxbot_core.py`）
 两个小机制，合并上游后确认还在：
 - **时间戳外漏修复**：历史消息喂模型时用户侧带 `[时间] 发送者:` 前缀（刻意的，给模型时间感），但 assistant 历史必须喂纯内容，否则模型模仿格式把时间戳写进新回复。OpenAIAPI / DusAPI（Claude + OpenAI 兼容两分支）/ CozeAPI 的 `chat()` 里都有这个处理。另有兜底：模块级 `strip_leading_timestamp()` 在 `_clean_reply_for_send`（不受清洗开关控制）和 `_parse_split_reply`（逐条）剥掉回复开头的时间戳。
+  ⚠️ **OpenAIAPI 这一处 2026-08-17 换地方了**：上游 V4.7.31 把历史拼装抽成了
+  `OpenAIAPI._build_history_messages`（主路径 `chat()` 与备用路径 `_try_responses_api` 共用），
+  定制已搬进那个方法里，`chat()` 里只剩一句 `messages.extend(...)`。**下次合并上游改这里，
+  改的是 `_build_history_messages`，别再去 `chat()` 的循环里找。**
 - **接话闸门**：人设 prompt 里约定"判断无需接话时只输出 `[NO_REPLY]`"，`wx_send_ai`（私聊）和群聊回复路径在发送前调 `apply_no_reply_gate()` 静默跳过、日志留痕。**prompt 层 opt-in**——只有 prompt 提到该标记的人设（目前 `AI极客.md`、`NCC肥肉.md` 的「接话判断」节）会触发，其他人设不受影响。标记混着正文时只发正文。
 - 单测：`python tests/test_reply_gate.py`（13 个，纯函数不碰微信；mac 上 `-m unittest tests.xxx` 会被 anaconda 的 tests 包遮蔽，直接跑文件即可）。
 
