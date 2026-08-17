@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import os
 import time
 
 from .config import load
@@ -25,6 +26,11 @@ except Exception:  # 单测环境没有项目根的 logger
 
 
 def log(level: str, message: str) -> None:
+    # 单测不许写进生产日志：本文件的用例会打出「触发 SWXPanelRestart 自愈重启」
+    # 这类以假乱真的行，混进 panel_logs 后排查真故障时根本分不出真假（2026-08-15 踩到）。
+    if os.environ.get("NCC_LOG_SILENT") == "1":
+        print(f"[{level}] [listen_health] {message}")
+        return
     try:
         _log(level=level, message=f"[listen_health] {message}")
     except Exception:

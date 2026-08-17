@@ -24,7 +24,7 @@ import json
 import os
 import time
 
-from .config import DATA_DIR
+from .config import DATA_DIR, load as load_config
 
 try:
     from logger import log as _log
@@ -34,6 +34,11 @@ except Exception:
 
 
 def log(level: str, message: str) -> None:
+    # 单测不许写进生产日志：本文件的用例会打出「触发 SWXPanelRestart 自愈重启」
+    # 这类以假乱真的行，混进 panel_logs 后排查真故障时根本分不出真假（2026-08-15 踩到）。
+    if os.environ.get("NCC_LOG_SILENT") == "1":
+        print(f"[{level}] [listen_health] {message}")
+        return
     try:
         _log(level=level, message=f"[listen_health] {message}")
     except Exception:
@@ -131,15 +136,25 @@ def maybe_heal(bot, consecutive_fail: int, pcfg: dict, last_error=None, snapshot
 
 
 def _alert(bot, title: str, content: str) -> None:
-    """自愈相关的通知，走和失败告警同一套通道，但不吃它的冷却（这类事件本来就少）。"""
-    try:
-        import webhook_send
-        webhook_send.send_message(title, content)
-    except Exception as e:
-        log("WARNING", f"自愈 webhook 通知失败：{e}")
-    try:
-        from plugins.ncc_community.common import notify_admin
-        from plugins.ncc_community.store import load as load_ncc
-        notify_admin(bot, load_ncc(), f"⚠️ {title}\n{content}")
-    except Exception as e:
-        log("WARNING", f"自愈管理群通知失败：{e}")
+    """自愈相关的通知，走和失败告警同一套通道，但不吃它的冷却（这类事件本来就少）。
+
+    ★★ "同一套通道"必须【真的】读同一套开关（2026-08-15 修）：
+    原来这里把 webhook + 管理群写死成两边都发，压根不看 `alert.webhook` /
+    `alert.admin_group`。于是人把 `admin_group` 关成 false（约定是运维状态消息只发飞书）
+    之后，探针告警确实不发微信了，而【自愈这一路】——"监听进入坏状态，即将自动重启
+    机器人"——照旧往管理群里灌。开关看着生效了一半，人只会以为"我明明关了"。
+    注释自称同一套、实现却各走各的，是这类 bug 最好的藏身处。"""
+    acfg = (load_config() or {}).get('alert', {})
+    if acfg.get('webhook', True):
+        try:
+            import webhook_send
+            webhook_send.send_message(title, content)
+        except Exception as e:
+            log("WARNING", f"自愈 webhook 通知失败：{e}")
+    if acfg.get('admin_group', True):
+        try:
+            from plugins.ncc_community.common import notify_admin
+            from plugins.ncc_community.store import load as load_ncc
+            notify_admin(bot, load_ncc(), f"⚠️ {title}\n{content}")
+        except Exception as e:
+            log("WARNING", f"自愈管理群通知失败：{e}")

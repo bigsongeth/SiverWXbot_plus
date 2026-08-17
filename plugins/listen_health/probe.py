@@ -30,6 +30,11 @@ except Exception:
 
 
 def log(level: str, message: str) -> None:
+    # 单测不许写进生产日志：本文件的用例会打出「触发 SWXPanelRestart 自愈重启」
+    # 这类以假乱真的行，混进 panel_logs 后排查真故障时根本分不出真假（2026-08-15 踩到）。
+    if os.environ.get("NCC_LOG_SILENT") == "1":
+        print(f"[{level}] [listen_health] {message}")
+        return
     try:
         _log(level=level, message=f"[listen_health] {message}")
     except Exception:
@@ -69,6 +74,158 @@ def _visible_chat_windows():
     return count[0]
 
 
+def _wx_top_windows():
+    """微信全部顶层窗口，按 Z 序（EnumWindows 就是从上往下枚举），**含不可见的**。
+
+    为什么要含不可见：原来的 `_visible_chat_windows()` 只数可见的，于是「窗口建出来了
+    但没显示」这种情况会被误判成「一个都没建」。08-12 的窗口清单取证表明确实不存在
+    目标窗口，但那是单次快照；这里每轮都记，把这个盲点彻底关掉。
+    """
+    try:
+        import win32gui
+        import win32process
+        import psutil
+    except Exception:
+        return None
+    out = []
+
+    def cb(h, _):
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(h)
+            name = psutil.Process(pid).name().lower()
+            if name not in ('weixin.exe', 'wechat.exe', 'wechatappex.exe'):
+                return
+        except Exception:
+            return
+        try:
+            out.append({
+                'h': h,
+                'cls': win32gui.GetClassName(h),
+                't': win32gui.GetWindowText(h),
+                'v': int(bool(win32gui.IsWindowVisible(h))),
+                'r': list(win32gui.GetWindowRect(h)),
+                'p': name,
+            })
+        except Exception:
+            return
+
+    try:
+        win32gui.EnumWindows(cb, None)
+    except Exception:
+        return None
+    return out
+
+
+def _hit_test_session_list(main_hwnd):
+    """会话列表那几个点上，**实际压在最上面的是哪个窗口**。
+
+    这是本轮调查留下的头号待验假设的直接判据。08-12 实测：尝试那一刻前台是 Chrome
+    面板的 70 个样本 0 失败，是微信某个窗口的 32 个样本 28 失败（87.5%）。最可疑的机制
+    是——微信已在前台时 wxautox 跳过了「激活主窗口」，而真正盖在会话列表上的是别的窗口，
+    于是双击打空、微信没收到建窗请求、FindWindow 空等满 3 秒死线。
+
+    WindowFromPoint 是纯只读的，不移动鼠标、不点击、不抢焦点，不违反「独立进程不得做
+    微信 UI 操作」那条铁律（何况这里本来就跑在 bot 进程内）。
+    """
+    if not main_hwnd:
+        return None
+    try:
+        import ctypes
+        import win32gui
+        import win32process
+        import psutil
+    except Exception:
+        return None
+    try:
+        l, t, r, b = win32gui.GetWindowRect(main_hwnd)
+        w, h = r - l, b - t
+        if w <= 0 or h <= 0:
+            return None
+    except Exception:
+        return None
+
+    class _PT(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+
+    u32 = ctypes.windll.user32
+    u32.WindowFromPoint.argtypes = [_PT]
+    u32.WindowFromPoint.restype = ctypes.c_void_p
+
+    hits = []
+    # 左侧会话列表那一列，纵向取三个点（会话行高约 60px，取 15%/30%/45% 高度处）
+    for fx, fy in ((0.15, 0.15), (0.15, 0.30), (0.15, 0.45)):
+        x, y = int(l + w * fx), int(t + h * fy)
+        try:
+            hh = u32.WindowFromPoint(_PT(x, y))
+            hh = int(hh) if hh else 0
+        except Exception:
+            hits.append({'pt': [x, y], 'e': 'WindowFromPoint failed'})
+            continue
+        item = {'pt': [x, y], 'h': hh}
+        try:
+            item['cls'] = win32gui.GetClassName(hh)
+            item['t'] = win32gui.GetWindowText(hh)
+            root = win32gui.GetAncestor(hh, 2)      # GA_ROOT：落点所属的顶层窗口
+            item['root'] = root
+            item['is_main'] = int(root == main_hwnd)
+            _, pid = win32process.GetWindowThreadProcessId(hh)
+            item['proc'] = psutil.Process(pid).name()
+        except Exception:
+            pass
+        hits.append(item)
+    return hits
+
+
+def _gui_resources():
+    """每个微信进程的 GDI/USER 对象数与**峰值**。
+
+    句柄配额假设这轮已被证伪（Weixin GDI 实测 39/10000，且 CreateWindowEx 消耗的是
+    USER + 桌面堆、不是 GDI 句柄）。这里仍留一份，只为把它永久封棺：峰值由 win32k 维护、
+    进程生命周期内单调不减，所以哪怕采不到失败那一瞬间，跨过一整个发作块后峰值仍然低，
+    就能回溯覆盖这个进程经历过的每一次发作。跨会话取不到（恒返回 0 + GetLastError=87），
+    只有跑在会话 2 内的本进程能拿到 —— 所以这几个字段顺带还是「探针确实在会话 2」的自检。
+    """
+    try:
+        import ctypes
+        import psutil
+    except Exception:
+        return None
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    u32.GetGuiResources.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    u32.GetGuiResources.restype = ctypes.c_uint
+    k32.OpenProcess.restype = ctypes.c_void_p
+    out = []
+    for p in psutil.process_iter(['name', 'pid']):
+        try:
+            nm = (p.info.get('name') or '').lower()
+            if nm not in ('weixin.exe', 'wechat.exe', 'wechatappex.exe'):
+                continue
+            row = {'pid': p.info['pid'], 'name': p.info['name']}
+            hp = k32.OpenProcess(0x0400, False, p.info['pid'])   # QUERY_INFORMATION
+            if not hp:
+                row['e'] = 'open:%d' % ctypes.get_last_error() if hasattr(ctypes, 'get_last_error') else 'open'
+                out.append(row)
+                continue
+            try:
+                for key, flag in (('gdi', 0), ('user', 1), ('gdi_peak', 2), ('user_peak', 4)):
+                    row[key] = int(u32.GetGuiResources(hp, flag))
+                if row.get('gdi') == 0 and row.get('user') == 0:
+                    # 全 0 基本等于跨会话调用失败 —— 记一笔，别把 0 当真值去下结论
+                    row['e'] = 'all-zero(可能不在会话2)'
+            finally:
+                k32.CloseHandle(hp)
+            try:
+                row['handles'] = p.num_handles()
+                row['threads'] = p.num_threads()
+                row['ws_mb'] = int(p.memory_info().rss / 1048576)
+            except Exception:
+                pass
+            out.append(row)
+        except Exception:
+            continue
+    return out or None
+
+
 def _env_snapshot() -> dict:
     """
     采样时的环境快照。wxautox 作者说这类「窗口丢失」多半是被人为/后台软件干扰，
@@ -83,10 +240,17 @@ def _env_snapshot() -> dict:
     except Exception:
         return snap
 
-    # 前台窗口是谁——被别的程序抢了焦点，双击就可能落空
+    # 前台窗口是谁——被别的程序抢了焦点，双击就可能落空。
+    # 08-12 复盘发现这是目前最强的判别式，但光有 title/proc 分不清「主窗口在前台」和
+    # 「某个聊天子窗口在前台」（前者当天 15/15 全败、后者 16/21），所以补上 hwnd 和类名。
     try:
         hwnd = win32gui.GetForegroundWindow()
         snap['fg_title'] = win32gui.GetWindowText(hwnd)
+        snap['fg_hwnd'] = hwnd
+        try:
+            snap['fg_class'] = win32gui.GetClassName(hwnd)
+        except Exception:
+            snap['fg_class'] = None
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             snap['fg_proc'] = psutil.Process(pid).name()
@@ -126,6 +290,32 @@ def _env_snapshot() -> dict:
                 return
         win32gui.EnumWindows(cb, None)
         snap['wx_main_hwnd'] = found[0] if found else None
+    except Exception:
+        pass
+
+    # 主窗口自己的几何/显示状态。「置前=True 但仍然开不出窗口」是日报日志里反复出现的
+    # 矛盾（08-12 四次失败全是这样），所以把最小化、rect、可见性都记下来。
+    try:
+        mh = snap.get('wx_main_hwnd')
+        if mh:
+            snap['wx_main_rect'] = list(win32gui.GetWindowRect(mh))
+            snap['wx_main_iconic'] = int(bool(win32gui.IsIconic(mh)))
+            snap['wx_main_visible'] = int(bool(win32gui.IsWindowVisible(mh)))
+            snap['wx_main_is_fg'] = int(mh == snap.get('fg_hwnd'))
+    except Exception:
+        pass
+
+    # 下面三块是本轮新加的取证埋点，全部只读；任何一块挂掉都只是缺字段，不影响探针判定。
+    try:
+        snap['wx_windows'] = _wx_top_windows()
+    except Exception:
+        pass
+    try:
+        snap['hit_test'] = _hit_test_session_list(snap.get('wx_main_hwnd'))
+    except Exception:
+        pass
+    try:
+        snap['gui'] = _gui_resources()
     except Exception:
         pass
 
@@ -191,6 +381,16 @@ def tick(bot) -> None:
         ok = err is None and sub is not None
         win_after = _visible_chat_windows()
 
+        # 失败时再取一份**只读**快照：窗口清单/双击落点/前台在这 3.4 秒里到底变了没有。
+        # 故意不做「隔 2s/10s 再 AddListenChat 复测一次」——那等于每次失败多打两次微信 UI，
+        # 而「bot 驱动 UI 的强度」正是本轮头号放大器嫌疑，不能拿采样去污染被测对象。
+        snapshot_after = None
+        if not ok:
+            try:
+                snapshot_after = _env_snapshot()
+            except Exception:
+                pass
+
         # 清理，别让探针窗口累积
         try:
             wx.RemoveListenChat(target)
@@ -210,6 +410,7 @@ def tick(bot) -> None:
             "dyn_listen_count": len(getattr(bot, 'all_Mode_listen_list', []) or []),
             "msg_received": getattr(bot, 'msg_received_count', None),
             "env": snapshot,
+            "env_after": snapshot_after,
         })
 
         if ok:

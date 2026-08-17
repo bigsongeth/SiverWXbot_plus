@@ -8,9 +8,13 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 单测的日志不许写进 panel_logs（生产日志）——必须在导入插件【之前】设。
+os.environ.setdefault("NCC_LOG_SILENT", "1")
 
 from plugins.listen_health import alert as alert_mod
 from plugins.listen_health import probe as probe_mod
@@ -344,6 +348,72 @@ class TestHeal(unittest.TestCase):
     def test_never_raises_when_trigger_broken(self):
         self.heal._trigger_restart = lambda task: (_ for _ in ()).throw(OSError('schtasks not found'))
         self.assertEqual(self.heal.maybe_heal(None, 2, self._cfg()), 'none')
+
+
+class TestHealAlertHonorsChannelSwitches(unittest.TestCase):
+    """★ 回归：自愈通知必须读 alert.webhook / alert.admin_group 这两个开关。
+
+    原来 heal._alert 把两个通道写死成"都发"，于是把 admin_group 关掉（约定是运维状态
+    消息只发飞书）之后，探针告警确实不发微信了，而「监听进入坏状态，即将自动重启
+    机器人」照旧往管理群里灌 —— 开关只生效了一半，人只会以为自己没关掉。
+    这里【测真的 _alert】，所以不能放进 TestHeal（那个类把 _alert 整个换成了 mock）。
+    """
+
+    def setUp(self):
+        from plugins.listen_health import heal as heal_mod
+        from plugins.ncc_community import common as ncc_common
+        self.heal, self.ncc_common = heal_mod, ncc_common
+        self.webhooks, self.admins = [], []
+
+        fake_webhook = types.ModuleType('webhook_send')
+        fake_webhook.send_message = lambda t, c: (self.webhooks.append((t, c)), (True, ''))[1]
+        self._orig_module = sys.modules.get('webhook_send')
+        sys.modules['webhook_send'] = fake_webhook
+
+        self._orig_notify = ncc_common.notify_admin
+        ncc_common.notify_admin = lambda bot, cfg, text: self.admins.append(text)
+
+        self._orig_path = cfg_mod.CONFIG_PATH
+
+    def tearDown(self):
+        if self._orig_module is None:
+            sys.modules.pop('webhook_send', None)
+        else:
+            sys.modules['webhook_send'] = self._orig_module
+        self.ncc_common.notify_admin = self._orig_notify
+        cfg_mod.CONFIG_PATH = self._orig_path
+
+    def _with_alert_cfg(self, **alert):
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, encoding='utf-8') as f:
+            json.dump({'alert': alert}, f)
+            cfg_mod.CONFIG_PATH = f.name
+        self.addCleanup(os.unlink, f.name)
+
+    def test_admin_group_off_means_feishu_only(self):
+        self._with_alert_cfg(webhook=True, admin_group=False)
+        self.heal._alert(None, '监听进入坏状态', '即将自动重启机器人')
+        self.assertEqual(len(self.webhooks), 1)          # 飞书照发
+        self.assertEqual(self.admins, [])                # 微信管理群一条都不发
+
+    def test_both_on_still_sends_both(self):
+        self._with_alert_cfg(webhook=True, admin_group=True)
+        self.heal._alert(None, '标题', '正文')
+        self.assertEqual(len(self.webhooks), 1)
+        self.assertEqual(len(self.admins), 1)
+
+    def test_webhook_off_means_admin_group_only(self):
+        self._with_alert_cfg(webhook=False, admin_group=True)
+        self.heal._alert(None, '标题', '正文')
+        self.assertEqual(self.webhooks, [])
+        self.assertEqual(len(self.admins), 1)
+
+    def test_local_config_actually_routes_status_to_feishu_only(self):
+        """本机配置的实际效果：状态消息只进飞书。改回去会在这里失败。"""
+        if not os.path.exists(self._orig_path):
+            self.skipTest('本机没有 data/config.json，用 DEFAULTS')
+        cfg_mod.CONFIG_PATH = self._orig_path
+        self.heal._alert(None, '监听进入坏状态', '即将自动重启机器人')
+        self.assertEqual(self.admins, [], '运维状态消息不该发进微信管理群')
 
 
 class TestConfig(unittest.TestCase):
