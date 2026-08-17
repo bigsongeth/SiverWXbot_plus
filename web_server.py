@@ -1244,8 +1244,8 @@ def ai_news_send_now():
     def run():
         pythoncom.CoInitialize()
         try:
-            from plugins.ai_news_note.sender import send_daily_note
-            r = send_daily_note(force=True, source="manual")
+            from plugins.ai_news_note.sender import send_daily_note_guarded
+            r = send_daily_note_guarded(force=True, source="manual")
             log('INFO', f'AI 日报手动发送结果：{r}')
         except Exception as e:
             log('ERROR', f'AI 日报手动发送异常: {e}')

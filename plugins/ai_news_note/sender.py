@@ -21,7 +21,7 @@ import win32api
 import win32process
 
 from . import config
-from .render import render
+from .render import render, render_plain
 
 _LOG = os.path.join(os.path.dirname(__file__), "..", "..", "panel_logs", "ai_news_note.log")
 _STATE = os.path.join(os.path.dirname(__file__), "last_sent.txt")
@@ -836,3 +836,323 @@ def send_daily_note(bot=None, force=False, source="scheduled"):
         return done(f"❌ 发送异常：{e}")
     finally:
         _drop_topmost()   # 别把微信永久钉在最上层，挡住人操作
+
+
+# ---------------- 降级通路：不新建任何窗口，直接发纯文本 ----------------
+# 2026-08-12 事故：微信进入"已有窗口读写正常、但新顶层窗口一个都建不出来"的状态
+# （同期探针 AddListenChat 也成块失败，报 error(1400,'MoveWindow')），建笔记连败
+# 4 次、日报整天断供；而**往已存在的窗口发文本全程正常**（bot 收发消息、告警都照发）。
+# 所以降级 = 不点"新建笔记"、不开任何顶层窗口，把日报当纯文本发进目标群已有的会话。
+# 降级只是止血：正常笔记流程一行不改，guarded 入口先原样跑完 send_daily_note，
+# 只在它已失败、且**能确定群里还什么都没收到**时才追加发文本。
+_DEGRADE_STATE = os.path.join(os.path.dirname(__file__), "data", "degrade_state.json")
+
+# 允许降级的失败阶段（取自返回文案的"（阶段）"）。入选判据只有一条：这四个阶段全部发生
+# 在"点选择器里的【发送】按钮"之前，群里一定还什么都没收到，降级不可能重复推送。逐个核
+# 对过：环境=_desktop_usable/_close_all_editors 挂；建笔记=_create_note_from_clipboard 挂
+# 或收藏里没这条；打开目标=_open_target 挂；发送收藏=_send_favorite 的每个 False 返回都在
+# sendb.Click() 之前（点完发送就直接 return True）。故意**不含"发送异常"**：那是 try 里任
+# 意一行抛的，确定不了发送点过没点过 —— 宁可不发，也不冒"笔记已进群又补一份文本"的风险。
+_DEGRADE_SAFE_STAGES = ("环境", "建笔记", "打开目标", "发送收藏")
+
+
+def _fail_stage(text):
+    """从返回文案取出失败阶段；不是"发送失败"就返回 None。
+    ✅/⚠️/❌ 三态是 trigger._status_of 早就依赖的既有约定，这里只多解析一层括号里的阶段名。"""
+    t = str(text)
+    head = "❌ 发送失败（"
+    if not t.startswith(head):
+        return None
+    return t[len(head):].split("）", 1)[0]
+
+
+def _degrade_state():
+    """读今天的降级状态。日期不是今天就当空的返回（跨天自动归零，不用清理）。"""
+    today = datetime.date.today().isoformat()
+    try:
+        with open(_DEGRADE_STATE, encoding="utf-8") as f:
+            s = json.load(f)
+        if isinstance(s, dict) and s.get("date") == today:
+            return {"date": today,
+                    "fail_count": int(s.get("fail_count") or 0),
+                    "first_fail_at": s.get("first_fail_at"),
+                    "degraded_at": s.get("degraded_at")}
+    except Exception:
+        pass
+    return {"date": today, "fail_count": 0, "first_fail_at": None, "degraded_at": None}
+
+
+def _save_degrade_state(s):
+    """原子写降级状态。**必须落盘**：计数放内存里，探针自愈重启一次就全丢
+    （2026-08-12 有 5 次自愈重启，09:45 那次直接把重试链冲掉），降级就永远等不到门槛。"""
+    try:
+        os.makedirs(os.path.dirname(_DEGRADE_STATE), exist_ok=True)
+        tmp = _DEGRADE_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _DEGRADE_STATE)
+    except Exception as e:
+        log(f"写 degrade_state.json 失败（不影响本次降级判定）：{e!r}")
+
+
+def _should_degrade(text):
+    """决定要不要降级，返回 (要不要, 不降级的原因)。
+    顺带把"今天第几次安全失败/首次失败在什么时候"记进状态文件 —— 触发门槛就靠它。"""
+    stage = _fail_stage(text)
+    if stage is None:
+        return False, ""                      # 成功 / ⚠️跳过 / 发送异常：都不降级，也不记账
+    if not getattr(config, "DEGRADE_ENABLED", False):
+        return False, "降级通路已关闭（config.DEGRADE_ENABLED=False）"
+    if stage not in _DEGRADE_SAFE_STAGES:
+        return False, f"失败阶段「{stage}」不在安全清单里，无法确定笔记有没有已经发进群，不降级"
+    if _already_sent_today():
+        return False, "last_sent.txt 已是今天（笔记通道可能已经发出去了），不降级"
+
+    s = _degrade_state()
+    if s.get("degraded_at"):
+        return False, f"今天已经降级发过了（{s['degraded_at']}），不重复发"
+    s["fail_count"] += 1
+    if not s.get("first_fail_at"):
+        s["first_fail_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    _save_degrade_state(s)
+
+    waited = 0.0
+    try:
+        t0 = datetime.datetime.fromisoformat(s["first_fail_at"])
+        waited = (datetime.datetime.now() - t0).total_seconds() / 60.0
+    except Exception:
+        pass
+    need_fails = int(getattr(config, "DEGRADE_AFTER_FAILS", 3))
+    need_min = float(getattr(config, "DEGRADE_AFTER_MIN", 40))
+    if s["fail_count"] >= need_fails:
+        return True, ""
+    if waited >= need_min:
+        return True, ""
+    return False, (f"今天第 {s['fail_count']} 次失败、距首次失败 {waited:.0f} 分钟，"
+                   f"还没到降级门槛（≥{need_fails} 次 或 ≥{need_min:.0f} 分钟），先让笔记流程再试")
+
+
+def _hard_split(block, limit, bot=None):
+    """单个条目块本身就超过一条消息的字数上限时，按字数硬切（会切断句子，最后手段）。
+    切分复用 bot 那套 split_long_text，别自己再写一份切法。"""
+    try:
+        return list(bot.config.split_long_text(block, limit))
+    except Exception:
+        return [block[i:i + limit] for i in range(0, len(block), limit)]
+
+
+def _pack_blocks(blocks, limit, bot=None):
+    """把条目块装进若干条消息，**一个条目块绝不跨消息切开**。
+    不直接对整篇正文调 split_long_text(2000)：按字数盲切的切点会落在 URL 中间，断链微信
+    不识别成蓝链，等于这条日报废了。所以按"条目"这个天然边界打包。"""
+    segs, cur, n = [], [], 0
+    for b in blocks:
+        if len(b) > limit:
+            if cur:
+                segs.append("\n\n".join(cur))
+                cur, n = [], 0
+            segs.extend(_hard_split(b, limit, bot))
+            continue
+        add = len(b) + (2 if cur else 0)      # 块之间用一个空行分隔
+        if cur and n + add > limit:
+            segs.append("\n\n".join(cur))
+            cur, n = [], 0
+            add = len(b)
+        cur.append(b)
+        n += add
+    if cur:
+        segs.append("\n\n".join(cur))
+    return segs
+
+
+def _degrade_messages(d, bot=None):
+    """把日报渲染成"可以直接一条条发出去"的纯文本消息列表。返回 (messages, title, hits)。"""
+    mode = str(getattr(config, "DEGRADE_MODE", "digest") or "digest").strip()
+    title, blocks, hits = render_plain(d, mode)
+    limit = max(300, int(getattr(config, "DEGRADE_SEG_CHARS", 1500)))
+    segs = _pack_blocks(blocks, limit, bot)
+
+    # 上限内发不完就截断：宁可少发几条也别刷屏（连发十几条长文本容易被判骚扰），
+    # 末尾注明少了多少，人可以去服务器上看完整版。
+    cap = max(1, int(getattr(config, "DEGRADE_MAX_SEGMENTS", 6)))
+    dropped = max(0, len(segs) - cap)
+    segs = segs[:cap]
+
+    note = str(getattr(config, "DEGRADE_NOTE", "（笔记通道故障，本次改为文本推送）"))
+    total = len(segs)
+    messages = []
+    for i, seg in enumerate(segs, 1):
+        head = title if total == 1 else f"{title}（{i}/{total}）"
+        if i == 1:
+            head = f"{head}\n{config.INTRO}\n{note}"
+        tail = ""
+        if i == total and dropped:
+            tail = f"\n\n（内容过长，还有 {dropped} 段未发送，完整版见服务器 {config.DATA_FILE}）"
+        messages.append(f"{head}\n\n{seg}{tail}")
+    return messages, title, hits
+
+
+def _send_ok(r):
+    """判 wxautox 返回是否发送成功。照 wxbot_core 的 ReplyCountStore.was_send_success 抄
+    一份，故意不 import 它（插件被 wxbot_core 导入，反向 import 会循环依赖）。"""
+    if r is True:
+        return True
+    if r is False or r is None:
+        return False
+    if isinstance(r, dict):
+        st = str(r.get("status", "")).lower()
+        if st in ("success", "ok", "true", "成功"):
+            return True
+        if st in ("error", "fail", "failed", "false", "失败", "错误"):
+            return False
+    return bool(r)
+
+
+def _send_text_to_target(wx, target, messages, dry_run=False):
+    """把 messages 逐条发到 target。返回 (发成功几条, 用的哪条通道)。
+
+    **全程不新建任何窗口**，这是降级路径的立命之本：
+      首选 wx.GetSubWindow(target)：目标群一直被 bot 监听，独立窗口本来就开着，不碰
+            "新建窗口"那条坏路（故障期实测对 5 个已有窗口五连成功、窗口数不变）。
+      回落 wx.SendMsg(who=..., exact=True)：主窗口切会话再发，也不新建顶层窗口，就是
+            MainWindowChat 那条通道。exact=True 防发错群（群名带 emoji 后缀）。
+    绝不做 SetForegroundWindow / 置顶 / 点击：抢前台是给建笔记用的，外层 finally 已经
+    _drop_topmost 过了，发文本让 wxautox 自己处理。
+    """
+    chat, how = None, ""
+    try:
+        sub = wx.GetSubWindow(target)
+    except Exception as e:
+        sub = None
+        log(f"GetSubWindow 出错，回落主窗口发送：{e!r}")
+    # 校验 who 完全相等：宁可回落到 exact 搜索，也不能往一个名字不对的窗口里发日报。
+    if sub is not None and str(getattr(sub, "who", "") or "") == target:
+        chat, how = sub, f"已有独立窗口「{target}」"
+    else:
+        how = f"主窗口切会话（exact 匹配「{target}」）"
+    log(f"降级发送：通道={how}，共 {len(messages)} 条"
+        f"{'（演练模式，一条都不真发）' if dry_run else ''}")
+
+    interval = max(0.0, float(getattr(config, "DEGRADE_SEG_INTERVAL_SEC", 4.0)))
+    sent = 0
+    for i, m in enumerate(messages, 1):
+        if dry_run:
+            log(f"  [演练] 第 {i}/{len(messages)} 条（{len(m)} 字）：\n{m}")
+            sent += 1
+            continue
+        try:
+            r = chat.SendMsg(m) if chat is not None else wx.SendMsg(msg=m, who=target, exact=True)
+        except Exception as e:
+            log(f"  第 {i}/{len(messages)} 条发送抛异常，停止后续发送：{e!r}")
+            break
+        if not _send_ok(r):
+            log(f"  第 {i}/{len(messages)} 条发送失败，停止后续发送：{r!r}")
+            break
+        sent += 1
+        log(f"  第 {i}/{len(messages)} 条已发（{len(m)} 字）")
+        if i < len(messages):
+            time.sleep(interval)   # 节流：连发不歇容易触发风控，也刷屏
+    return sent, how
+
+
+def _degrade_send(bot, orig_text, source):
+    """执行一次降级发送。返回给 trigger 用的结果文案（首字符仍遵守 ✅/⚠️/❌ 约定）。"""
+    target = str(config.TARGET or "").strip()
+    if not target:
+        msg = f"{orig_text}｜降级未执行：目标群名为空（settings.json 的 target）"
+        log(msg)
+        return msg
+
+    wx = getattr(bot, "wx", None)
+    if wx is None:
+        # 面板"手动发送"（web_server.py:1248）直接调 send_daily_note(bot=None)，拿不到客户端
+        # 对象；那条路本来也不该在 web 线程里碰微信 UI，这里只如实说明，不硬凑一个 WeChat。
+        msg = f"{orig_text}｜降级未执行：拿不到 bot 的微信客户端（bot.wx 未初始化）"
+        log(msg)
+        return msg
+
+    # 重新读数据并复查日期：降级距笔记流程已隔几十分钟，期间 mac-mini 可能又覆盖了
+    # latest.json。绝不能把昨天的旧日报当今天的发出去。
+    try:
+        with open(config.DATA_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception as e:
+        msg = f"{orig_text}｜降级未执行：读不了 {config.DATA_FILE}（{e!r}）"
+        log(msg)
+        return msg
+    today = datetime.date.today().isoformat()
+    if d.get("date") != today or not d.get("items"):
+        msg = (f"{orig_text}｜降级未执行：数据日期={d.get('date')}（今天 {today}）"
+               f"或 items 为空，不发")
+        log(msg)
+        return msg
+
+    messages, title, hits = _degrade_messages(d, bot)
+    if hits:
+        log(f"降级内容审查：已打码敏感词 {hits}")
+    log(f"启动降级发送：{title} -> {target}，mode={getattr(config, 'DEGRADE_MODE', 'digest')} "
+        f"共 {len(messages)} 条 / {sum(len(m) for m in messages)} 字；"
+        f"笔记通道失败原因：{orig_text}")
+
+    dry_run = bool(getattr(config, "DEGRADE_DRY_RUN", False))
+    sent, how = _send_text_to_target(wx, target, messages, dry_run)
+
+    if dry_run:
+        # 演练不动 last_sent.txt / degrade_state.json：可以反复跑，也不挡正常笔记流程重试。
+        out = f"⚠️ 降级演练完成（{sent}/{len(messages)} 条只写日志未发送），原因：{orig_text}"
+        log(out)
+        return out
+
+    extra = f"，已过滤敏感词：{'、'.join(hits)}" if hits else ""
+    if sent >= len(messages) and sent > 0:
+        # 写 last_sent.txt 是**防重复推送的关键一步**：后续所有重试与今天的定时任务都会在
+        # send_daily_note 开头被"今天已发过"拦掉，笔记不可能再补发一遍。副作用（是期望
+        # 行为）：gh_trending_note 靠这个文件判断"AI 日报已发完"，会随之放行。
+        _mark_sent_today()
+        s = _degrade_state()
+        s["degraded_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        _save_degrade_state(s)
+        out = (f"✅ 日报已降级为纯文本发送到 {target}（{len(messages)} 条，"
+               f"通道：{how}）{extra}。笔记通道失败原因：{orig_text}")
+        log(out)
+        _push(out, source)
+        return out
+
+    if sent > 0:
+        # 发了一半：群里已有内容，绝不能让笔记流程再补一份 —— 照样写 last_sent.txt
+        # 掐掉重试，然后大声喊人来收尾。
+        _mark_sent_today()
+        s = _degrade_state()
+        s["degraded_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        _save_degrade_state(s)
+        out = (f"⚠️ 降级只发出 {sent}/{len(messages)} 条到 {target}（通道：{how}），"
+               f"群里已有内容、已按防重记为今天已发，请人工确认并补齐剩余部分。"
+               f"笔记通道失败原因：{orig_text}")
+        log(out)
+        _push(out, source)
+        return out
+
+    out = f"{orig_text}｜降级也没发出去（0/{len(messages)} 条，通道：{how}），等下次重试"
+    log(out)
+    return out
+
+
+def send_daily_note_guarded(bot=None, force=False, source="scheduled"):
+    """正常笔记流程 + 失败后的纯文本降级。**trigger 调这个，不要直接调 send_daily_note。**
+
+    send_daily_note 一行没改：先原样跑完它，只在它已失败、能确定"群里还什么都没收到"
+    （见 _DEGRADE_SAFE_STAGES）、且失败次数/时间到门槛时，才追加一次不新建窗口的文本
+    发送。降级自身出任何岔子都只记日志、原结果照原样返回，不能反过来把主流程搞挂。
+    """
+    text = send_daily_note(bot, force=force, source=source)
+    try:
+        ok, why = _should_degrade(text)
+        if not ok:
+            if why:
+                log(f"不降级：{why}")
+            return text
+        return _degrade_send(bot, text, source)
+    except Exception as e:
+        import traceback
+        log(f"降级通路自身出错（原结果照原样返回）：{e!r}\n{traceback.format_exc()}")
+        return text

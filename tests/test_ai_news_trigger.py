@@ -37,7 +37,7 @@ class TriggerTestBase(unittest.TestCase):
         # 把请求/结果文件重定向到临时目录，绝不碰真实的 C:\Users\Admin\ai_news
         self.tmp = tempfile.mkdtemp(prefix="ai_news_trigger_test_")
         self._orig = (trigger._DIR, trigger.REQUEST_FILE, trigger.RESULT_FILE,
-                      trigger.send_daily_note, trigger.log)
+                      trigger.send_daily_note_guarded, trigger.log)
         trigger._DIR = self.tmp
         trigger.REQUEST_FILE = os.path.join(self.tmp, "send_request.flag")
         trigger.RESULT_FILE = os.path.join(self.tmp, "send_result.json")
@@ -48,17 +48,17 @@ class TriggerTestBase(unittest.TestCase):
 
     def tearDown(self):
         (trigger._DIR, trigger.REQUEST_FILE, trigger.RESULT_FILE,
-         trigger.send_daily_note, trigger.log) = self._orig
+         trigger.send_daily_note_guarded, trigger.log) = self._orig
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def stub_send(self, *results):
-        """让 send_daily_note 依次返回给定结果；用完后重复最后一个。"""
+        """让 send_daily_note_guarded 依次返回给定结果；用完后重复最后一个。"""
         seq = list(results)
 
         def fake(bot=None, force=False, source="scheduled"):
             self.calls.append({"force": force, "source": source})
             return seq.pop(0) if len(seq) > 1 else seq[0]
-        trigger.send_daily_note = fake
+        trigger.send_daily_note_guarded = fake
 
     def result_json(self):
         with open(trigger.RESULT_FILE, encoding="utf-8") as f:
@@ -97,7 +97,7 @@ class TestResultFile(TriggerTestBase):
     def test_发送抛异常也写结果不炸掉(self):
         def boom(bot=None, force=False, source="scheduled"):
             raise RuntimeError("UI 挂了")
-        trigger.send_daily_note = boom
+        trigger.send_daily_note_guarded = boom
         trigger.start_day(object())
         self.assertEqual(self.result_json()["status"], "failed")
 

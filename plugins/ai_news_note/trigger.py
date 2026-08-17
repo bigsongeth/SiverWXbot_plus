@@ -25,7 +25,7 @@ import time
 import datetime
 
 from . import config
-from .sender import send_daily_note, log
+from .sender import send_daily_note_guarded, log
 
 _DIR = os.path.dirname(config.DATA_FILE)
 # mac-mini 通过 SSH 写这个文件表示"请发今天的日报"；本模块消费后立刻删掉。
@@ -100,7 +100,9 @@ def _arm_retry(status, text):
 def run_once(bot, source):
     """跑一次发送并回写结果 + 安排重试。只应由 schedule 循环调用（保证串行）。"""
     try:
-        text = str(send_daily_note(bot, force=False, source=source))
+        # 走 guarded 入口：笔记流程一行不改，只在它失败、且确定群里还没收到任何东西时，
+        # 才追加一次「不新建窗口」的纯文本降级发送（见 sender.py 末尾）。
+        text = str(send_daily_note_guarded(bot, force=False, source=source))
     except Exception as e:
         import traceback
         text = f"❌ 发送异常：{e}"

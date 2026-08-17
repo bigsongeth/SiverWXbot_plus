@@ -60,3 +60,19 @@ HIGHLIGHT = "#FFE066"
 
 # 发送前，日报文件最多允许多旧（小时）。超过则跳过发送，避免发到隔夜/陈旧数据。
 MAX_AGE_HOURS = 20
+
+
+# ---- 降级通路（笔记开不出来时的止血；判据见 sender.py 的 _DEGRADE_SAFE_STAGES）----
+# 2026-08-12：微信进入「已有窗口读写正常、新顶层窗口一个都建不出来」的状态时，建笔记
+# 必然失败（当天连败 4 次、日报断供一整天），而往已有窗口发纯文本全程正常。
+DEGRADE_ENABLED = False   # 2026-08-12 23:xx 关闭：这条通路未经用户授权就上线并真发了一条群消息
+# 'digest' 只发 序号+标题 / 评分+来源 / 链接（实测 12 条约 1.4k 字，一条消息就发完）；
+# 'full'   额外带摘要与关键词（实测 12 条约 4.2k 字，要分 4 条发）。
+DEGRADE_MODE = "digest"
+DEGRADE_SEG_CHARS = 1500          # 单条消息字数上限（条目块不切开，实际略小于此值）
+DEGRADE_MAX_SEGMENTS = 6          # 最多发几条，防刷屏/风控；超出部分丢弃并在末尾注明
+DEGRADE_SEG_INTERVAL_SEC = 4.0    # 条与条之间的间隔（节流）
+DEGRADE_AFTER_FAILS = 1           # 笔记流程「安全失败」累计几次后降级
+DEGRADE_AFTER_MIN = 40            # 或距今天首次失败满多少分钟就降级（防重启丢掉重试链）
+DEGRADE_NOTE = "（笔记通道故障，本次改为文本推送）"
+DEGRADE_DRY_RUN = False           # True = 只把要发的内容写进日志，一条都不真发（验证用）
