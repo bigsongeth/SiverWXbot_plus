@@ -1153,7 +1153,7 @@ body.mobile-nav-open { overflow: hidden; }
               <label class="cfg-label">SDK</label>
               <div style="position:relative;">
                 <select class="form-select api-sdk-select" style="appearance:none;-webkit-appearance:none;padding-right:28px;">
-                  <option value="OpenAI SDK" {% if cfg.get('sdk') == 'OpenAI SDK' %}selected{% endif %}>OpenAI SDK</option>
+                  <option value="OpenAI API 格式兼容接口" {% if cfg.get('sdk') in ('OpenAI SDK', 'OpenAI API 格式兼容接口') %}selected{% endif %}>OpenAI API 格式兼容接口</option>
                   <option value="DusAPI" {% if cfg.get('sdk') == 'DusAPI' %}selected{% endif %}>DusAPI</option>
                   <option value="Dify" {% if cfg.get('sdk') == 'Dify' %}selected{% endif %}>Dify</option>
                   <option value="Coze" {% if cfg.get('sdk') == 'Coze' %}selected{% endif %}>Coze</option>
@@ -2859,7 +2859,7 @@ $(function(){
           '<div class="col-12 col-md-3"><label class="cfg-label">SDK</label>'+
             '<div style="position:relative;">'+
               '<select class="form-select api-sdk-select" style="appearance:none;-webkit-appearance:none;padding-right:28px;">'+
-                '<option value="OpenAI SDK" selected>OpenAI SDK</option>'+
+                '<option value="OpenAI API 格式兼容接口" selected>OpenAI API 格式兼容接口</option>'+
                 '<option value="DusAPI">DusAPI</option>'+
                 '<option value="Dify">Dify</option>'+
                 '<option value="Coze">Coze</option>'+

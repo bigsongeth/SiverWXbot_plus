@@ -47,6 +47,8 @@ class NccKbTestCase(unittest.TestCase):
 
         fake.DusAPI = _Api
         fake.OpenAIAPI = _Api
+        # 上游 V4.7.31 起 OpenAI 接口有新旧两个显示名，_build_api 要拿这个常量判分支
+        fake.OPENAI_SDK_ALIASES = ("OpenAI SDK", "OpenAI API 格式兼容接口")
         sys.modules["wxbot_core"] = fake
         self.bot = FakeBot()
 

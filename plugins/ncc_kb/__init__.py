@@ -45,7 +45,10 @@ def kb_enabled(who, is_group) -> bool:
 
 def _build_api(endpoint):
     """按端点配置构建一个 AI 接口实例（复用 wxbot_core 的接口类，懒导入避免循环依赖）。"""
-    from wxbot_core import DusAPI, OpenAIAPI
+    # OPENAI_SDK_ALIASES 含新旧两个名字：上游 V4.7.31 把「OpenAI SDK」改名成
+    # 「OpenAI API 格式兼容接口」，本插件的端点配置是自己那份 data/config.json，
+    # 不吃上游那套自动迁移，两个名字都得认，否则会静默落到 DusAPI 分支上。
+    from wxbot_core import DusAPI, OpenAIAPI, OPENAI_SDK_ALIASES
 
     class _Proxy:
         pass
@@ -56,7 +59,7 @@ def _build_api(endpoint):
     p.base_url = endpoint.get("url", "")
     p.model1 = endpoint.get("model", "")
     p.prompt = ""  # prompt 总是 chat() 显式传入
-    if p.api_sdk == "OpenAI SDK":
+    if p.api_sdk in OPENAI_SDK_ALIASES:
         return OpenAIAPI(p)
     return DusAPI(p)
 
