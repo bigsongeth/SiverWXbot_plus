@@ -12,7 +12,12 @@
 """
 from __future__ import annotations
 
-from . import registry, store
+import os
+from datetime import datetime
+
+# task_runner 只 import 了 store/common/wxlock，都不碰 wxautox，
+# 所以在这儿导入不会破坏"mac 上能裸跑单测"这条（forward 是在它函数内部才导的）。
+from . import registry, store, task_runner
 
 # 「后台」指令回给管理群的地址。Tailscale IP 不随局域网换段变（CLAUDE.md 3.1），
 # 端口跟面板一致（10001）。可用 config.json 的 panel_url 覆盖。
@@ -199,7 +204,87 @@ def _op_invite_delete(p):
     return f"拉群关键词「{kw}」已删除"
 
 
+# ---------------------------------------------------------------- 体检任务
+
+# ★ 为什么体检指令要搬到面板（2026-08-15）：
+# 这些指令要动微信 UI，必须在 bot 进程内跑，所以当初只能"人在管理群里发一句话"。
+# 但主菜单状态会把文本吃掉（发「检查群组 全部」回你"请输入有效的选项"），
+# 而且指令串全靠手打、错一个字或多个 BOM 就静默不认。
+# task_runner 本来就是为"不用真有人在群里发"造的 —— 面板按钮写请求文件，
+# bot 每 10 秒取一次，结果写回结果文件，这里只管下发和回读。
+TASK_COMMANDS = [
+    {"id": "check_groups", "cmd": "检查群组 全部", "label": "检查群组",
+     "hint": "逐个切过去确认群还在不在，顺便学微信里的真实显示名（转发靠它寻址）",
+     "cost": "87 个群，约 5–10 分钟", "danger": False},
+    {"id": "audit_remarks", "cmd": "核对备注 全部", "label": "核对备注",
+     "hint": "查🐶备注有没有打到别的群头上 —— 这类错「检查群组」查不出来",
+     "cost": "约 5–10 分钟", "danger": False},
+    {"id": "fix_addressing", "cmd": "查寻址 全部", "label": "查寻址",
+     "hint": "用微信搜索抄回每个群的实际显示名，比逐个切窗口快",
+     "cost": "约 10 分钟", "danger": False},
+    {"id": "scan_groups", "cmd": "扫群", "label": "扫群",
+     "hint": "微信里到底有多少个群（只读，不改任何东西）",
+     "cost": "十几秒", "danger": False},
+    {"id": "find_unmarked", "cmd": "查新群", "label": "查新群",
+     "hint": "挑出没打🐶标签的群 —— 新建的群用它",
+     "cost": "十几秒", "danger": False},
+    {"id": "fix_remarks_preview", "cmd": "修备注 预览", "label": "修备注（预览）",
+     "hint": "只列出要改什么，不动微信。不可逆操作永远先跑预览",
+     "cost": "约 5 分钟", "danger": False},
+    {"id": "fix_remarks_apply", "cmd": "修备注 全部", "label": "修备注（真改）",
+     "hint": "把每个群的备注改成「群名🐶」。★ 备注不可逆：打错只能人在微信里手动清",
+     "cost": "约 10 分钟", "danger": True},
+]
+
+_TASK_BY_ID = {t["id"]: t for t in TASK_COMMANDS}
+
+
+def task_catalog() -> list:
+    """给前端渲染按钮用（不含真实指令串——指令串在服务端查表，前端拼不出花样）。"""
+    return [{k: v for k, v in t.items() if k != "cmd"} for t in TASK_COMMANDS]
+
+
+def run_task(task_id: str) -> str:
+    """把一条体检指令下发给 bot 进程。"""
+    task = _TASK_BY_ID.get(str(task_id or ""))
+    if task is None:
+        raise ValueError(f"未知的体检指令：{task_id}")
+    if os.path.exists(task_runner.REQUEST_PATH):
+        raise ValueError("上一条指令还没被机器人取走（每 10 秒取一次），稍等几秒再点。")
+    status = task_status()
+    if status["running"]:
+        raise ValueError("已经有一个任务在跑了，等它结束再点 —— 同时跑两个会互相抢微信窗口。")
+    os.makedirs(task_runner.DATA_DIR, exist_ok=True)
+    # newline="" + utf-8 无 BOM：BOM 会让指令头上多个不可见字符，bot 那边死活匹配不上
+    with open(task_runner.REQUEST_PATH, "w", encoding="utf-8", newline="") as f:
+        f.write(task["cmd"])
+    return f"已下发「{task['cmd']}」，机器人 10 秒内开始，结果实时显示在下面。"
+
+
+def task_status() -> dict:
+    """当前体检任务的状态 + 结果全文（面板轮询这个）。"""
+    pending = os.path.exists(task_runner.REQUEST_PATH)
+    text, updated = "", None
+    if os.path.exists(task_runner.RESULT_PATH):
+        try:
+            with open(task_runner.RESULT_PATH, "r", encoding="utf-8") as f:
+                text = f.read()
+            updated = datetime.fromtimestamp(
+                os.path.getmtime(task_runner.RESULT_PATH)).strftime("%Y-%m-%d %H:%M:%S")
+        except OSError as e:
+            text = f"（读结果文件失败：{e}）"
+    # 结束行由 task_runner._run 的 finally 写，有它才算跑完
+    running = bool(text) and "=== 任务结束" not in text
+    return {"pending": pending, "running": running, "result": text,
+            "updated_at": updated, "catalog": task_catalog()}
+
+
+def _op_task_run(p):
+    return run_task(_s(p, "task"))
+
+
 _OPS = {
+    "task.run": _op_task_run,
     "group.save": _op_group_save,
     "group.add": _op_group_add,
     "group.delete": _op_group_delete,

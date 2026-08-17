@@ -10,6 +10,9 @@ import tempfile
 import time
 import unittest
 
+# 单测的日志不许写进 panel_logs（生产日志）——必须在导入插件【之前】设。
+os.environ.setdefault("NCC_LOG_SILENT", "1")
+
 from plugins.ncc_community import registry, forward, discovery, remark, notion_sync, store
 from plugins.ncc_community import handle_friend_message
 
@@ -80,7 +83,9 @@ class FakeMsg:
 
 
 ZERO_DELAY = {"group_min": 0, "group_max": 0, "msg_min": 0, "msg_max": 0,
-              "batch_every": 10, "batch_min": 0, "batch_max": 0, "max_retries": 1}
+              "batch_every": 10, "batch_min": 0, "batch_max": 0, "max_retries": 1,
+              # 搜不到时的同串重试：测试里不真等，但次数保留（要测到重试行为本身）
+              "miss_retries": 2, "miss_gap": 0}
 
 
 def _prompt():
@@ -182,6 +187,8 @@ class EngineTest(unittest.TestCase):
         store._cache_mtime = None
         forward._STATE.clear()
         forward.GATHER_SETTLE = 0    # 测试里不等 UI
+        forward.CHATINFO_SETTLE = 0  # 同上：重读窗口名不用真等
+        forward.SEARCH_RETRY_GAP = 0  # 空结果重搜的间隔，测试里不真等
         discovery._SEEN.clear()
         self.bot = FakeBot()
         self.admin = FakeChat(ADMIN)
@@ -690,6 +697,154 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(registry.load()["invite_keywords"], {"大理": "群A"})
         registry.upsert_from_notion({}, {})
         self.assertEqual(registry.load()["invite_keywords"], {"大理": "群A"})
+
+    # ---------- 寻址串会误伤别的群（2026-08-14「NCC的朋友们」发进 26群 那次）----------
+
+    @staticmethod
+    def _family(hit_for_parent="NCC的朋友们"):
+        """一个"祖宗群 + 带编号子群"的登记表：祖宗群的名字是所有子群名字的前缀。"""
+        return {"groups": {
+            "NCC的朋友们": {"name": "NCC的朋友们", "remark": "NCC的朋友们🐶",
+                            "remark_applied": True, "allow_forward": True,
+                            "groupings": ["朋友X群"], "addressing_hit": hit_for_parent},
+            "NCC的朋友们26群": {"name": "NCC的朋友们26群", "remark": "NCC的朋友们26群🐶",
+                              "remark_applied": True, "allow_forward": True,
+                              "groupings": ["朋友X群"], "addressing_hit": "NCC的朋友们26群🐶"},
+        }}
+
+    def test_unsafe_candidate_detects_substring(self):
+        displays = registry.display_names(self._family())
+        # 裸名是别人显示名的前缀 → 危险
+        self.assertEqual(
+            registry.unsafe_candidate("NCC的朋友们", "NCC的朋友们", displays), "NCC的朋友们26群")
+        # 带🐶的串谁也不包含它（🐶后面接的是"2"不是"🐶"）→ 安全
+        self.assertEqual(
+            registry.unsafe_candidate("NCC的朋友们🐶", "NCC的朋友们", displays), "")
+        # 完全相等不算歧义（那是同一个群存了两条，交给去重）
+        self.assertEqual(
+            registry.unsafe_candidate("NCC的朋友们26群🐶", "别名", displays), "")
+
+    def test_forward_specs_blocks_substring_addressing(self):
+        # ★ 微信搜索是包含匹配：拿裸名去搜会同时命中 26群，机器人只拿列表第一个，
+        # 于是这条内容【发进别的群】—— 比漏发严重。所以整个候选表被摘光，不许发。
+        specs = {s["name"]: s for s in registry.forward_specs(self._family())}
+        self.assertEqual(specs["NCC的朋友们"]["cands"], [])
+        self.assertEqual(specs["NCC的朋友们"]["blocked"], [("NCC的朋友们", "NCC的朋友们26群")])
+        # 别的群不受影响
+        self.assertEqual(specs["NCC的朋友们26群"]["cands"], ["NCC的朋友们26群🐶"])
+
+    def test_forward_specs_recovers_after_clearing_bare_hit(self):
+        # 清掉裸名 hit 后回落去猜：带🐶的排首位且安全，裸名作为次选被摘掉
+        specs = {s["name"]: s for s in registry.forward_specs(self._family(hit_for_parent=None))}
+        self.assertEqual(specs["NCC的朋友们"]["cands"], ["NCC的朋友们🐶"])
+        self.assertEqual(specs["NCC的朋友们"]["blocked"], [("NCC的朋友们", "NCC的朋友们26群")])
+
+    def test_normalize_targets_never_resurrects_blocked_string(self):
+        # 候选被摘光时【不能】回落成群名 —— 回落等于把刚摘掉的危险串又捡回来
+        out = forward._normalize_targets([{"name": "NCC的朋友们", "cands": [],
+                                           "blocked": [("NCC的朋友们", "NCC的朋友们26群")]}])
+        self.assertEqual(out[0]["cands"], [])
+        ok, unsafe = forward._split_addressable(out)
+        self.assertEqual(ok, [])
+        self.assertEqual([s["name"] for s in unsafe], ["NCC的朋友们"])
+        # 汇报要指名道姓，不能静默跳过（静默跳过=某个群从此再没人发现它收不到）
+        text = " ".join(forward._unsafe_lines(unsafe))
+        self.assertIn("NCC的朋友们", text)
+        self.assertIn("NCC的朋友们26群", text)
+
+    # ---------- ChatInfo 读回上一个群（2026-08-14「20 个好群被判不可达」那次）----------
+
+    def test_read_chat_name_retries_stale_cache(self):
+        """★ 回归：ChatWith 之后窗口没结算，第一次 ChatInfo 读回的是【上一个群】。
+        8-14「检查群组」87 个群里 20 个中招，被判"不可达"还建议人去删掉。
+        重读一次拿到正确的名字就该收工，不能拿第一次的结果下结论。"""
+        class WX:
+            def __init__(self): self.n = 0
+            def ChatInfo(self):
+                self.n += 1
+                # 第 1 次是缓存里的上一个群，第 2 次才是刚切过去的这个
+                return {"chat_name": "NCCer在杭州🐶" if self.n == 1 else "NCC的朋友们20群🐶"}
+        wx = WX()
+        self.assertEqual(forward._read_chat_name(wx, "NCC的朋友们20群"), "NCC的朋友们20群🐶")
+        self.assertEqual(wx.n, 2)          # 对上了就停，不白读第三次
+
+    def test_read_chat_name_reports_real_mismatch(self):
+        # 重试到底还是别人 → 这才算真切歪了，如实返回给调用方判失败
+        class WX:
+            def ChatInfo(self): return {"chat_name": "完全不相干的群"}
+        self.assertEqual(forward._read_chat_name(WX(), "NCC的朋友们20群"), "完全不相干的群")
+
+    def test_read_chat_name_survives_chatinfo_exception(self):
+        class WX:
+            def ChatInfo(self): raise RuntimeError("UIA 抽风")
+        self.assertEqual(forward._read_chat_name(WX(), "甲群"), "")
+
+    def test_flog_does_not_write_production_file_in_tests(self):
+        """★ 群发专用日志同样不许被单测写脏（2026-08-15）：
+        主日志刚堵上这个洞，flog 又新开了一个落盘点，差点重蹈覆辙。"""
+        from plugins.ncc_community import common
+        self.assertEqual(os.environ.get("NCC_LOG_SILENT"), "1")
+        before = os.path.exists(common.FORWARD_LOG)
+        common.flog("单测写的，不该落盘")
+        self.assertEqual(os.path.exists(common.FORWARD_LOG), before)
+
+    def test_classify_maps_errors_to_greppable_tags(self):
+        # 事后统计"到底哪类挂的"全靠这几个标签，别改字面量
+        self.assertEqual(forward._classify(forward.STUCK_MARK + "x"), "STUCK")
+        self.assertEqual(forward._classify("视图中定位不到该消息"), "NOLOC")
+        self.assertEqual(forward._classify(forward.TIMEOUT_MARK + "：「A」搜不到"), "MISS")
+        self.assertEqual(forward._classify("天知道发生了什么"), "ERR")
+
+
+    # ---------- 搜不到要用同一个串重试（2026-08-15 实测微信搜索有 ~25% 抖动）----------
+
+    def test_forward_retries_same_string_on_miss(self):
+        """★ 回归：实测「数游大会交流群3️⃣🐶」连打 8 轮，2 轮返回 0 项/11 项且未命中
+        （耗时都 >1s，正常 520~640ms）—— 微信搜索在慢路径上会吐中间态。
+        原来搜不到就直接判这个群失败、零重试，抖一下就漏一个群。"""
+        seed_registry()
+        m = FakeMsg("素材", mtype="text")
+
+        # 前两次搜不到，第三次成功 —— 模拟抖动
+        calls = {"n": 0}
+        real_forward = m.forward
+
+        def flaky(target, **kw):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return FakeWxResponse(False, "无结果")
+            return real_forward(target, **kw)
+        m.forward = flaky
+
+        build_timeline(self.bot, m)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": [{"name": "大理A群", "cands": ["大理A群🐶"]}],
+                "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["ok"], 1)            # 重试之后成功了
+        self.assertEqual(calls["n"], 3)            # 确实试了 3 次（1 + 2 次重试）
+        self.assertEqual(stat["gone"], [])         # 不该被记成"群没了"
+
+    def test_forward_gives_up_after_miss_retries(self):
+        # 重试用尽仍搜不到 → 如实判失败，别无限试下去
+        seed_registry()
+        m = FakeMsg("素材", mtype="text")
+        m.gone_set = {"大理A群🐶"}
+        build_timeline(self.bot, m)
+        task = {"bot": self.bot, "admin": ADMIN, "operator": "大松",
+                "targets": [{"name": "大理A群", "cands": ["大理A群🐶"]}],
+                "label": "x", "delay": dict(ZERO_DELAY)}
+        stat = forward._deliver(task)
+        self.assertEqual(stat["ok"], 0)
+        # 只有一个群且整条都没成功 → 走"别冤枉群"的保护，不标记不可达
+        self.assertEqual(stat["gone"], [])
+
+    def test_classify_labels_are_greppable(self):
+        # 失败分类要能 grep：事后统计"到底哪类挂的"全靠它
+        self.assertEqual(forward._classify(forward.STUCK_MARK + "x"), "STUCK")
+        self.assertEqual(forward._classify("视图中定位不到该消息"), "NOLOC")
+        self.assertEqual(forward._classify(forward.TIMEOUT_MARK + "：「群」搜不到"), "MISS")
+        self.assertEqual(forward._classify("什么鬼错误"), "ERR")
 
 
 if __name__ == "__main__":

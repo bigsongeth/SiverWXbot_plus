@@ -50,6 +50,15 @@
     .acts { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; align-items:center; }
     .sep { border-top:1px dashed var(--line); margin:12px 0 0; padding-top:10px; }
     .empty { color:var(--muted); font-size:13px; padding:8px 2px; }
+    .taskgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(268px,1fr)); gap:10px; margin-bottom:14px; }
+    .taskcard { border:1px solid var(--line); border-radius:10px; padding:12px 13px; display:flex; flex-direction:column; gap:7px; }
+    .taskcard .t { font-weight:600; font-size:14px; }
+    .taskcard .h { color:var(--muted); font-size:12.5px; line-height:1.55; flex:1; }
+    .taskcard .c { color:var(--warn); font-size:12px; }
+    .result { background:#0f172a; color:#e2e8f0; border-radius:10px; padding:13px 15px; font-family:ui-monospace,Menlo,Consolas,monospace;
+              font-size:12.5px; line-height:1.65; white-space:pre-wrap; word-break:break-all; max-height:56vh; overflow:auto; }
+    .live { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--brand); margin-right:6px; animation:blink 1s infinite; }
+    @keyframes blink { 50% { opacity:.25; } }
     .mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12px; color:var(--muted); }
     #msg { position:sticky; bottom:0; padding:12px 0 2px; font-size:13.5px; background:linear-gradient(transparent,var(--bg) 40%); }
     .ok { color:var(--brand-d); } .err { color:var(--err); }
@@ -70,6 +79,7 @@
       <div class="tab" data-tab="groupings">分组管理</div>
       <div class="tab" data-tab="invites">拉群关键词</div>
       <div class="tab" data-tab="pending">待归类</div>
+      <div class="tab" data-tab="health">体检</div>
     </div>
 
     <div id="pane"></div>
@@ -115,7 +125,8 @@ function render() {
     stat('待归类', st.pending) + stat('分组', st.groupings) + stat('拉群关键词', st.keywords_on + '/' + st.keywords) +
     '<div class="stat" style="color:var(--muted)">最后改动：' + esc(S.updated_at || '—') + '</div>';
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.tab === TAB));
-  ({groups: renderGroups, groupings: renderGroupings, invites: renderInvites, pending: renderPending})[TAB]();
+  ({groups: renderGroups, groupings: renderGroupings, invites: renderInvites,
+    pending: renderPending, health: renderHealth})[TAB]();
 }
 const stat = (k, v) => '<div class="stat">' + k + ' <b>' + esc(v) + '</b></div>';
 
@@ -280,7 +291,73 @@ function renderPending() {
   bindRows(S.pending, 'p');
 }
 
-document.querySelectorAll('.tab').forEach(t => t.onclick = () => { TAB = t.dataset.tab; OPEN = null; render(); });
+
+// ---------------------------------------------------------------- 体检
+let TASK = null, TIMER = null;
+
+async function loadTask(quiet) {
+  try {
+    const r = await fetch('/ncc_community/task');
+    const d = await r.json();
+    if (d.status !== 'success') { if (!quiet) say('读取体检状态失败：' + (d.message || ''), 'err'); return; }
+    TASK = d.task;
+    if (TAB === 'health') renderHealth();
+  } catch (e) { if (!quiet) say('✗ ' + e.message, 'err'); }
+}
+
+// 跑着的时候 3 秒一刷，闲着 15 秒一刷 —— 长任务要能看到实时进度，
+// 但没人在跑时别拿轮询去烦一个正在操作微信 UI 的进程。
+function pollTask() {
+  clearTimeout(TIMER);
+  if (TAB !== 'health') return;
+  const gap = (TASK && (TASK.running || TASK.pending)) ? 3000 : 15000;
+  TIMER = setTimeout(async () => { await loadTask(true); pollTask(); }, gap);
+}
+
+async function runTask(id, label, danger) {
+  const warn = danger
+    ? '「' + label + '」会真的去改微信里的群备注，而且【不可逆】：打错只能人到微信里一个个手动清。\n\n确认要跑吗？'
+    : '要执行「' + label + '」吗？执行期间机器人会占用微信主窗口，正常回消息会暂停。';
+  if (!confirm(warn)) return;
+  await act('task.run', {task: id});
+  await loadTask(true); pollTask();
+}
+
+function renderHealth() {
+  const t = TASK || {catalog: [], result: '', running: false, pending: false};
+  let h = '<div class="card"><h2>体检</h2>' +
+    '<p class="hint">这些操作要动微信界面，所以由机器人进程去跑：点一下把指令排进队列，机器人 10 秒内开始，' +
+    '结果实时显示在下面。<b>执行期间机器人不回消息</b>，长任务请挑没人聊天的时段。</p>';
+  h += '<div class="taskgrid">' + (t.catalog || []).map(c =>
+      '<div class="taskcard">' +
+        '<div class="t">' + esc(c.label) + '</div>' +
+        '<div class="h">' + esc(c.hint) + '</div>' +
+        '<div class="c">⏱ ' + esc(c.cost) + '</div>' +
+        '<button class="' + (c.danger ? 'danger' : '') + '" data-task="' + esc(c.id) +
+          '" data-label="' + esc(c.label) + '" data-danger="' + (c.danger ? '1' : '') + '"' +
+          ((t.running || t.pending) ? ' disabled' : '') + '>' +
+          (c.danger ? '⚠ 执行' : '执行') + '</button>' +
+      '</div>').join('') + '</div>';
+
+  let head;
+  if (t.pending) head = '<span class="live"></span>已下发，等机器人取走（每 10 秒取一次）…';
+  else if (t.running) head = '<span class="live"></span>正在执行…（' + esc(t.updated_at || '') + ' 更新）';
+  else if (t.result) head = '已完成 · ' + esc(t.updated_at || '');
+  else head = '还没跑过体检';
+  h += '<div style="display:flex;justify-content:space-between;align-items:center;margin:2px 0 8px;">' +
+       '<b style="font-size:13.5px;">执行结果</b><span class="mono">' + head + '</span></div>';
+  h += '<div class="result">' + (t.result ? esc(t.result) : '（点上面的按钮开始）') + '</div>';
+
+  $('pane').innerHTML = h + '</div>';
+  $('pane').querySelectorAll('button[data-task]').forEach(b =>
+    b.onclick = () => runTask(b.dataset.task, b.dataset.label, !!b.dataset.danger));
+}
+
+document.querySelectorAll('.tab').forEach(t => t.onclick = async () => {
+  TAB = t.dataset.tab; OPEN = null;
+  if (TAB === 'health') { await loadTask(); pollTask(); } else { clearTimeout(TIMER); }
+  render();
+});
 load();
 </script>
 </body>

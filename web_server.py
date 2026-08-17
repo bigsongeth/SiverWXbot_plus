@@ -1672,6 +1672,21 @@ def ncc_community_state():
         return jsonify({'status': 'error', 'message': str(e)})
 
 
+@app.route('/ncc_community/task')
+@login_required
+def ncc_community_task():
+    """体检任务状态 + 结果全文（面板每 3 秒轮询一次）。
+
+    单独一条路由而不是塞进 /state：体检结果可能有几千字，
+    页面平时刷群列表不该顺带把它拖下来。"""
+    try:
+        from plugins.ncc_community import panel
+        return jsonify({'status': 'success', 'task': panel.task_status()})
+    except Exception as e:
+        log('ERROR', f'读取 NCC 体检任务状态失败: {e}')
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
 @app.route('/ncc_community/action', methods=['POST'])
 @login_required
 def ncc_community_action():

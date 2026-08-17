@@ -192,6 +192,42 @@ def address_candidates(group: dict) -> list:
     return out
 
 
+def display_names(data: dict) -> dict:
+    """{群名: 它在微信里【最可能】显示的那个串}，即寻址首选候选。
+
+    只取首选而不是全部候选：候选表里的次选往往是"猜的"（比如没打上的备注），
+    拿它去当"别的群长什么样"会把好串误判成危险串。"""
+    out = {}
+    for name, g in (data.get("groups") or {}).items():
+        cands = address_candidates(g)
+        if cands:
+            out[str(name)] = cands[0]
+    return out
+
+
+def unsafe_candidate(cand: str, name: str, displays: dict) -> str:
+    """这个寻址串会不会误伤别的群？会就返回被误伤的那个群名，不会返回 ""。
+
+    ★ 微信搜索是【包含】匹配（2026-08-14 实测钉死）：「NCC的朋友们」这个群的
+    addressing_hit 存成了不带🐶的裸名，而它是另外 20 个群显示名的前缀
+    （「NCC的朋友们26群🐶」…），搜出来 21 条，机器人只能拿列表里的第一个 ——
+    「检查群组」实际切到的就是 26群。
+    这类串的风险不是"发不出去"，是【发进别的群】，比漏发严重得多，
+    所以一律不许用来寻址，交给人确认。
+
+    判据是"真子串"：完全相等不算（那是同一个群在登记表里存了两条，
+    由 forward_specs 的去重处理，不是寻址歧义）。"""
+    cand = str(cand or "")
+    if not cand:
+        return ""
+    for other, shown in (displays or {}).items():
+        if other == name or not shown:
+            continue
+        if cand != shown and cand in shown:
+            return other
+    return ""
+
+
 def match_key(group: dict):
     """返回该群在微信里可能显示的名字集合（用于把 chat.who 匹配到登记表）。"""
     keys = set()
@@ -287,18 +323,32 @@ def forward_specs(data: dict, grouping_name: str = None):
 
     与 targets_for_grouping/all_forward_targets 的区别是【带候选】：单一寻址串
     一旦不对（比如备注其实没打上），转发就会在"发送给"对话框里搜不到而卡死，
-    详见 address_candidates 的注释。分组名传 None 表示"所有群聊"。"""
+    详见 address_candidates 的注释。分组名传 None 表示"所有群聊"。
+
+    ★ 会误伤别的群的候选串在这里就被摘掉（见 unsafe_candidate），摘掉的记在
+    spec["blocked"] = [(串, 会命中的群)] 里。候选全被摘光的群 cands 为空 ——
+    调用方必须【跳过并汇报】，绝不能回落到那个危险串去发（发错群比漏发严重）。"""
+    displays = display_names(data)
     out, seen = [], set()
     for name, g in data.get("groups", {}).items():
         if not g.get("allow_forward", False):
             continue
         if grouping_name is not None and grouping_name not in g.get("groupings", []):
             continue
-        cands = address_candidates(g)
-        if not cands or cands[0] in seen:
+        # 去重键用"首选显示串"而不是 cands[0]：候选被摘光时 cands 为空，
+        # 但同一个群在登记表里存两条（实测有）仍要靠它去掉一条。
+        key = displays.get(name)
+        if not key or key in seen:
             continue
-        seen.add(cands[0])
-        out.append({"name": name, "cands": cands})
+        seen.add(key)
+        cands, blocked = [], []
+        for c in address_candidates(g):
+            victim = unsafe_candidate(c, name, displays)
+            if victim:
+                blocked.append((c, victim))
+            else:
+                cands.append(c)
+        out.append({"name": name, "cands": cands, "blocked": blocked})
     return out
 
 

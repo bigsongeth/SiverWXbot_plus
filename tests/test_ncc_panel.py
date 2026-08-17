@@ -12,7 +12,10 @@ import shutil
 import tempfile
 import unittest
 
-from plugins.ncc_community import registry, store, panel, migrate_notion_off
+# 单测的日志不许写进 panel_logs（生产日志）——必须在导入插件【之前】设。
+os.environ.setdefault("NCC_LOG_SILENT", "1")
+
+from plugins.ncc_community import registry, store, panel, migrate_notion_off, task_runner
 
 
 class PanelTestBase(unittest.TestCase):
@@ -26,8 +29,15 @@ class PanelTestBase(unittest.TestCase):
         store.CONFIG_PATH = os.path.join(self.tmp, "config.json")
         store._cache = None
         store._cache_mtime = None
+        # 体检任务的请求/结果文件也指到临时目录，别碰生产机上的真文件
+        self._t = (task_runner.DATA_DIR, task_runner.REQUEST_PATH, task_runner.RESULT_PATH)
+        task_runner.DATA_DIR = self.tmp
+        task_runner.REQUEST_PATH = os.path.join(self.tmp, "task_request.txt")
+        task_runner.RESULT_PATH = os.path.join(self.tmp, "task_result.txt")
 
     def tearDown(self):
+        (task_runner.DATA_DIR, task_runner.REQUEST_PATH,
+         task_runner.RESULT_PATH) = self._t
         registry.DATA_DIR, registry.REGISTRY_PATH = self._r
         store.DATA_DIR, store.CONFIG_PATH = self._s
         store._cache = None
@@ -391,6 +401,60 @@ class MigrationTests(PanelTestBase):
         store.save(cfg)
         migrate_notion_off.run()
         self.assertEqual(registry.invite_map(registry.load())["大理"], "大理B群")
+
+
+class HealthTaskTests(PanelTestBase):
+    """体检指令搬到面板（2026-08-15）：按钮 → 请求文件 → bot 取走 → 结果回读。"""
+
+    def test_catalog_hides_real_command_string(self):
+        # 前端只拿到 id，指令串在服务端查表 —— 前端拼不出没授权的指令
+        cat = panel.task_catalog()
+        self.assertTrue(cat)
+        for c in cat:
+            self.assertNotIn("cmd", c)
+            self.assertTrue(c["id"] and c["label"] and c["hint"])
+        self.assertTrue(any(c["danger"] for c in cat))      # 修备注要标危险
+
+    def test_run_task_writes_command_without_bom(self):
+        # ★ BOM 是实测踩过的坑：PowerShell 的 Set-Content -Encoding UTF8 带 BOM，
+        # bot 那边读成「\ufeff检查群组 全部」，指令表怎么也匹配不上，还看不出差别
+        msg = panel.run_task("check_groups")
+        self.assertIn("检查群组 全部", msg)
+        raw = open(task_runner.REQUEST_PATH, "rb").read()
+        self.assertEqual(raw, "检查群组 全部".encode("utf-8"))
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+
+    def test_run_task_rejects_unknown_id(self):
+        with self.assertRaises(ValueError):
+            panel.run_task("rm -rf /")
+        self.assertFalse(os.path.exists(task_runner.REQUEST_PATH))
+
+    def test_run_task_rejects_while_previous_pending(self):
+        panel.run_task("scan_groups")
+        with self.assertRaises(ValueError):          # 上一条还没被取走
+            panel.run_task("check_groups")
+
+    def test_run_task_rejects_while_running(self):
+        # 结果文件有内容、又没有结束行 = 正在跑。两个任务同时跑会互相抢微信窗口。
+        open(task_runner.RESULT_PATH, "w", encoding="utf-8").write("=== 后台任务「扫群」开始 ===\n")
+        with self.assertRaises(ValueError):
+            panel.run_task("check_groups")
+
+    def test_task_status_running_then_done(self):
+        self.assertFalse(panel.task_status()["running"])       # 没结果文件 = 没在跑
+        with open(task_runner.RESULT_PATH, "w", encoding="utf-8") as f:
+            f.write("=== 后台任务「检查群组 全部」开始 ===\n\n[18:07] 开始检查 87 个群…\n")
+        st = panel.task_status()
+        self.assertTrue(st["running"])
+        self.assertIn("开始检查 87 个群", st["result"])
+        with open(task_runner.RESULT_PATH, "a", encoding="utf-8") as f:
+            f.write("\n=== 任务结束，耗时 412.0 秒 ===\n")
+        self.assertFalse(panel.task_status()["running"])
+
+    def test_apply_routes_task_run(self):
+        msg = panel.apply("task.run", {"task": "scan_groups"})
+        self.assertIn("扫群", msg)
+        self.assertEqual(open(task_runner.REQUEST_PATH, encoding="utf-8").read(), "扫群")
 
 
 if __name__ == "__main__":

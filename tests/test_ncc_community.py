@@ -9,6 +9,9 @@ import tempfile
 import time
 import unittest
 
+# 单测的日志不许写进 panel_logs（生产日志）——必须在导入插件【之前】设。
+os.environ.setdefault("NCC_LOG_SILENT", "1")
+
 from plugins.ncc_community import (store, forward, invite, registry, welcome, notion_sync,
                                    audit, remark, task_runner)
 from plugins.ncc_community import handle_friend_message, handle_self_message, handle_system_message

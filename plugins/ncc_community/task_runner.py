@@ -73,7 +73,10 @@ def _read_request():
     text, age = "", 0.0
     try:
         age = time.time() - os.path.getmtime(REQUEST_PATH)
-        with open(REQUEST_PATH, "r", encoding="utf-8") as f:
+        # utf-8-sig：Windows PowerShell 的 `Set-Content -Encoding UTF8` 会写 BOM，
+        # 读成普通 utf-8 时指令头上多个不可见的 ﻿，指令表怎么也匹配不上
+        # （2026-08-15 实测：回「不认识的指令：检查群组 全部」，肉眼完全看不出差别）。
+        with open(REQUEST_PATH, "r", encoding="utf-8-sig") as f:
             text = f.read().strip()
     except OSError as e:
         log("WARNING", f"读后台任务请求失败：{e}")

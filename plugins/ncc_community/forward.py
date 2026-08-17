@@ -28,7 +28,7 @@ import threading
 from queue import Queue
 
 from . import store, registry, audit, panel
-from .common import REPLY_PREFIX, is_bot_reply, log, reply
+from .common import REPLY_PREFIX, flog, is_bot_reply, log, reply
 
 # ---- 每个操作者的状态机（对齐旧 OperatorState）----
 S_MAIN = "main"            # 主菜单
@@ -60,6 +60,12 @@ DELAY = {  # 防风控/防卡死延迟（可被 config.forward.delay 覆盖）
     # 连续多少个群一个都搜不到就中止整轮：寻址串要是普遍不对（比如登记表里全是微信里
     # 不存在的备注），越往下跑越白跑，早点收手叫人来查
     "give_up_after_misses": 3,
+    # ★ 搜不到时用【同一个串】再试几次（2026-08-15 加）。实测微信搜索有 ~25% 的抖动：
+    # 「数游大会交流群3️⃣🐶」8 轮里有 2 轮返回 0 项/11 项且未命中，耗时都 >1s（正常
+    # 520~640ms），也就是读到了结果还没收敛的中间态。在此之前搜不到就直接判这个群
+    # 失败、零重试，抖一下就漏一个群。代价：真的没了的群要多等 2×call_timeout。
+    "miss_retries": 2,
+    "miss_gap": 1.5,
 }
 
 # 收集时忽略的消息类型：只跳真噪音。视频号是 'other'，必须收集。
@@ -73,12 +79,13 @@ MAIN_MENU = (
     "3 👈 待归类新群\n"
     "4 👈 迎新 / 拉群设置\n"
     "0 👈 退出管理模式\n"
-    "\n体检指令（直接发，要动微信 UI 所以留在这里）：\n"
-    "  检查群组 全部 —— 群还在不在（可达性）\n"
-    "  核对备注 全部 —— 🐶备注有没有打错群\n"
-    "  扫群 —— 微信里到底有多少个群\n"
-    "  查新群 —— 挑出没打🐶标签的群（新建的群用它）\n"
-    "  修备注 预览 / 修备注 全部 —— 把每个群的备注修成「群名🐶」"
+    # ★ 体检指令已搬到面板「体检」页签（2026-08-15）。
+    # 原来这里列着一串要手打的中文指令，问题有三：菜单状态会把文本吃掉（发了回你
+    # "请输入有效的选项"）、指令串错一个字就静默不认、跑起来几分钟没有任何进度。
+    # 面板上是按钮 + 实时结果 + 危险操作二次确认，没有一样是聊天框给得了的。
+    "\n体检（检查群组 / 核对备注 / 扫群 / 查新群 / 修备注）已挪到面板，\n"
+    "回复 2 拿地址，进去点「体检」页签，有按钮和实时进度。\n"
+    "老指令仍然认，手打也能用。"
 )
 
 COLLECT_PROMPT = (
@@ -326,6 +333,8 @@ def _forward_one_shot(cache_box, bot, source, sig, occ, spec, d) -> tuple[bool, 
     cands = spec.get("cands") or [spec.get("name")]
     timeout = float(d.get("call_timeout", 12))
     locate_timeout = float(d.get("locate_timeout", 60))
+    miss_retries = int(d.get("miss_retries", 2))      # 搜不到时，同一个串再试几次
+    miss_gap = float(d.get("miss_gap", 1.5))          # 两次之间等多久（让搜索结果收敛）
     for _ in range(int(d["max_retries"])):
         with MAIN_WINDOW_LOCK:
             if cache_box[0] is None:
@@ -342,16 +351,35 @@ def _forward_one_shot(cache_box, bot, source, sig, occ, spec, d) -> tuple[bool, 
             else:
                 for cand in cands:
                     try:
-                        done, _, _ = _ui_call(cache_box[0].roll_into_view, 15, "roll")
-                        if not done:
-                            return False, f"{STUCK_MARK}（滚动到消息时卡死）", ""
-                        ok, err = _forward_call(cache_box[0], cand, timeout)
-                        if ok:
-                            return True, "", cand
-                        last = err
-                        if STUCK_MARK in err:
-                            return False, err, ""     # 锁没救回来，别再试了
-                        continue                      # 搜不到/无结果 → 换下一个候选串
+                        # ★★ 同一个串要重试（2026-08-15 实测加的）：
+                        # 「数游大会交流群3️⃣🐶」连打 8 轮主窗口搜索，5 轮正常返回 2 项，
+                        # 第 6 轮返回 11 项且未命中、第 7 轮返回 0 项 —— 出错的两轮耗时
+                        # 都 >1000ms，正常轮次 520~640ms。也就是说微信搜索在慢路径上
+                        # 会吐【中间态】（结果正在展开 / 正被清空重建），25% 的抖动率。
+                        # 而这里原来是"搜不到就换下一个候选串"，候选只有一个实测串时
+                        # 等于【零重试】—— 抖一下就漏一个群，86 个群的群发会稳定漏掉
+                        # 一批，日志还只报 MISS，看着像"这个群没了"。
+                        # 只对"搜不到"重试：卡死要立刻收手，其它错重试也没意义。
+                        for att in range(miss_retries + 1):
+                            done, _, _ = _ui_call(cache_box[0].roll_into_view, 15, "roll")
+                            if not done:
+                                return False, f"{STUCK_MARK}（滚动到消息时卡死）", ""
+                            ok, err = _forward_call(cache_box[0], cand, timeout)
+                            if ok:
+                                if att:
+                                    flog(f"「{spec['name']}」第 {att + 1} 次尝试才命中"
+                                         f"（前 {att} 次搜不到，多半是搜索抖动）")
+                                return True, "", cand
+                            last = err
+                            if STUCK_MARK in err:
+                                return False, err, ""     # 锁没救回来，别再试了
+                            if not (TIMEOUT_MARK in err or _is_gone(err)):
+                                break                     # 不是"搜不到"，重试无意义
+                            if att < miss_retries:
+                                flog(f"「{spec['name']}」搜不到（第 {att + 1} 次），"
+                                     f"等 {miss_gap}s 用同一个串重试", "WARNING")
+                                time.sleep(miss_gap)
+                        continue                      # 这个候选彻底不行 → 换下一个
                     except Exception as e:
                         last = str(e)
                         if _is_stale(last):
@@ -364,7 +392,18 @@ def _forward_one_shot(cache_box, bot, source, sig, occ, spec, d) -> tuple[bool, 
     return False, last, ""
 
 
-def _forward_located_message(bot, source, sig, occ, targets, d):
+def _classify(err: str) -> str:
+    """把失败归成可 grep 的固定标签。事后统计"到底是哪类挂的"全靠它。"""
+    if STUCK_MARK in err:
+        return "STUCK"          # 全局 UI 锁没救回来，整轮完蛋
+    if "定位不到该消息" in err:
+        return "NOLOC"          # 源消息没定位到，不是群的问题
+    if TIMEOUT_MARK in err or _is_gone(err):
+        return "MISS"           # "发送给"对话框里搜不到这个群
+    return "ERR"                # 说不清的，人来看
+
+
+def _forward_located_message(bot, source, sig, occ, targets, d, msg_no=1, msg_total=1):
     """把一条消息（按签名+序号定位）【一个群一个群】转发。无结果的群记下来，其余照发。
     每 batch_every 个群额外歇一会儿。返回 (成功群数, 无结果群列表, 其它失败[str])。
     targets 是 _normalize_targets 出来的 spec 列表。"""
@@ -380,8 +419,18 @@ def _forward_located_message(bot, source, sig, occ, targets, d):
         g = spec["name"]
         if i > 0 and i % int(d["batch_every"]) == 0:
             time.sleep(random.uniform(d["batch_min"], d["batch_max"]))
+        t_g = time.time()
         success, err, hit = _forward_one_shot(cache_box, bot, source, sig, occ, spec, d)
+        cost = time.time() - t_g
         keepalive()          # 转发仍在推进，给主窗口闸门续期（别让它半路失效被人抢窗口）
+        # ★ 每个群一行，成功也记（2026-08-15）。原来只有异常路径写日志，于是一次
+        # 86 个群的群发在日志里近乎空白，卡住时连"跑到第几个"都答不上来。
+        _pos = f"[群发 {i + 1}/{len(targets)} 第{msg_no}/{msg_total}条]"
+        if success:
+            flog(f"{_pos} 「{g}」 ✅ OK 串「{hit}」 {cost:.1f}s")
+        else:
+            flog(f"{_pos} 「{g}」 ❌ {_classify(err)} 候选{spec.get('cands')} "
+                 f"{cost:.1f}s —— {err}", "WARNING")
         if success:
             ok += 1
             sent.append(g)
@@ -540,16 +589,44 @@ def _normalize_targets(targets):
     """把目标清单统一成 [{"name","cands"}]。
 
     兼容两种形态：registry.forward_specs 出来的 dict（带寻址候选），以及历史/测试里
-    的纯字符串（只有一个候选，行为与以前一致）。"""
+    的纯字符串（只有一个候选，行为与以前一致）。
+
+    ⚠️ dict 形态下 cands 为空【不能】回落成群名 —— 空是 forward_specs 把危险候选
+    摘光的结果（见 registry.unsafe_candidate），回落等于把刚摘掉的串又捡回来。
+    空 cands 的 spec 由 _split_addressable 挑出去汇报，不进投递。"""
     out = []
     for t in targets or []:
         if isinstance(t, dict):
             cands = [str(c) for c in (t.get("cands") or []) if c]
             name = t.get("name") or (cands[0] if cands else "")
-            out.append({"name": str(name), "cands": cands or [str(name)]})
+            out.append({"name": str(name), "cands": cands,
+                        "blocked": list(t.get("blocked") or [])})
         else:
-            out.append({"name": str(t), "cands": [str(t)]})
+            out.append({"name": str(t), "cands": [str(t)], "blocked": []})
     return out
+
+
+def _split_addressable(specs):
+    """把目标清单拆成 (能安全寻址的, 寻址串会误伤别人的)。后者必须汇报给人，
+    不能静默跳过 —— 静默跳过就是"某个群从此再也收不到"，而没人会发现。"""
+    ok, unsafe = [], []
+    for s in specs:
+        (ok if s.get("cands") else unsafe).append(s)
+    return ok, unsafe
+
+
+def _unsafe_lines(unsafe):
+    """把"寻址串会误伤别人"的群渲染成人能直接照着处理的一段话。"""
+    if not unsafe:
+        return []
+    rows = []
+    for s in unsafe[:10]:
+        why = "、".join(f"「{c}」会同时命中「{v}」" for c, v in (s.get("blocked") or [])[:2])
+        rows.append(f" - {s['name']}：{why or '没有安全的寻址串'}")
+    return [f"⚠️ {len(unsafe)} 个群【没发】：寻址串是别的群名字的一部分，微信搜索是包含匹配，"
+            f"发出去就可能进错群，所以宁可不发：\n" + "\n".join(rows)
+            + (f"\n…另有 {len(unsafe) - 10} 个" if len(unsafe) > 10 else "")
+            + "\n👉 去面板给这些群点「改名」对齐微信里的真名，或发「恢复群 <群名>」清掉旧寻址串重学。"]
 
 
 def _deliver(task) -> dict:
@@ -558,7 +635,7 @@ def _deliver(task) -> dict:
     主窗口锁已和主循环共用，转发期间主循环不会来抢窗口。
     """
     bot = task["bot"]; admin = task["admin"]
-    targets = _normalize_targets(task["targets"])
+    targets, unsafe = _split_addressable(_normalize_targets(task["targets"]))
     label = task["label"]; d = task["delay"]
     operator = task.get("operator")
 
@@ -594,8 +671,15 @@ def _deliver(task) -> dict:
     fail_detail = []
 
     aborted = False
+    t_run = time.time()
+    flog(f"===== 群发开始 {label} 目标 {len(targets)} 群 × {n_msgs} 条 "
+         f"operator={operator} 跳过(寻址有歧义) {len(unsafe)} =====")
+    for spec in unsafe:
+        flog(f"  ⚠️ 不发「{spec['name']}」：{spec.get('blocked')}", "WARNING")
     for mi, (sig, occ) in enumerate(sigs):
-        okc, gone, failed, sent = _forward_located_message(bot, admin, sig, occ, targets, d)
+        flog(f"--- 第 {mi + 1}/{n_msgs} 条：{sig} occ={occ} ---")
+        okc, gone, failed, sent = _forward_located_message(bot, admin, sig, occ, targets, d,
+                                                           msg_no=mi + 1, msg_total=n_msgs)
         ok += okc
         fail += len(gone) + len(failed)
         gone_all.update(gone)
@@ -625,9 +709,15 @@ def _deliver(task) -> dict:
         pass
 
     missed = [t["name"] for t in targets if t["name"] not in sent_all]
+    flog(f"===== 群发{'中止' if aborted else '结束'} {label} "
+         f"成功 {ok} 条次 / 失败 {fail} 条次 | 收到的群 {len(sent_all)} / 没收到 {len(missed)} "
+         f"| 耗时 {time.time() - t_run:.1f}s =====")
+    if missed:
+        flog("  没收到的群：" + "、".join(missed), "WARNING")
     lines = [f"{REPLY_PREFIX} {'转发中止！' if aborted else '转发完成！'}{label}",
              f"成功 {ok} 条次，失败 {fail} 条次，目标 {len(targets)} 个群 × {n_msgs} 条。",
              f"📊 收到的群 {len(sent_all)} 个，没收到的 {len(missed)} 个。"]
+    lines.extend(_unsafe_lines(unsafe))
     if missed:
         # 人要的是"到底哪几个群没发到"——只给数字，事后还得自己一个个去翻
         lines.append("❌ 没收到的群：\n" + "\n".join(f" - {m}" for m in missed[:20])
@@ -716,6 +806,13 @@ def _handle_main_menu(bot, chat, cfg, sender, text) -> bool:
     if text in ("4", "5"):   # 迎新 / 拉群设置（5 是老编号，手指记着呢，留个兼容）
         reply(chat, _format_welcome_invite(cfg))
         return True
+    # ★ 主菜单状态下也要认直接指令（2026-08-15 修）。
+    # 之前：只要处在菜单状态，任何非 1/2/3/4/0 的文本都被这里的兜底吃掉，
+    # 于是人照着菜单上"体检指令（直接发）"那几行发「检查群组 全部」，
+    # 回的却是"请输入有效的选项"+ 同一份菜单 —— 菜单教你发，菜单又不让你发，
+    # 死循环，看着像"机器人读不懂人话"。（截图实测：连发两次，两次都被顶回来。）
+    if _try_direct_command(bot, chat, cfg, sender, text):
+        return True
     reply(chat, "请输入有效的选项，或发送【0】退出。\n\n" + MAIN_MENU)
     return True
 
@@ -786,13 +883,21 @@ def _handle_choose(bot, chat, cfg, sender, st, text) -> bool:
         reply(chat, "未找到任何可转发的群组（去面板看看这些群勾没勾「允许转发」），或发送【0】退出")
         return True
 
+    # 寻址串会误伤别的群的，这里就别算进"要发几个群"了 —— 报个准数，人才好核对。
+    # 它们仍旧塞进 targets 交给 worker，由最终汇报统一列出来（一份报告，别报两遍）。
+    safe, unsafe = _split_addressable(_normalize_targets(targets))
+    if not safe:
+        reply(chat, "\n".join(["这一批群一个都发不了："] + _unsafe_lines(unsafe)))
+        return True
+
     count = st.get("count", 0)
     _clear_state(sender)
     # 不传消息对象：worker 投递前从源群现读 operator 的内容（新鲜元素、不漏不失效）
     _QUEUE.put({"bot": bot, "admin": cfg.get("admin_group"), "operator": sender,
                 "targets": list(targets), "label": label, "delay": _delays(cfg)})
-    reply(chat, f"开始转发 {count} 条消息到 {len(targets)} 个群…\n"
-                f"为避免风控，将会添加随机延迟，请耐心等待，完成后我在这儿汇报。")
+    reply(chat, f"开始转发 {count} 条消息到 {len(safe)} 个群…"
+                + (f"（另有 {len(unsafe)} 个群寻址串有歧义，不发，完成后一并汇报）" if unsafe else "")
+                + "\n为避免风控，将会添加随机延迟，请耐心等待，完成后我在这儿汇报。")
     return True
 
 
@@ -860,11 +965,12 @@ def _try_direct_command(bot, chat, cfg, sender, text) -> bool:
     if plain in ("扫群", "扫描群列表"):
         return _scan_groups(bot, chat)
 
-    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|探备注面板|查寻址|禁群|恢复群|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
+    m = re.match(r"^(检查群组|核对备注|修备注|看群|看会话|试改备注|探搜索|测搜索|探备注面板|查寻址|禁群|恢复群|开迎新|关迎新|删拉群)\s*(.+)$", text, re.S)
     if m:
         name = m.group(2).strip()
         return {
             "探搜索": lambda: _probe_search(bot, chat, name),
+            "测搜索": lambda: _bench_search(bot, chat, name),
             "探备注面板": lambda: _probe_remark_panel(bot, chat, name),
             "查寻址": lambda: _fix_addressing(bot, chat, name),
             "禁群": lambda: _disable_group(chat, name),
@@ -943,6 +1049,41 @@ def _format_welcome_invite(cfg) -> str:
             "回复 0 退出管理模式。")
 
 
+SEARCH_EMPTY_RETRIES = 2   # 主窗口搜索返回 0 项时，重搜几次（微信会吐中间态）
+SEARCH_RETRY_GAP = 0.8     # 两次重搜之间等多久
+CHATINFO_SETTLE = 0.6      # ChatWith 之后等窗口结算的时间（秒）
+CHATINFO_TRIES = 3         # 读回的名字对不上时最多重读几次
+
+
+def _read_chat_name(wx, want: str) -> str:
+    """（须在 MAIN_WINDOW_LOCK 内调用）ChatWith 之后读【当前会话显示名】。
+
+    ★★ 为什么不能读一次就信（2026-08-14 事故根因）：
+    `ChatWith` 返回后窗口并没有立刻结算，紧跟着调 `ChatInfo()` 会读回【上一个会话】
+    的名字。8-14 那次「检查群组」87 个群里有 20 个中招，而且铁证如山 —— 报告里
+    "切歪到"的那个群，7/8 正好是它在队列里的【前一个】群（序号差恒为 1），
+    同一批日志里一条 `切到「X」失败` 都没有（说明 ChatWith 其实全成功了）。
+    结果是 20 个好群被判成"不可达"，还建议人去面板删掉它们。
+
+    所以：先给结算时间再读；读回的名字剥掉🐶等于目标就立刻收工，不等于就再等再读，
+    重试到 CHATINFO_TRIES 次为止。这样"读慢了"只多花几百毫秒，
+    而"真切歪了"才会被判失败 —— 判据不再冤枉人。
+    读不到返回 ""（调用方退回用"切成功的那个串"）。"""
+    seen = ""
+    for i in range(CHATINFO_TRIES):
+        time.sleep(CHATINFO_SETTLE)
+        try:
+            info = wx.ChatInfo() or {}
+        except Exception:
+            info = {}
+        seen = str(info.get("chat_name") or "").strip()
+        if seen and audit.strip_dog(seen) == want:
+            return seen                      # 对上了就不用再等
+        if i == 0 and seen:
+            log("DEBUG", f"读回「{seen}」≠ 目标「{want}」，等窗口结算后重读")
+    return seen                              # 重试完还不对：这才算真的切歪了
+
+
 def _check_groups(bot, chat, name) -> bool:
     data = registry.load()
     if name in ("全部", "所有", "all"):
@@ -955,10 +1096,15 @@ def _check_groups(bot, chat, name) -> bool:
     if not specs:
         reply(chat, "该分组没有允许转发的群可检查。")
         return True
+    specs, unsafe = _split_addressable(_normalize_targets(specs))
+    if not specs:
+        reply(chat, "\n".join(["这一批群一个都查不了："] + _unsafe_lines(unsafe)))
+        return True
     reply(chat, f"开始检查 {len(specs)} 个群，顺便学习每个群在微信里的真实显示名，请稍等…")
     ok_list, fail_list, fixed, odd = [], [], [], []
     wx = getattr(bot, "wx", None)
     for spec in specs:
+        keepalive()   # 87 个群要跑好几分钟，闸门不续期后半程会被探针抢走主窗口
         # ★ 不只判"切没切过去"，还要把【微信里的显示名】读回来存下。
         # 转发的"发送给"对话框是按显示名精确勾选的（8/10 实测：拿群名去搜一个已打🐶的群，
         # 搜得到但勾不中，send() 在里面死等）。显示名才是唯一该用的寻址串——
@@ -969,11 +1115,7 @@ def _check_groups(bot, chat, name) -> bool:
                 if not _switched(wx, cand, exact=False):
                     seen_name = ""
                 else:
-                    try:
-                        info = wx.ChatInfo() or {}
-                    except Exception:
-                        info = {}
-                    seen_name = str(info.get("chat_name") or "").strip()
+                    seen_name = _read_chat_name(wx, spec["name"])
                     if not seen_name:
                         hit = cand        # 读不到显示名，退回用"切成功的这个串"
             if hit:
@@ -982,10 +1124,22 @@ def _check_groups(bot, chat, name) -> bool:
                 # ★ 安全闸：ChatWith 是模糊匹配，完全可能切到【别的群】。显示名剥掉🐶后
                 # 必须等于登记表里的群名，否则就是切歪了或群改了名 —— 绝不能把别人的名字
                 # 学进来，那会让之后每一次转发都稳定地发错群，比现在的卡死更糟。
-                if audit.strip_dog(seen_name) == spec["name"]:
+                bare = audit.strip_dog(seen_name)
+                if bare == spec["name"]:
                     hit = seen_name
                     break
-                odd.append(f"{spec['name']}：搜「{cand}」切到的是「{seen_name}」")
+                # ★ 分两种情况说人话（2026-08-15）：原来一律报"切到的是「X」"，
+                # 而「泰国清迈旅居交流1群」读回的是「🟪泰国清迈旅居交流1群🐶」——
+                # 剥掉🐶还多个🟪前缀，于是报告写成"搜「🟪…🐶」切到的是「🟪…🐶」"，
+                # 两个串肉眼一模一样，人看了只会觉得机器人疯了。
+                # 真相是登记表里的群名少了前缀，该去面板改名，不是切歪了。
+                if bare and (bare in spec["name"] or spec["name"] in bare):
+                    odd.append(f"{spec['name']}：微信里其实叫「{bare}」——名字对不上，"
+                               f"去面板点「改名」对齐")
+                else:
+                    odd.append(f"{spec['name']}：搜「{cand}」切到的是「{seen_name}」，"
+                               f"多半是🐶备注没真打上，微信只好模糊匹配")
+                log("WARNING", f"检查群组：搜「{cand}」读回的是「{seen_name}」，与目标不符")
             time.sleep(0.3)
         if hit:
             ok_list.append(spec["name"])
@@ -1008,9 +1162,13 @@ def _check_groups(bot, chat, name) -> bool:
         lines.append(f"⚠️ {len(odd)} 处搜到的是别的群（模糊匹配切歪或群改了名，没敢学）：\n"
                      + "\n".join(f" - {x}" for x in odd[:8])
                      + (f"\n…另有 {len(odd) - 8} 处" if len(odd) > 8 else ""))
+    lines.extend(_unsafe_lines(unsafe))
     if fail_list:
-        lines.append("不可达（可能改了群名/退群，去面板「群列表」改名或删除）：")
+        lines.append(f"不可达 {len(fail_list)} 个（重读 {CHATINFO_TRIES} 次仍对不上，"
+                     f"多半是真改了群名/退群了）：")
         lines.extend(f" - {t}" for t in fail_list)
+        lines.append("👉 先在微信里搜一下确认，确实改名了就去面板点「改名」，"
+                     "真退群了才删 —— 别照着这份清单直接删。")
     reply(chat, "\n".join(lines))
     return True
 
@@ -1152,12 +1310,24 @@ def _search_display_name(wx, group_name: str, out_detail=None):
         if box is not None:
             _ui_call(lambda: box.SendKeys("{Ctrl}a{Delete}", waitTime=0.15), 6, "clear-search")
             time.sleep(0.2)
-        done, res, err = _ui_call(lambda: sb.search(q), 20, f"search:{q[:12]}")
-        if not done:
-            return None, f"{STUCK_MARK}（搜索「{q}」卡住，UI 锁多半没释放）"
-        if err is not None:
-            return None, f"搜索失败：{err}"
-        res = res or []
+        # ★ 空结果要重搜（2026-08-15 实测加）：同一个串连打 8 轮，有一轮返回 0 项、
+        # 一轮返回 11 项且未命中，出错的两轮耗时都 >1s（正常 520~640ms）—— 微信搜索
+        # 在慢路径上会被读到中间态（结果正被清空重建 / 还没收敛）。
+        # 0 项是其中最干净、最不会误判的信号，只重试它；"非空但对不上"留给上层报人工，
+        # 因为那也可能是真的改了名，无脑重试会把"群没了"拖成三倍耗时。
+        res = []
+        for att in range(SEARCH_EMPTY_RETRIES + 1):
+            done, r, err = _ui_call(lambda: sb.search(q), 20, f"search:{q[:12]}")
+            if not done:
+                return None, f"{STUCK_MARK}（搜索「{q}」卡住，UI 锁多半没释放）"
+            if err is not None:
+                return None, f"搜索失败：{err}"
+            res = r or []
+            if res or att >= SEARCH_EMPTY_RETRIES:
+                if res and att:
+                    flog(f"搜「{q}」第 {att + 1} 次才有结果（前 {att} 次是空的，搜索抖动）")
+                break
+            time.sleep(SEARCH_RETRY_GAP)
         for el in res:
             c = str(getattr(el, "content", "") or "").strip()
             if not c or c in cands:
@@ -1517,6 +1687,105 @@ def _probe_remark_panel(bot, chat, group_name) -> bool:
             out.append(f"遍历控件失败：{e}")
 
     reply(chat, "\n".join(out))
+    return True
+
+
+def _read_search_text(box):
+    """读搜索框里当前实际的文字。读不到返回 None（当"没这条信息"，不当失败）。
+
+    uiautomation 的 EditControl 值在 ValuePattern 上；各版本控件类型不一定支持，
+    所以两条路都试，全都吞异常 —— 这只是诊断信息，绝不能因为读不到就把主流程弄挂。"""
+    if box is None:
+        return None
+    try:
+        return str(box.GetValuePattern().Value or "")
+    except Exception:
+        pass
+    try:
+        return str(getattr(box, "Name", "") or "") or None
+    except Exception:
+        return None
+
+
+def _bench_search(bot, chat, arg) -> bool:
+    """「测搜索 <串>|<轮数>」：同一个查询连打 N 轮，量搜索结果稳不稳、返回有多快。只读。
+
+    ★ 为什么必须黑盒量（2026-08-15，大松看着屏幕提的）：
+    肉眼看到"搜完立刻就跳到群里"，怀疑没等结果渲染完就判定。而 wxautox4 是
+    **编译发行**（19 个 .pyd，只有 param.py 这种壳是纯 .py），`ChatWith`/`search`
+    的实现根本读不到源码 —— 这个怀疑只能靠反复打同一个查询、看返回项数稳不稳来证伪。
+
+    历史上三条独立记录都指着同一件事，但从没有人真去量过：
+      · SEARCH_CHAT_TIMEOUT 实测默认 2 秒（文档写 5），"搜索结果常常 2 秒内没渲染完"
+      · 拉群专门做了切群重试 3 次，注释写"搜索结果常常不是第一时间出来"
+      · 转发失败标记的注释写"微信搜索被实测证明会抖，同一个群这轮搜到下轮搜不到"
+
+    判据：
+      · 项数在 0 和 N 之间跳  → 实锤"读太快"，该在搜索后补结算等待
+      · 项数稳定、且单次耗时只有几十毫秒 → 它压根没在等渲染，同样是问题
+      · 项数稳定、耗时在百毫秒以上 → 搜索本身没问题，失败另有原因
+    """
+    parts = [p.strip() for p in str(arg or "").split("|")]
+    q = parts[0]
+    rounds = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 8
+    rounds = max(1, min(rounds, 20))
+    if not q:
+        reply(chat, "用法：测搜索 <寻址串>|<轮数>（轮数可省，默认 8）")
+        return True
+
+    wx = getattr(bot, "wx", None)
+    sb = getattr(wx, "SessionBox", None) if wx else None
+    if sb is None or not hasattr(sb, "search"):
+        reply(chat, "拿不到 SessionBox.search，没法测")
+        return True
+
+    rows, counts, costs = [], [], []
+    with MAIN_WINDOW_LOCK:
+        try:
+            wx.Show()
+        except Exception:
+            pass
+        _bring_wx_front()
+        for i in range(rounds):
+            keepalive()
+            box = getattr(sb, "searchbox", None)
+            if box is not None:
+                _ui_call(lambda b=box: b.SendKeys("{Ctrl}a{Delete}", waitTime=0.15), 6, "clear")
+            t0 = time.time()
+            done, res, err = _ui_call(lambda: sb.search(q), 20, f"bench:{i}")
+            ms = (time.time() - t0) * 1000
+            # ★ 把搜索框里【实际】是什么读回来（2026-08-15 加）：不读的话，
+            # "第 6 轮返回 11 项且未命中"有两种解释分不开 —— 搜索吐了中间态，
+            # 还是上一轮的清空失败、这一轮搜的其实是"残留+新串"。
+            # 两种都是真问题，但修法完全不同，不能靠猜。
+            actual = _read_search_text(box)
+            tag = "" if (actual is None or actual == q) else f"  ⚠️框里是「{actual}」"
+            if not done:
+                rows.append(f"  第{i+1}轮  ⏱ 卡住未返回（>20s）{tag}"); counts.append(-1)
+            elif err is not None:
+                rows.append(f"  第{i+1}轮  ✗ 异常 {err}  {ms:.0f}ms{tag}"); counts.append(-1)
+            else:
+                n = len(res) if hasattr(res, "__len__") else -1
+                hit = any(q in str(getattr(x, "content", "")) for x in (res or []))
+                rows.append(f"  第{i+1}轮  {n} 项  {'命中' if hit else '未命中'}  "
+                            f"{ms:.0f}ms{tag}")
+                counts.append(n); costs.append(ms)
+            time.sleep(0.4)
+        box = getattr(sb, "searchbox", None)
+        if box is not None:
+            _ui_call(lambda b=box: b.SendKeys("{Esc}", waitTime=0.2), 6, "esc")
+
+    ok = [c for c in counts if c >= 0]
+    uniq = sorted(set(ok))
+    verdict = ("⚠️ 项数在几个值之间跳 → 搜索结果渲染没等稳，实锤"
+               if len(uniq) > 1 else "项数稳定")
+    if len(uniq) <= 1 and costs and sorted(costs)[len(costs) // 2] < 200:
+        verdict += "，但单次只要 %.0fms —— 它压根没在等渲染" % (sorted(costs)[len(costs) // 2])
+    stat = (f"耗时 min/中位/max = {min(costs):.0f}/{sorted(costs)[len(costs)//2]:.0f}/"
+            f"{max(costs):.0f} ms" if costs else "无有效样本")
+    flog(f"测搜索「{q}」×{rounds}：项数 {counts}，{stat}")
+    reply(chat, f"测搜索「{q}」×{rounds} 轮（只读）：\n" + "\n".join(rows)
+                + f"\n\n项数取值：{uniq or '（全失败）'}\n{stat}\n判定：{verdict}")
     return True
 
 
