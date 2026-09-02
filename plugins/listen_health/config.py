@@ -28,6 +28,12 @@ DEFAULTS = {
         "restart_cooldown_min": 60,       # 冷却期内不再重启；期内又失败 = 重启无效，叫人
         "restart_task_name": "SWXPanelRestart",
     },
+    # --- 开窗录像机（见 tap.py）：AddListenChat 期间录底层点击消息，失败时连截图一起存档 ---
+    "tap": {
+        "enabled": True,
+        "screenshot": True,       # 失败时截屏（PIL.ImageGrab，约 200ms，只在失败时做）
+        "keep_success": True,     # 成功也记一行（只有调用序列，没有截图），用来和失败对比
+    },
 }
 
 

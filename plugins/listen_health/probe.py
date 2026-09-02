@@ -447,6 +447,12 @@ def register(bot, schedule) -> None:
     间隔取自配置，改间隔要重启机器人线程才生效（schedule 注册时就固定了）。
     """
     cfg = load()
+    # 开窗录像机不依赖探针开关：探针 08-15 起就是关的，而录像机要录的是真实私聊开窗的失败现场
+    try:
+        from .tap import install as _install_tap
+        _install_tap(bot)
+    except Exception as e:
+        log("WARNING", f"开窗录像机挂载失败（不影响机器人）：{e!r}")
     pcfg = cfg.get('probe', {})
     if not pcfg.get('enabled', True):
         log("INFO", "探针已关闭，不挂载")
