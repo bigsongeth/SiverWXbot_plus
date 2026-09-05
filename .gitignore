@@ -60,6 +60,7 @@ plugins/ncc_community/data/*.json
 # 后台任务触发器的请求/结果（运行时产物，见 plugins/ncc_community/task_runner.py）
 plugins/ncc_community/data/task_*.txt
 plugins/ncc_kb/data/
+plugins/dsh_brain/data/
 # ai_news_note：抓取数据与已发送标记
 plugins/ai_news_note/data/
 plugins/ai_news_note/last_sent.txt

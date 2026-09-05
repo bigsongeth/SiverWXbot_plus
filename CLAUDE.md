@@ -88,13 +88,14 @@ netstat -ano | findstr LISTEN | findstr :100
 | `gh_trending_note` | 每日 GitHub 趋势笔记（跟在日报后面） | 定时任务注册处 ×1（紧邻 ai_news_note） | 插件内 `selftest.py` / `test_follow.py` |
 | `ui_watchdog` | 卡死/日志异常 → 整进程重启 | 主循环 `heartbeat()` / `disarm()`、`web_server` 消费标记 ×3 | `test_ui_watchdog.py` |
 | `listen_health` | 监听窗口丢失探针 + 自愈 | `MainWindowChat` 等 ×5（见 3.18） | `test_listen_health.py` / `test_main_window_chat.py` |
+| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/） | `_resolve_group_api` / `_resolve_chat_api` ×2，排在 ncc_kb 前（见 3.21） | `test_dsh_brain.py` |
 
 另有不成插件的核心内改动：3.1 面板监听地址、3.10 时间戳清洗与接话闸门（`test_reply_gate.py`）、
 3.12 绕开系统代理的 `HTTP` 会话、3.14 `SEARCH_CHAT_TIMEOUT`。
 
 另有 **`brain/`（肥肉大脑，2026-09-05 立项）**：常驻 dsh 智能体 + 网关 + 说话工具，机器人以后只把消息交给它，
 自己不再挑接口和人设。设计文档 `docs/superpowers/specs/2026-09-05-dsh-brain-design.md`（§2 是用户拍板的硬约束），
-跑法/目录/期 0 结论见 `brain/README.md`。期 1 只在 mac 侧跑、只接测试群；机器人侧插件 `plugins/dsh_brain/` 在期 3 才有。
+跑法/目录/期 0 结论见 `brain/README.md`。期 1 网关只在 mac 侧跑、只接测试群；机器人侧插件 `plugins/dsh_brain/`（最小版，2026-09-06）见 3.21。
 单测 `tests/test_brain_*.py`，直接跑文件。
 
 ### 3.1 面板局域网访问（`web_server.py` 的 `host='0.0.0.0'`）★ 容易被合并冲掉
@@ -828,6 +829,21 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 
 ---
 
+### 3.21 肥肉大脑接入插件 `plugins/dsh_brain/`（2026-09-06 加，最小版）★ 指定会话的 AI 回复整个交给大脑
+机器人不再挑接口和人设，把消息原样交给 `brain/` 的网关（`POST /reply`），大脑说什么发什么。
+
+- **hook 2 处**：`_resolve_group_api` / `_resolve_chat_api` 开头各一段，**排在 ncc_kb 前**（大脑自己会查知识库）。
+  返回的 `BrainAPI` 长得和四个接口类一样（`.chat(message, prompt=, history=)`），所以历史/分条/接话闸门/故障转移全复用：
+  多条气泡用 `SPLIT_SEPARATOR` 拼、不接话返回 `[NO_REPLY]`、网关出错/超时返回 model_fallback 认的失败串 → 备用链换老接口顶上。
+- **超时 300 秒、不重试**：网关串行，一轮 8–115 秒还要排队；上游 OpenAIAPI 那套 30 秒 + 重试 2 次会把同一条消息发三遍，
+  绝不能拿"OpenAI 兼容接口"配置项去指大脑（最终评审 Important 3）。
+- 走 `requests.Session(trust_env=False)` 直连 Tailscale 地址，同 3.12。刻意不 import `wxbot_core`。
+- 配置 `plugins/dsh_brain/data/config.json`（不进库）：`enabled` 总开关**默认关**，`gateway_url`、`timeout_sec`、
+  `enabled_groups/chats`（支持 `*`）、`excluded_*`。改配置下一条消息生效；**改插件代码要整进程重启**。
+  文件缺失不落盘（默认全关，合进 main 不改任何行为）。
+- 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
+- 单测：`PYTHONPATH=. python3 tests/test_dsh_brain.py`（本地假网关，不连微信不连大脑）。
+
 ### 3.20 GitHub 趋势笔记插件 `plugins/gh_trending_note/`（未在本文档记录过，2026-08-15 补）
 
 和 `ai_news_note` **平行的第二条笔记管线**：每天把 GitHub 趋势榜（今日/本周/本月 Top5）
@@ -1065,6 +1081,6 @@ cd /Volumes/SiverWXbot_plus-main && python3 -m py_compile wxbot_core.py web_serv
 | 面板模板 | `templates/dashboard.html` |
 | 配置 | `config/config.json` |
 | 日志 | `panel_logs/`、`wxauto_logs/` |
-| 肥肉大脑 | `brain/`（网关 :8500，运行数据 `~/feirou-brain-data`，见 `brain/README.md`） |
+| 肥肉大脑 | `brain/`（网关 :8500，运行数据 `~/feirou-brain-data`，见 `brain/README.md`）+ 机器人侧 `plugins/dsh_brain/`（3.21） |
 | 测试 | `tests/`（mac 上直接跑文件，见 5.5） |
 | 行尾 / 忽略规则 | `.gitattributes`、`.gitignore`（见第 5 节） |

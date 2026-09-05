@@ -2367,6 +2367,14 @@ class WXBot:
         - 若配置了 group_api_map 映射，则返回对应接口（惰性初始化并缓存）
         - 否则返回默认接口 self.api
         """
+        # dsh_brain plugin hook: 交给肥肉大脑的群（业务逻辑见 plugins/dsh_brain/，跑法见 brain/README.md）
+        try:
+            from plugins.dsh_brain import brain_api_for
+            _brain = brain_api_for(group_name, True)
+            if _brain is not None:
+                return _brain
+        except Exception as _brain_err:
+            log(level="ERROR", message=f"dsh_brain api hook error: {_brain_err}")
         # ncc_kb plugin hook: 知识库开关（业务逻辑见 plugins/ncc_kb/）
         try:
             from plugins.ncc_kb import kb_api_for
@@ -3678,6 +3686,14 @@ class WXBot:
 
     def _resolve_chat_api(self, user_name):
         """获取私聊用户对应的 AI 接口实例（知识库开关优先 > 白名单 chat_api_map > 默认接口）"""
+        # dsh_brain plugin hook: 交给肥肉大脑的私聊（业务逻辑见 plugins/dsh_brain/）
+        try:
+            from plugins.dsh_brain import brain_api_for
+            _brain = brain_api_for(user_name, False)
+            if _brain is not None:
+                return _brain
+        except Exception as _brain_err:
+            log(level="ERROR", message=f"dsh_brain api hook error: {_brain_err}")
         # ncc_kb plugin hook: 私聊知识库开关（在全局模式下也生效，补齐上游的空缺）
         try:
             from plugins.ncc_kb import kb_api_for

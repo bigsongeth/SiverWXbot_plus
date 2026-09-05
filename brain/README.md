@@ -5,7 +5,8 @@
 设计文档：`docs/superpowers/specs/2026-09-05-dsh-brain-design.md`；本期（期 1）计划：
 `docs/superpowers/plans/2026-09-05-dsh-brain-phase1.md`。用户拍板的硬约束见设计文档 §2，改代码前先读。
 
-期 1 只在 mac 侧跑、只接测试群；容器化（期 2）、机器人侧插件 `plugins/dsh_brain/`（期 3）还没做。
+期 1 网关只在 mac 侧跑、只接测试群；容器化（期 2）还没做。机器人侧插件 `plugins/dsh_brain/` 已有最小版
+（2026-09-06，CLAUDE.md 3.21）：指定群/私聊的 AI 回复整个交给网关 `/reply`，超时 300 秒不重试，配置默认全关。
 
 ## 跑起来
 
@@ -136,12 +137,15 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 - 每轮真调模型 10–115 秒，群里体验偏慢；提速方向是模型路由与去掉 kb 侧 rerank（约 6 秒）。
 - 回放对照表里的"原回复"来自老链路流水，群里老机器人没答的轮次没有对照。
 
-## 接管杭州美食群时（期 4 才做，先记这里）
+## 让某个群走大脑（测试群 / 以后的美食群）
 
-1. 面板「API 接口配置」里 hzfood-feirou 那一项 URL 改成大脑地址 `:8500`，模型名改 `feirou:group:共建杭州美食地图`。
-   **前提：机器人侧接口超时要放到不低于网关 `lock_timeout_sec`（250 秒）**——现在 `OpenAIAPI` 的 SDK 客户端是 30 秒、
-   备用 `HTTP.post` 是 60 秒，而网关一轮 8–115 秒、超时 120 秒再追问 120 秒；机器人会先放弃走 `model_fallback`，
-   网关却还握着锁跑完，回复丢失、后续消息拿到 `busy`。这是期 3 插件 `plugins/dsh_brain/` 要解决的第一件事。
+1. mac 上把网关常驻起来，`~/feirou-brain-data/config.json` 写 `{"bind": "<本机 Tailscale 地址>", "model": "deepseek-v4-flash"}`
+   （`bind` 默认只绑本机，要让 win-shukong 打进来必须改；网关无鉴权，只准 tailnet 可达）。
+2. win-shukong 上 `plugins/dsh_brain/data/config.json`：`{"enabled": true, "gateway_url": "http://<mac Tailscale 地址>:8500",
+   "enabled_groups": ["肥肉测试1🐶"]}`；改配置下一条消息生效，插件代码首次上线要整进程重启一次。
+3. **不要**拿面板的「OpenAI 兼容接口」配置项去指大脑：`OpenAIAPI` 是 30 秒超时 + 重试 2 次，会把同一条消息发三遍还全丢。
+   `/v1/chat/completions` 兼容路由只留给没法装插件的调用方。
+4. 美食群切换时再做：把该群加进 `enabled_groups`，观察一天，`ssh mac-mini launchctl bootout gui/501/com.hzfood.gateway` 退役 8437。
 2. 观察一天没问题后 `ssh mac-mini launchctl bootout gui/501/com.hzfood.gateway`（退役 8437 网关）。
 3. 改 `~/Personal/hz-food-map/README.md` 里的链路说明；美食技能以后只改 `brain/workspace/skills/hz-food-map/SKILL.md`，
    并同步回 `~/Personal/hz-food-map/deploy/dsh/SKILL.md`。
