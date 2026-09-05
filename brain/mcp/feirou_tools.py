@@ -12,6 +12,11 @@ import urllib.request
 
 GW = os.environ.get("FEIROU_GW", "http://127.0.0.1:8500").rstrip("/")
 
+# dsh 的 toolCallTimeoutMs 是 60000（见 brain/profile/cordis.patch.yml.tmpl），
+# 这里必须留在它之下，不然 dsh 先超时、我们的重试/报错永远传不回去。
+# kb_search 在网关侧封顶 20s，wx_reply 是本地写库基本秒回，45s 留了充足余量。
+GW_TIMEOUT_SEC = 45
+
 TOOLS = [
     {"name": "wx_reply",
      "description": "把你决定要说的话发到微信。这是唯一的说话通道，正文里写的字不会被发出去。"
@@ -44,8 +49,40 @@ def send(obj):
 def call_gateway(name, args):
     req = urllib.request.Request(f"{GW}/tool/{name}", data=json.dumps(args, ensure_ascii=False).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=90) as r:
+    with urllib.request.urlopen(req, timeout=GW_TIMEOUT_SEC) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def handle_frame(m):
+    """处理一个已解析成 dict 的 JSON-RPC 帧。不抛异常——任何一帧出错都不能带崩整条 stdin 循环。"""
+    meth, i = m.get("method"), m.get("id")
+    p = m.get("params")
+    if not isinstance(p, dict):
+        p = {}
+    if meth == "initialize":
+        send({"jsonrpc": "2.0", "id": i, "result": {
+            "protocolVersion": p.get("protocolVersion", "2025-03-26"),
+            "capabilities": {"tools": {}}, "serverInfo": {"name": "feirou", "version": "1"}}})
+    elif meth == "tools/list":
+        send({"jsonrpc": "2.0", "id": i, "result": {"tools": TOOLS}})
+    elif meth == "tools/call":
+        name = p.get("name")
+        args = p.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        if name not in NAMES:
+            send({"jsonrpc": "2.0", "id": i, "result": {"content": [{"type": "text", "text": f"未知工具 {name}"}], "isError": True}})
+            return
+        try:
+            res = call_gateway(name, args)
+            ok, text = bool(res.get("ok")), str(res.get("text", ""))
+        except Exception as e:  # 网关不在 → 告诉模型，别让 dsh 挂
+            ok, text = False, f"网关不可用：{e}"
+        send({"jsonrpc": "2.0", "id": i, "result": {"content": [{"type": "text", "text": text}], "isError": not ok}})
+    elif meth == "ping":
+        send({"jsonrpc": "2.0", "id": i, "result": {}})
+    elif i is not None:
+        send({"jsonrpc": "2.0", "id": i, "error": {"code": -32601, "message": f"method not found: {meth}"}})
 
 
 def main():
@@ -57,28 +94,15 @@ def main():
             m = json.loads(line)
         except ValueError:
             continue
-        meth, i, p = m.get("method"), m.get("id"), m.get("params") or {}
-        if meth == "initialize":
-            send({"jsonrpc": "2.0", "id": i, "result": {
-                "protocolVersion": p.get("protocolVersion", "2025-03-26"),
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "feirou", "version": "1"}}})
-        elif meth == "tools/list":
-            send({"jsonrpc": "2.0", "id": i, "result": {"tools": TOOLS}})
-        elif meth == "tools/call":
-            name, args = p.get("name"), p.get("arguments") or {}
-            if name not in NAMES:
-                send({"jsonrpc": "2.0", "id": i, "result": {"content": [{"type": "text", "text": f"未知工具 {name}"}], "isError": True}})
-                continue
-            try:
-                res = call_gateway(name, args)
-                ok, text = bool(res.get("ok")), str(res.get("text", ""))
-            except Exception as e:  # 网关不在 → 告诉模型，别让 dsh 挂
-                ok, text = False, f"网关不可用：{e}"
-            send({"jsonrpc": "2.0", "id": i, "result": {"content": [{"type": "text", "text": text}], "isError": not ok}})
-        elif meth == "ping":
-            send({"jsonrpc": "2.0", "id": i, "result": {}})
-        elif i is not None:
-            send({"jsonrpc": "2.0", "id": i, "error": {"code": -32601, "message": f"method not found: {meth}"}})
+        if not isinstance(m, dict):
+            # 合法 JSON 但顶层不是对象（数组批量请求 / 数字 / 字符串 / true / null）：
+            # 我们不支持批量帧，跳过而不是让 .get() 抛 AttributeError 带崩整条桥。
+            continue
+        try:
+            handle_frame(m)
+        except Exception as e:  # 任何一帧处理出错都不能让子进程退出——写 stderr，继续读下一帧
+            sys.stderr.write(f"[feirou_tools] 处理帧出错：{e}\n")
+            sys.stderr.flush()
 
 
 if __name__ == "__main__":
