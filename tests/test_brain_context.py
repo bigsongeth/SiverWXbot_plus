@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import unittest
+from unittest.mock import patch
 from brain.gateway import context
+from plugins.context_guard import guard
 
 IDX = {"hz-food-map": {"groups": ["共建杭州美食地图"]}, "ncc-community": {"scope": "all"}}
 
@@ -34,6 +36,18 @@ class PrimeTest(unittest.TestCase):
     def test_keeps_last_n(self):
         items = [{"time": "t", "type": "text", "attr": "friend", "sender": "a", "content": str(i)} for i in range(30)]
         self.assertEqual([x["content"] for x in context.filter_prime(items, 3)], ["27", "28", "29"])
+
+    def test_prime_drops_fallback_even_if_context_guard_disabled(self):
+        items = [
+            {"time": "2026/09/05 10:00:00", "type": "text", "attr": "friend", "sender": "K", "content": "第一个问题"},
+            {"time": "2026/09/05 10:00:05", "type": "text", "attr": "self", "sender": "肥肉", "content": "在忙，我稍后回复您"},
+            {"time": "2026/09/05 10:00:10", "type": "text", "attr": "self", "sender": "肥肉", "content": "[NO_REPLY]"},
+            {"time": "2026/09/05 10:00:15", "type": "text", "attr": "self", "sender": "肥肉", "content": "我这边没法联网哦"},
+            {"time": "2026/09/05 10:00:20", "type": "text", "attr": "friend", "sender": "K", "content": "第二个问题"},
+        ]
+        with patch.object(guard, "_load_config", return_value={"enabled": False}):
+            out = context.filter_prime(items, 20)
+        self.assertEqual([x["content"] for x in out], ["第一个问题", "第二个问题"])
 
 
 class MessageTest(unittest.TestCase):

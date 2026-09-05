@@ -6,6 +6,7 @@ import os
 import re
 from typing import List, Optional
 
+from plugins.context_guard import guard as _guard
 from plugins.context_guard.guard import filter_history  # 时间戳条目/兜底文案/[NO_REPLY]/"没法联网"整轮连坐
 from plugins.wechat_checkin.handler import TRIGGERS, normalize_text  # 签到触发词的唯一真相源
 
@@ -39,10 +40,29 @@ def match_skills(index: dict, conversation: str, is_group: bool) -> List[str]:
     return out
 
 
+def _is_dropped_self_fallback(item: dict) -> bool:
+    """兜底文案/[NO_REPLY]/"没法联网"这类脏话，不该管 context_guard 插件的运行时开关。
+
+    `filter_history` 一旦读到插件配置 `enabled=false` 或 `filter_history=false` 就原样
+    透传——那个开关管的是"微信机器人实际发出去的历史"要不要洗，不该连带决定"大脑预热时
+    看到的历史"要不要洗。这里直接从 guard 的默认词表判断，是一道不看插件开关的独立防线。
+    """
+    if item.get("attr") != "self":
+        return False
+    content = str(item.get("content", "")).strip()
+    if not content:
+        return False
+    cfg = _guard._DEFAULT_CONFIG
+    if content in cfg["drop_assistant_contents"]:
+        return True
+    return any(s in content for s in cfg["drop_assistant_substrings"])
+
+
 def filter_prime(items: List[dict], count: int) -> List[dict]:
     kept = [x for x in filter_history(list(items or []))
             if x.get("attr") in ("friend", "self") and x.get("type", "text") == "text"
-            and not is_checkin_text(str(x.get("content", "")))]
+            and not is_checkin_text(str(x.get("content", "")))
+            and not _is_dropped_self_fallback(x)]
     return kept[-count:]
 
 
