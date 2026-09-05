@@ -153,28 +153,9 @@ class DshClient:
     def initialize(self, cwd: str, provider: str, model: str) -> dict:
         return self._request("initialize", {"cwd": cwd, "provider": provider, "model": model}, timeout=60)
 
-    def cancel(self, session_id: str, drain_sec: float = 8.0) -> bool:
-        """取消该会话正在跑的那一轮（dsh 的 session/cancel，keepInbox），再等它回到 idle。
-
-        超时后用这个代替重建进程：进程与预热都保住，只丢那一轮。等不到 idle 返回 False，
-        调用方应退回重建进程。
-        """
-        try:
-            self._request("session/cancel", {"sessionId": session_id}, timeout=5)
-        except Exception:
-            return False
-        q = self._session_queue(session_id)
-        deadline = time.time() + drain_sec
-        while time.time() < deadline:
-            if not self.alive():
-                return False
-            try:
-                m = q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if m.get("method") == "session.status" and (m.get("params") or {}).get("status") == "idle":
-                return True
-        return False
+    # 注意：sdk 运行时（dsh-sdk-jsonrpc-server 0.1.2-rc.1）只认 initialize / session/prompt / shutdown
+    # 三个方法，2026-09-05 实测 session/cancel、session/control 都回 "unknown ... runtime method"。
+    # 所以一轮超时后没法只取消那一轮，只能由网关重建整个进程。
 
     def prompt(self, session_id: str, text: str, timeout_sec: float) -> TurnResult:
         q = self._session_queue(session_id)
