@@ -1,0 +1,66 @@
+# brain/profile/cordis.patch.yml.tmpl
+# 肥肉大脑的 sdk profile 覆盖层。由 gateway/profile.py 渲染，人设正文、feirou 命令与参数、
+# grok 可选块由渲染函数按位置注入下方对应字段（此处不写占位符字面量，避免和真正的占位符
+# 一起被 str.replace 命中、把注释炸成非法 YAML）。
+# 关掉的东西：shell 类工具、子代理、dsh 自带联网；同时禁用 approval 与 permission 两个插件
+# （原因见下方注释，效果等价于「从不询问」）。
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: bash-sandbox
+  disabled: true
+- id: pwsh-sandbox
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-web
+  disabled: true
+- id: web-fetch-http
+  disabled: true
+- id: approval
+  disabled: true
+- id: permission
+  disabled: true
+  # 期 0 实测（2026-09-05）：id: approval（name '@deepseek-ai/dsh-user-approval'）和
+  # id: permission（name '@deepseek-ai/dsh-permission-presets'）是两个不同插件——
+  # 写 `config: { policy: never }` 或只关掉前者，dsh-permission-presets 会卡在
+  # "pending (waiting for services: shell, approval)" 永久挂起（bash 类工具全关后
+  # 没人再提供 ctx.shell、approval 插件被关后也没人提供 approval 服务，它两个依赖
+  # 都满足不了，进程直接起不来）。既然 shell 工具已经全关，没有 shell 就没有需要
+  # 审批的对象，两个都整个关掉，效果等价于"从不询问"，而且真的能启动。
+- id: sandbox-policy
+  config:
+    mode: workspace-write
+- id: system-prompt
+  config:
+    persona: |
+__PERSONA__
+- insert:
+    - id: mcp-feirou
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: feirou
+        transport: stdio
+        command: __FEIROU_CMD__
+        args:
+__FEIROU_ARGS__
+        toolCallTimeoutMs: 60000
+        failOnStartupError: true
+    - id: mcp-hzfood
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: hzfood
+        transport: streamable-http
+        url: https://food.bigsong.site/mcp
+        toolCallTimeoutMs: 60000
+        failOnStartupError: false
+__GROK_BLOCK__
