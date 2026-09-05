@@ -4,6 +4,9 @@ from __future__ import annotations
 import json
 import urllib.request
 
+FACTS_MAX_CHARS = 6000
+CONTEXT_MAX_CHARS = 12000
+
 
 def search(kb_url: str, query: str, timeout: float) -> str:
     try:
@@ -16,9 +19,15 @@ def search(kb_url: str, query: str, timeout: float) -> str:
         return f"检索不可用（{type(e).__name__}）。不要编造，按不知道处理，建议对方问群里的主理人。"
     parts = []
     if d.get("facts"):
-        parts.append("【固定事实清单（优先级最高）】\n" + d["facts"].strip())
+        facts = d["facts"].strip()
+        if len(facts) > FACTS_MAX_CHARS:
+            facts = facts[:FACTS_MAX_CHARS] + "\n…（已截断）"
+        parts.append("【固定事实清单（优先级最高）】\n" + facts)
     if d.get("context"):
-        parts.append("【检索片段】\n" + d["context"].strip())
+        context = d["context"].strip()
+        if len(context) > CONTEXT_MAX_CHARS:
+            context = context[:CONTEXT_MAX_CHARS] + "\n…（已截断）"
+        parts.append("【检索片段】\n" + context)
     if not parts:
         return "知识库里没有相关内容。不要编造。"
     return "\n\n".join(parts)

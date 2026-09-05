@@ -3,10 +3,13 @@
 from __future__ import annotations
 import json
 import os
+import re
 import threading
 import time
 import uuid
 from typing import List, Optional
+
+_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 
 
 class Proposals:
@@ -17,6 +20,8 @@ class Proposals:
         self._lock = threading.Lock()
 
     def _path(self, pid: str) -> str:
+        if not _ID_RE.match(pid):
+            raise ValueError(f"非法的提议 id: {pid!r}")
         return os.path.join(self.dir, pid + ".json")
 
     def _write(self, rec: dict) -> None:
@@ -35,17 +40,20 @@ class Proposals:
         return pid
 
     def list(self, status: Optional[str] = None) -> List[dict]:
-        out = []
-        for name in sorted(os.listdir(self.dir)):
-            if name.endswith(".json"):
-                rec = self._read(name[:-5])
-                if status is None or rec["status"] == status:
-                    out.append(rec)
+        with self._lock:
+            out = []
+            for name in sorted(os.listdir(self.dir)):
+                if name.endswith(".json"):
+                    rec = self._read(name[:-5])
+                    if status is None or rec["status"] == status:
+                        out.append(rec)
         return out
 
     def approve(self, pid: str) -> dict:
         with self._lock:
             rec = self._read(pid)
+            if rec["status"] == "rejected":
+                return rec
             if rec["status"] != "approved":
                 with open(self.shared, "a", encoding="utf-8") as f:
                     f.write(f"- ({time.strftime('%Y-%m-%d')}，来源: {rec['source']}) {rec['text']}\n")
@@ -57,6 +65,8 @@ class Proposals:
     def reject(self, pid: str) -> dict:
         with self._lock:
             rec = self._read(pid)
+            if rec["status"] == "approved":
+                return rec
             rec["status"] = "rejected"
             rec["decided"] = time.strftime("%Y-%m-%d %H:%M:%S")
             self._write(rec)
