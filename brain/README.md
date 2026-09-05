@@ -97,6 +97,10 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
   真收进了 food.bigsong.site 的库（hkbohai `places` 表 rowid 最新一条，2026-09-05 23:00）。回放数据里凡是含高德链接、
   店名推荐的消息都会落到生产地图上；要么先在数据源里过滤掉，要么接受它。grok-search 只读，kb_search 只读。
 - 美食 MCP 的工具在**所有**会话里都可见（技能索引只决定给不给它那份 SKILL.md 说明），不限于「共建杭州美食地图」群。
+- 美食技能有「地图没有 → 小红书」路径（2026-09-06 加）：`suggest` 返回空就调 `mcp__grok__cn_search`，答的时候说明来源是小红书、
+  末尾邀请发高德链接收进地图；小红书搜到的店绝不写进地图。实测「余杭万达有哪些好吃的」→ suggest 空 → cn_search →
+  "蛙喔牛蛙(4楼)、裴社长山葵烤肉…觉得好发我高德链接"，110 秒。`~/Personal/hz-food-map/deploy/dsh/SKILL.md` 那份（老 8437 网关用）
+  没同步这条，因为那条链路上没有 grok MCP；期 4 切换时以 `brain/` 这份为准。
 - 2A 里 grok-4.6 的典型失败：把回复写在正文里不调 wx_reply，被网关追问后又把追问当成"系统提示不该回"而调 no_reply，
   一条私聊连着 6 条这样丢掉；答出来的也偏客服腔、爱编细节（"社区厨房齐全"）。
 - 2B 里 deepseek-v4-flash 基本按规矩走：据点/主理人/签到都答对（大曹、大理+黑多岛、"发【签到】两个字"），
@@ -112,8 +116,9 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
   模型物理上能用 write/edit 改它（人设已明令禁止，`run.py` 也不覆盖该文件所以改了会留下）。文件属主级的只读要等期 2 两个用户落地。
 - 网关没有鉴权（见上面 API 一节），默认只绑本机；改成 0.0.0.0 之前要先有 tailnet ACL。
 - 没容器化、没网络隔离：只能在可信机器上跑、只接测试群。硬约束 ①（Tailscale 单向）在期 2 落地。
-  另外 dsh 在宿主上跑时能看到宿主的全局 skills 列表（`apple-design` 等，来自 `~/.agents` / `~/.claude`），
-  硬约束 ②（只看自己的工作区）也要等容器化才算满足。
+  dsh 会扫 `~/.agents/skills`，宿主上几十个与肥肉无关的技能曾出现在它的目录里；现在 `run.py` 把 dsh 的 `HOME`
+  指到数据目录、`$DSH_HOME/skills` 软链到工作区 `skills/`（dsh 不扫工作区里的 `skills/`），实测目录里只剩
+  hz-food-map / ncc-community。硬约束 ②（只看自己的工作区）真正兜底仍要等容器化。
 - **sdk 运行时只有 initialize / session/prompt / shutdown 三个方法，没有取消轮次的手段**（09-05 实测
   `session/cancel` / `session/control` 都回 unknown method）。所以一轮超时只能重建整个进程：冷启动 + 重预热，
   且后台那一轮还在烧模型。超时阈值必须放在模型真实延迟之上，否则会连锁（回放第一轮一条私聊 15 轮打掉 11 轮）。

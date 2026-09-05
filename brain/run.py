@@ -66,7 +66,7 @@ def main() -> None:
         "DSH_BIN", "~/.nvm/versions/node/v24.19.0/lib/node_modules/@deepseek-ai/dsh/lib/bin.js"))
     cfg = config.load(data)
     seed_workspace(ws)
-    profile.prepare_dsh_home(dsh_home, key, cfg["model"])
+    profile.prepare_dsh_home(dsh_home, key, cfg["model"], skills_dir=os.path.join(ws, "skills"))
     with open(os.path.join(ws, "PERSONA.md"), encoding="utf-8") as f:
         persona = f.read()
     patch_path = os.path.join(data, "cordis.patch.yml")
@@ -74,7 +74,9 @@ def main() -> None:
         f.write(profile.render_patch(persona, [sys.executable, os.path.join(HERE, "mcp", "feirou_tools.py")],
                                      os.path.join(HERE, "mcp", "grok_search", "server.js"), key, node=node))
     os.chmod(patch_path, 0o600)   # patch 里嵌着 key
-    env = dict(os.environ, DSH_HOME=dsh_home, SONGKEY_API_KEY=key,
+    # HOME 指到数据目录：dsh 还会扫 ~/.agents/skills（宿主上几十个与肥肉无关的技能会进它的目录，
+    # 硬约束 ② 在容器化前至少先把这条堵上）；node/dsh 都是绝对路径，不依赖 HOME。
+    env = dict(os.environ, HOME=data, DSH_HOME=dsh_home, SONGKEY_API_KEY=key,
                FEIROU_GW=f"http://127.0.0.1:{cfg['port']}")
 
     def factory():

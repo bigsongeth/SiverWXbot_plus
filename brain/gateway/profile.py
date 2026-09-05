@@ -47,12 +47,24 @@ def render_patch(persona: str, feirou_mcp_argv: List[str], grok_server_js: Optio
             .replace("__GROK_BLOCK__\n", grok))
 
 
-def prepare_dsh_home(dsh_home: str, songkey_key: str, model: str) -> None:
+def prepare_dsh_home(dsh_home: str, songkey_key: str, model: str, skills_dir: Optional[str] = None) -> None:
+    """建 DSH_HOME：settings.yaml 只写一次；`skills` 指向工作区的技能目录。
+
+    dsh 的技能目录只认 <项目>/.dsh/skills、<项目>/.agents/skills、$DSH_HOME/skills、~/.agents/skills，
+    工作区里的 skills/ 它不扫（2026-09-06 实测模型说"catalog 里没有 hz-food-map"，只能自己 glob+read，
+    一轮多花几十秒还常读不到）。所以把 $DSH_HOME/skills 做成指向工作区 skills/ 的软链。
+    """
     os.makedirs(dsh_home, exist_ok=True)
     settings = os.path.join(dsh_home, "settings.yaml")
     if not os.path.exists(settings):
         with open(settings, "w", encoding="utf-8") as f:
             f.write(_read("settings.yaml.tmpl").replace("__MODEL__", model))
+    if skills_dir:
+        link = os.path.join(dsh_home, "skills")
+        if os.path.islink(link) and os.readlink(link) != skills_dir:
+            os.unlink(link)
+        if not os.path.exists(link) and not os.path.islink(link):
+            os.symlink(skills_dir, link)
 
 
 def dsh_argv(node: str, dsh_bin: str, patch_path: str) -> List[str]:

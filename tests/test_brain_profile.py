@@ -19,6 +19,16 @@ class ProfileTest(unittest.TestCase):
         self.assertIn("serverName: grok", txt)
         self.assertIn("SONGKEY_API_KEY: sk-test", txt)
 
+    def test_prepare_dsh_home_links_workspace_skills(self):
+        d = tempfile.mkdtemp()
+        skills = os.path.join(d, "ws-skills"); os.makedirs(skills)
+        home = os.path.join(d, "dsh-home")
+        profile.prepare_dsh_home(home, "sk-x", "songkey-auto", skills_dir=skills)
+        self.assertEqual(os.readlink(os.path.join(home, "skills")), skills)
+        other = os.path.join(d, "other"); os.makedirs(other)
+        profile.prepare_dsh_home(home, "sk-x", "songkey-auto", skills_dir=other)   # 换目录要重指
+        self.assertEqual(os.readlink(os.path.join(home, "skills")), other)
+
     def test_prepare_dsh_home_writes_settings_once(self):
         d = tempfile.mkdtemp()
         profile.prepare_dsh_home(d, "sk-x", "songkey-auto")
