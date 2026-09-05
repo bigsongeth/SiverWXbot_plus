@@ -35,7 +35,7 @@ _FIELDS = ("conversation", "is_group", "sender", "text", "prime")
 def post(url: str, payload: dict, timeout: float = 300) -> dict:
     req = urllib.request.Request(url.rstrip("/") + "/reply", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout) as r:   # 无视环境代理
         return json.loads(r.read().decode("utf-8"))
 
 

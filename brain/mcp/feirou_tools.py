@@ -10,6 +10,8 @@ import os
 import sys
 import urllib.request
 
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 GW = os.environ.get("FEIROU_GW", "http://127.0.0.1:8500").rstrip("/")
 
 # dsh 的 toolCallTimeoutMs 是 60000（见 brain/profile/cordis.patch.yml.tmpl），
@@ -53,7 +55,7 @@ def send(obj):
 def call_gateway(name, args):
     req = urllib.request.Request(f"{GW}/tool/{name}", data=json.dumps(args, ensure_ascii=False).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=GW_TIMEOUT_SEC) as r:
+    with _OPENER.open(req, timeout=GW_TIMEOUT_SEC) as r:   # 直连网关，无视环境代理（见 gateway/kb.py 注释）
         return json.loads(r.read().decode("utf-8"))
 
 

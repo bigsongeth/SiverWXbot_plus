@@ -190,7 +190,8 @@ class Gateway:
             txt = kb.search(self.cfg["kb_url"], str(args.get("query", "")), self.cfg["kb_timeout_sec"])
             inf = self.inflight   # 只读一次：检索期间在飞的请求可能已经换人
             if inf is not None:
-                inf.tool_log.append({"tool": name, "query": args.get("query", "")})
+                inf.tool_log.append({"tool": name, "query": args.get("query", ""),
+                                     "ok": not txt.startswith("检索不可用"), "chars": len(txt)})
             return {"ok": True, "text": txt}
         inf = self.inflight
         if inf is None:
