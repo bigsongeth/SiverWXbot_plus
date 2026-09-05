@@ -105,6 +105,10 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
   `search_place(店名+地点)` → 校验城市是杭州、地标出现在返回地址里 → `recommend_place`；任一条件缺就追问，不猜不写。
   只给店名不带地点高德会匹配到外地店（实测「裴社长山葵烤肉」命中扬州店），所以地点是硬条件。
   实测「把裴社长山葵烤肉收进地图」→ 追问在杭州哪；「把余杭万达的蛙喔牛蛙记一下」→ 追问推荐语；两条都没写库。
+- 推荐每家带高德短链（2026-09-06 加）：美食 MCP 新增 `https://food.bigsong.site/p/<poiid>` → 302 到 `wb.amap.com/?p=…`（手机点开跳高德定位到店），
+  `suggest` / `list_places` / 收录回复里的 `amap` 都改成这个 38 字符短链；网关 `shape.text_len` 不把链接算进字数预算。
+  问「地图在哪看」给公开列表短链 `https://surl.amap.com/4bvd5QZ4HY`。改动在 `~/Personal/hz-food-map`（hkbohai 已部署，
+  备份 `hzfood/*.bak-20260906-shortlink`，那个仓库里的改动还没 commit）。
 - 2A 里 grok-4.6 的典型失败：把回复写在正文里不调 wx_reply，被网关追问后又把追问当成"系统提示不该回"而调 no_reply，
   一条私聊连着 6 条这样丢掉；答出来的也偏客服腔、爱编细节（"社区厨房齐全"）。
 - 2B 里 deepseek-v4-flash 基本按规矩走：据点/主理人/签到都答对（大曹、大理+黑多岛、"发【签到】两个字"），
