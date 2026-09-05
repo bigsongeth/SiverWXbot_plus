@@ -40,11 +40,14 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 `workspace/`（PERSONA 与 skills 每次启动被种子覆盖；`memory/`、`proposals/`、`knowledge/shared.md` 是运行中长出来的，不覆盖）、
 `dsh-home/`（专用 DSH_HOME，别指到 `~/.dsh`）、`log/replies-YYYYMMDD.jsonl` + `log/dsh.err`、`cordis.patch.yml`（含 key，0600）。
 
-## 网关 API（`:8500`）
+## 网关 API（`:8500`，默认只绑 `127.0.0.1`）
+
+`/tool/*` 与 `/proposals/<id>/approve` 都没有鉴权，只靠 `turn_id` 和本机可达性挡，所以期 1 默认只绑 127.0.0.1
+（MCP 桥、回放、面板过渡路由都在本机）。期 2 容器化后再在 `config.json` 里把 `bind` 放开到 tailnet。
 
 | 路由 | 用途 |
 |------|------|
-| `POST /reply` | `{conversation,is_group,sender,text,prime?}` → `{"bubbles":[...]}` 或 `{"no_reply":true,"reason":...}`。reason 有 `empty`（空文本/占位符直接拦）、`model_silent`、`timeout`、`dsh_error` |
+| `POST /reply` | `{conversation,is_group,sender,text,prime?}` → `{"bubbles":[...]}` 或 `{"no_reply":true,"reason":...}`。reason 有 `empty`（空文本/占位符直接拦）、`model_silent`、`timeout`、`dsh_error`。**出错时是 200 + `{"error": "..."}`**（dsh 起不来、conversation 缺失），只有网关正忙才是 503 `busy`；调用方两种都要判 |
 | `POST /v1/chat/completions` | OpenAI 兼容过渡路由，模型名 `feirou:group:<群名>` / `feirou:chat:<昵称>` 编码会话；历史做一次预热；全链失败返回与 `model_fallback` 同一串错误文案让机器人走备用链 |
 | `POST /tool/<name>` | 只给 MCP 桥用。说话类工具校验 `turn_id`，不是当前轮次的一律拒 |
 | `GET /proposals`、`POST /proposals/<id>/approve|reject` | 共享知识待审区（期 3 面板页接这里） |
@@ -101,6 +104,9 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 ## 已知限制（期 1）
 
 - 全局串行：同一时刻只处理一条消息，一条慢（最长 120 秒超时 + nudge）会拖住后面的。
+- **硬约束 ③ 的"共享知识只能提议"在期 1 只靠人设**：dsh 的文件沙箱是 workspace-write，`knowledge/shared.md` 就在工作区里，
+  模型物理上能用 write/edit 改它（人设已明令禁止，`run.py` 也不覆盖该文件所以改了会留下）。文件属主级的只读要等期 2 两个用户落地。
+- 网关没有鉴权（见上面 API 一节），默认只绑本机；改成 0.0.0.0 之前要先有 tailnet ACL。
 - 没容器化、没网络隔离：只能在可信机器上跑、只接测试群。硬约束 ①（Tailscale 单向）在期 2 落地。
   另外 dsh 在宿主上跑时能看到宿主的全局 skills 列表（`apple-design` 等，来自 `~/.agents` / `~/.claude`），
   硬约束 ②（只看自己的工作区）也要等容器化才算满足。
@@ -116,6 +122,9 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 ## 接管杭州美食群时（期 4 才做，先记这里）
 
 1. 面板「API 接口配置」里 hzfood-feirou 那一项 URL 改成大脑地址 `:8500`，模型名改 `feirou:group:共建杭州美食地图`。
+   **前提：机器人侧接口超时要放到不低于网关 `lock_timeout_sec`（250 秒）**——现在 `OpenAIAPI` 的 SDK 客户端是 30 秒、
+   备用 `HTTP.post` 是 60 秒，而网关一轮 8–115 秒、超时 120 秒再追问 120 秒；机器人会先放弃走 `model_fallback`，
+   网关却还握着锁跑完，回复丢失、后续消息拿到 `busy`。这是期 3 插件 `plugins/dsh_brain/` 要解决的第一件事。
 2. 观察一天没问题后 `ssh mac-mini launchctl bootout gui/501/com.hzfood.gateway`（退役 8437 网关）。
 3. 改 `~/Personal/hz-food-map/README.md` 里的链路说明；美食技能以后只改 `brain/workspace/skills/hz-food-map/SKILL.md`，
    并同步回 `~/Personal/hz-food-map/deploy/dsh/SKILL.md`。

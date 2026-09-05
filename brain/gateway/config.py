@@ -6,7 +6,7 @@ import os
 
 DEFAULTS = {
     "port": 8500,
-    "bind": "0.0.0.0",
+    "bind": "127.0.0.1",   # /tool/* 与 /proposals 审批都没有鉴权，期 1 只准本机访问；期 2 容器化后再在 config.json 放开
     "provider": "songkey",
     "model": "songkey-auto",
     "turn_timeout_sec": 120,   # songkey-auto 目前落到 grok-4.6，一句话也要先烧 700 个推理 token（24s 起步）

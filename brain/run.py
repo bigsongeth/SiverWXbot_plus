@@ -44,8 +44,9 @@ def check_key(key: str) -> None:
     """启动时验一次 key：09-05 hzfood 网关静默吃过 401，大脑不能带着废 key 起来。"""
     import urllib.request
     req = urllib.request.Request("https://key.bigsong.site/v1/models", headers={"Authorization": "Bearer " + key})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 与 kb.py 一致：无视环境代理
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with opener.open(req, timeout=15) as r:
             if r.status != 200:
                 sys.exit(f"songkey 返回 {r.status}")
     except Exception as e:
