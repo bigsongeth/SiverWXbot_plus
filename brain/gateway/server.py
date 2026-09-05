@@ -161,12 +161,14 @@ class Gateway:
                 self.recent.add(conv, result["bubbles"])
             truncated = memory_guard.enforce(os.path.join(self.ws, "memory"), self.cfg["memory_max_bytes"])
             self.turns += 1
+            dsh_tools = [str(((ev.get("data") or {}).get("name")) or ((ev.get("data") or {}).get("tool")) or "?")
+                         for ev in turn.events if ev.get("type") == "tool/call"]   # 含 MCP 工具（hzfood/grok），排障用
             log_rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
                        "sender": sender, "text": text, "budget": self.inflight.budget, "skills": skills,
                        "turn_id": self.inflight.turn_id, "session_id": session_id,
                        "primed": prime is not None, "result": result, "attempts": self.inflight.attempts,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
-                       "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted,
+                       "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
                        "ms": int((time.time() - t0) * 1000)}
             if turn.error:
                 log_rec["dsh_error"] = turn.error
