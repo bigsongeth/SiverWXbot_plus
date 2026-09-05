@@ -34,12 +34,18 @@ class DshClient:
         self._notes: Dict[str, queue.Queue] = {}
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
+        self._stderr_f = None   # 真文件对象时才持有，_close_pipes 里一并关掉
 
     # ---- 进程 ----
     def start(self) -> None:
         err = open(self.stderr_path, "ab") if self.stderr_path else subprocess.DEVNULL
-        self.p = subprocess.Popen(self.argv, cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
-                                  stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8", bufsize=1)
+        self._stderr_f = err if self.stderr_path else None
+        try:
+            self.p = subprocess.Popen(self.argv, cwd=self.cwd, env=self.env, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=err, text=True, encoding="utf-8", bufsize=1)
+        except Exception:
+            self._close_stderr()
+            raise
         threading.Thread(target=self._reader, daemon=True).start()
 
     def alive(self) -> bool:
@@ -78,12 +84,21 @@ class DshClient:
     def _close_pipes(self) -> None:
         # 崩溃路径（进程自己退出）和正常路径都要走到这里，否则 stdin/stdout 的
         # TextIOWrapper 会一直不关，触发 ResourceWarning: unclosed file。
+        self._close_stderr()
         if self.p is None:
             return
         for f in (self.p.stdin, self.p.stdout):
             try:
                 if f is not None:
                     f.close()
+            except Exception:
+                pass
+
+    def _close_stderr(self) -> None:
+        f, self._stderr_f = self._stderr_f, None
+        if f is not None and hasattr(f, "close"):
+            try:
+                f.close()
             except Exception:
                 pass
 

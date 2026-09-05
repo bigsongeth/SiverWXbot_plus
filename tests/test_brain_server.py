@@ -17,16 +17,27 @@ class FakeDsh:
         self.script = []          # list of callables(gw) -> None
         self.prompts = []
         self._alive = True
+        self.stopped = 0
+        self.timeout_next = False       # 为 True 时 prompt 直接返回 timed_out
+        self.init_fail_once = False     # 为 True 时 initialize 抛一次
 
     def start(self): self._alive = True
-    def initialize(self, cwd, provider, model): return {}
+    def initialize(self, cwd, provider, model):
+        if self.init_fail_once:
+            self.init_fail_once = False
+            raise RuntimeError("initialize: boom")
+        return {}
     def alive(self): return self._alive
-    def stop(self): self._alive = False
+    def stop(self):
+        self._alive = False
+        self.stopped += 1
 
     def prompt(self, session_id, text, timeout_sec):
         self.prompts.append((session_id, text))
         if self.script:
             self.script.pop(0)(self.gw_ref[0])
+        if self.timeout_next:
+            return TurnResult(reasoning="卡住了", timed_out=True)
         return TurnResult(reasoning="想了一下", text="草稿：不会被发出去", events=[{"type": "turn/end"}])
 
 
@@ -35,9 +46,11 @@ class GatewayTest(unittest.TestCase):
         self.data = tempfile.mkdtemp()
         self.ws = os.path.join(self.data, "workspace")
         os.makedirs(os.path.join(self.ws, "knowledge")); os.makedirs(os.path.join(self.ws, "memory", "people"))
-        open(os.path.join(self.ws, "knowledge", "shared.md"), "w").write("# 共享知识\n")
+        with open(os.path.join(self.ws, "knowledge", "shared.md"), "w", encoding="utf-8") as f:
+            f.write("# 共享知识\n")
         os.makedirs(os.path.join(self.ws, "skills"))
-        json.dump({"ncc-community": {"scope": "all"}}, open(os.path.join(self.ws, "skills", "index.json"), "w"))
+        with open(os.path.join(self.ws, "skills", "index.json"), "w", encoding="utf-8") as f:
+            json.dump({"ncc-community": {"scope": "all"}}, f)
         ref = []
         self.fake = FakeDsh(ref)
         self.gw = Gateway(DEFAULTS, self.data, self.ws, dsh_factory=lambda: self.fake)
@@ -49,7 +62,8 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(out["bubbles"], ["大理还开着，黄山也在。"])
         self.assertEqual(self.fake.prompts[0][0], "肥肉测试1🐶")
         self.assertIn("[群聊:肥肉测试1🐶 | 发言人:松爸", self.fake.prompts[0][1])
-        log = open(os.path.join(self.data, "log", "replies-" + __import__("time").strftime("%Y%m%d") + ".jsonl"), encoding="utf-8").read()
+        with open(os.path.join(self.data, "log", "replies-" + __import__("time").strftime("%Y%m%d") + ".jsonl"), encoding="utf-8") as f:
+            log = f.read()
         self.assertIn("大理还开着", log)
 
     def test_no_reply(self):
@@ -117,6 +131,83 @@ class GatewayTest(unittest.TestCase):
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out["bubbles"], ["ok"])
         self.assertTrue(self.fake.alive())
+
+    # ---- 复审修补：轮次标识 / 超时重建 / 生命周期 ----
+    def test_stale_turn_callback_rejected(self):
+        ids = []
+
+        def first(gw):
+            ids.append(gw.inflight.turn_id)
+            gw.tool_call("wx_reply", {"bubbles": ["第一轮"], "turn_id": gw.inflight.turn_id})
+
+        def second(gw):
+            r = gw.tool_call("wx_reply", {"bubbles": ["串话"], "turn_id": ids[0]})
+            assert r["ok"] is False, r
+            r2 = gw.tool_call("wx_reply", {"bubbles": ["正确"], "turn_id": gw.inflight.turn_id})
+            assert r2["ok"], r2
+        self.fake.script = [first, second]
+        self.gw.handle_reply({"conversation": "A", "is_group": False, "sender": "A", "text": "在吗"})
+        out = self.gw.handle_reply({"conversation": "B", "is_group": False, "sender": "B", "text": "你好"})
+        self.assertEqual(out["bubbles"], ["正确"])
+        self.assertNotEqual(ids[0], self.fake.prompts[1][1])  # 两轮 id 不同
+
+    def test_prefix_line_carries_turn_id(self):
+        ids = []
+        self.fake.script = [lambda gw: (ids.append(gw.inflight.turn_id),
+                                        gw.tool_call("wx_reply", {"bubbles": ["在"], "turn_id": gw.inflight.turn_id}))]
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "在吗"})
+        first_line = self.fake.prompts[0][1].split("\n")[0]
+        self.assertIn("| 轮次:" + ids[0] + "]", first_line)
+        self.assertTrue(first_line.startswith("[群聊:K | 发言人:K"))
+
+    def test_missing_turn_id_accepted_but_logged(self):
+        seen = []
+        self.fake.script = [lambda gw: (gw.tool_call("wx_reply", {"bubbles": ["无标识"]}),
+                                        seen.extend(gw.inflight.tool_log))]
+        out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(out["bubbles"], ["无标识"])
+        self.assertIn({"tool": "wx_reply", "no_turn_id": True}, seen)
+
+    def test_timeout_restarts_dsh(self):
+        self.fake.timeout_next = True
+        out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(out, {"no_reply": True, "reason": "timeout"})
+        self.assertEqual(self.fake.stopped, 1)
+        self.assertIsNone(self.gw.dsh)
+        self.assertEqual(len(self.fake.prompts), 1)  # 超时后不再 nudge
+        self.assertTrue(self.gw.read_log(1)[0]["dsh_restarted_after_timeout"])
+
+    def test_ensure_dsh_stops_old_client(self):
+        ref = [None]
+        fakes = []
+
+        def factory():
+            f = FakeDsh(ref)
+            n = len(fakes)   # 两次文案不同，避免撞上同会话的最近回复去重
+            f.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": [f"第{n}个进程在答"], "turn_id": gw.inflight.turn_id})]
+            fakes.append(f)
+            return f
+        gw = Gateway(DEFAULTS, self.data, self.ws, dsh_factory=factory)
+        ref[0] = gw
+        gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        fakes[0]._alive = False
+        out = gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯嗯"})
+        self.assertEqual(out["bubbles"], ["第1个进程在答"])
+        self.assertEqual(len(fakes), 2)
+        self.assertEqual(fakes[0].stopped, 1)
+        self.assertIs(gw.dsh, fakes[1])
+
+    def test_initialize_failure_leaves_no_half_dead_client(self):
+        self.fake.init_fail_once = True
+        out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertTrue(out["error"].startswith("dsh init failed: "))
+        self.assertIsNone(self.gw.dsh)
+        self.assertEqual(self.fake.stopped, 1)
+        self.assertEqual(self.fake.prompts, [])
+        # 下一条正常起来
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["活了"]})]
+        out2 = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(out2["bubbles"], ["活了"])
 
 
 if __name__ == "__main__":

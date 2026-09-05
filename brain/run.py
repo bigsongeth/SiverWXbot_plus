@@ -22,8 +22,8 @@ SEED = os.path.join(HERE, "workspace")
 
 
 def seed_workspace(ws: str) -> None:
-    """种子只在目标缺失时复制：PERSONA.md / skills / knowledge 每次覆盖（进库的是真相源），
-    memory / proposals 只建目录。"""
+    """PERSONA.md / skills 每次启动都覆盖（进库的是真相源）；knowledge/shared.md 只在缺失时
+    种一次（运行中会被审核通过的提议追加，不能覆盖）；memory / proposals 只建目录。"""
     for sub in ("memory/people", "memory/groups", "proposals", "knowledge", "skills"):
         os.makedirs(os.path.join(ws, sub), exist_ok=True)
     shutil.copy(os.path.join(SEED, "PERSONA.md"), os.path.join(ws, "PERSONA.md"))
@@ -66,11 +66,13 @@ def main() -> None:
     cfg = config.load(data)
     seed_workspace(ws)
     profile.prepare_dsh_home(dsh_home, key, cfg["model"])
-    persona = open(os.path.join(ws, "PERSONA.md"), encoding="utf-8").read()
+    with open(os.path.join(ws, "PERSONA.md"), encoding="utf-8") as f:
+        persona = f.read()
     patch_path = os.path.join(data, "cordis.patch.yml")
     with open(patch_path, "w", encoding="utf-8") as f:
         f.write(profile.render_patch(persona, [sys.executable, os.path.join(HERE, "mcp", "feirou_tools.py")],
                                      os.path.join(HERE, "mcp", "grok_search", "server.js"), key, node=node))
+    os.chmod(patch_path, 0o600)   # patch 里嵌着 key
     env = dict(os.environ, DSH_HOME=dsh_home, SONGKEY_API_KEY=key,
                FEIROU_GW=f"http://127.0.0.1:{cfg['port']}")
 

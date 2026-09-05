@@ -10,6 +10,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, List, Optional
@@ -21,6 +22,16 @@ from .replies import RecentReplies
 from .validate import validate_reply
 
 NUDGE = "你刚才没有调用 wx_reply 也没有调用 no_reply。现在二选一：要说话就调 wx_reply 把话放进 bubbles；不该接话就调 no_reply。"
+STALE_TURN = "这个调用属于已经结束的上一轮，已忽略。"
+TURN_TOOLS = ("wx_reply", "no_reply", "propose_shared_knowledge")
+
+
+def _stamp_turn_id(msg: str, turn_id: str) -> str:
+    """把轮次标识塞进 build_user_message 产出的首行 `[...]` 收尾处（不改 context.py）。"""
+    head, sep, rest = msg.partition("\n")
+    if head.endswith("]"):
+        head = head[:-1] + f" | 轮次:{turn_id}]"
+    return head + sep + rest
 
 
 @dataclass
@@ -28,6 +39,7 @@ class Inflight:
     conversation: str
     is_group: bool
     budget: int
+    turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     attempts: int = 0
     result: Optional[dict] = None          # {"bubbles": [...]} 或 {"no_reply": True, "reason": ...}
     tool_log: List[dict] = field(default_factory=list)
@@ -50,11 +62,38 @@ class Gateway:
 
     # ---- dsh 生命周期 ----
     def _ensure_dsh(self):
-        if self.dsh is None or not self.dsh.alive():
-            self.dsh = self.dsh_factory()
-            self.dsh.start()
-            self.dsh.initialize(self.ws, self.cfg["provider"], self.cfg["model"])
-            self.primed.clear()   # 进程重来了，会话是否接续未知，保守地允许再预热一次
+        if self.dsh is not None and self.dsh.alive():
+            return
+        if self.dsh is not None:
+            # 死掉的客户端也要 stop：关掉管道句柄，别泄漏
+            try:
+                self.dsh.stop()
+            except Exception:
+                pass
+            self.dsh = None
+        new = self.dsh_factory()
+        try:
+            new.start()
+            new.initialize(self.ws, self.cfg["provider"], self.cfg["model"])
+        except Exception:
+            # initialize 失败就别留半死的进程挂在 self.dsh 上
+            try:
+                new.stop()
+            except Exception:
+                pass
+            self.dsh = None
+            raise
+        self.dsh = new
+        self.primed.clear()   # 进程重来了，会话是否接续未知，保守地允许再预热一次
+
+    def _restart_dsh_after_timeout(self) -> None:
+        """一轮超时后 dsh 仍在跑那一轮，后续的工具回调会串到下一条消息上；直接重建进程。"""
+        if self.dsh is not None:
+            try:
+                self.dsh.stop()
+            except Exception:
+                pass
+        self.dsh = None
 
     # ---- 主流程 ----
     def handle_reply(self, payload: dict) -> dict:
@@ -71,20 +110,30 @@ class Gateway:
             return {"error": "busy"}
         t0 = time.time()
         try:
-            self._ensure_dsh()
+            try:
+                self._ensure_dsh()
+            except Exception as e:
+                return {"error": f"dsh init failed: {type(e).__name__}: {e}"}
             prime = None
             if conv not in self.primed:
                 prime = context.filter_prime(payload.get("prime") or [], self.cfg["prime_count"]) or None
                 self.primed.add(conv)
             skills = context.match_skills(self.skill_index, conv, is_group)
-            msg = context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"), skills, prime)
             self.inflight = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
+            msg = _stamp_turn_id(context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
+                                                            skills, prime), self.inflight.turn_id)
             turn = self.dsh.prompt(conv, msg, self.cfg["turn_timeout_sec"])
             reasoning = turn.reasoning
             if self.inflight.result is None and not turn.timed_out:
                 turn2 = self.dsh.prompt(conv, NUDGE, self.cfg["turn_timeout_sec"])
                 reasoning += "\n---nudge---\n" + turn2.reasoning
                 turn.timed_out = turn2.timed_out
+            restarted = False
+            if turn.timed_out:
+                # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上；
+                # turn_id 校验是第一道，重建进程是第二道保险。
+                self._restart_dsh_after_timeout()
+                restarted = True
             result = self.inflight.result
             if result is None:
                 result = {"no_reply": True, "reason": "timeout" if turn.timed_out else "model_silent"}
@@ -94,9 +143,11 @@ class Gateway:
             self.turns += 1
             self._log({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
                        "sender": sender, "text": text, "budget": self.inflight.budget, "skills": skills,
+                       "turn_id": self.inflight.turn_id,
                        "primed": prime is not None, "result": result, "attempts": self.inflight.attempts,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
-                       "memory_truncated": truncated, "ms": int((time.time() - t0) * 1000)})
+                       "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted,
+                       "ms": int((time.time() - t0) * 1000)})
             return result
         finally:
             self.inflight = None
@@ -117,12 +168,20 @@ class Gateway:
     def tool_call(self, name: str, args: dict) -> dict:
         if name == "kb_search":
             txt = kb.search(self.cfg["kb_url"], str(args.get("query", "")), self.cfg["kb_timeout_sec"])
-            if self.inflight:
-                self.inflight.tool_log.append({"tool": name, "query": args.get("query", "")})
+            inf = self.inflight   # 只读一次：检索期间在飞的请求可能已经换人
+            if inf is not None:
+                inf.tool_log.append({"tool": name, "query": args.get("query", "")})
             return {"ok": True, "text": txt}
         inf = self.inflight
         if inf is None:
             return {"ok": False, "text": "当前没有在处理的消息，这个调用被忽略。"}
+        if name in TURN_TOOLS:
+            tid = args.get("turn_id")
+            if tid is not None and str(tid) != inf.turn_id:
+                # 上一轮超时后 dsh 迟到的回调：绝不能算到当前这条消息头上
+                return {"ok": False, "text": STALE_TURN}
+            if tid is None:
+                inf.tool_log.append({"tool": name, "no_turn_id": True})
         inf.tool_log.append({"tool": name, "args": args})
         if name == "wx_reply":
             inf.attempts += 1
@@ -181,16 +240,19 @@ def make_handler(gw: Gateway):
 
         def do_GET(self):
             u = urlparse(self.path)
-            if u.path == "/health":
-                return self._json(200, gw.state())
-            if u.path == "/proposals":
-                st = (parse_qs(u.query).get("status") or [None])[0]
-                return self._json(200, gw.proposals.list(st))
-            if u.path == "/log":
-                lim = int((parse_qs(u.query).get("limit") or ["50"])[0])
-                return self._json(200, gw.read_log(lim))
-            if u.path == "/skills":
-                return self._json(200, gw.skill_index)
+            try:
+                if u.path == "/health":
+                    return self._json(200, gw.state())
+                if u.path == "/proposals":
+                    st = (parse_qs(u.query).get("status") or [None])[0]
+                    return self._json(200, gw.proposals.list(st))
+                if u.path == "/log":
+                    lim = int((parse_qs(u.query).get("limit") or ["50"])[0])
+                    return self._json(200, gw.read_log(lim))
+                if u.path == "/skills":
+                    return self._json(200, gw.skill_index)
+            except Exception as e:
+                return self._json(500, {"error": f"{type(e).__name__}: {e}"})
             self._json(404, {"error": "not found"})
 
         def do_POST(self):

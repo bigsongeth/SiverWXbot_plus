@@ -17,23 +17,27 @@ GW = os.environ.get("FEIROU_GW", "http://127.0.0.1:8500").rstrip("/")
 # kb_search 在网关侧封顶 20s，wx_reply 是本地写库基本秒回，45s 留了充足余量。
 GW_TIMEOUT_SEC = 45
 
+TURN_ID = {"type": "string", "description": "系统在消息开头给你的「轮次」标识，原样填入"}
+
 TOOLS = [
     {"name": "wx_reply",
      "description": "把你决定要说的话发到微信。这是唯一的说话通道，正文里写的字不会被发出去。"
                     "群聊最多 2 条气泡、私聊最多 3 条，总字数要在系统给你的预算之内；像真人一样一两句话，不要客套收尾。"
                     "被拒绝时按返回的提示改了再调一次。",
      "inputSchema": {"type": "object", "properties": {
-         "bubbles": {"type": "array", "items": {"type": "string"}, "description": "按顺序发出的气泡，每条一段话"}},
+         "bubbles": {"type": "array", "items": {"type": "string"}, "description": "按顺序发出的气泡，每条一段话"},
+         "turn_id": TURN_ID},
          "required": ["bubbles"]}},
     {"name": "no_reply",
      "description": "判断这条消息不需要接话时调用（附和、点赞、别人之间的闲聊、话题已经聊完）。调了它就不要再调 wx_reply。",
-     "inputSchema": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]}},
+     "inputSchema": {"type": "object", "properties": {"reason": {"type": "string"}, "turn_id": TURN_ID}, "required": ["reason"]}},
     {"name": "propose_shared_knowledge",
      "description": "把聊天里得到的、对所有人都有用的事实（据点变动、价格、联系方式、活动）提交审核。"
                     "通过后才会进入共享知识；未通过前不要当作事实告诉别人。",
      "inputSchema": {"type": "object", "properties": {
          "text": {"type": "string", "description": "一句话事实"},
-         "source": {"type": "string", "description": "谁在哪说的"}}, "required": ["text", "source"]}},
+         "source": {"type": "string", "description": "谁在哪说的"},
+         "turn_id": TURN_ID}, "required": ["text", "source"]}},
     {"name": "kb_search",
      "description": "检索 NCC 社区知识库（公众号文章 + 固定事实清单）。问据点、活动、报名、主理人、社区历史时先查再答。",
      "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
