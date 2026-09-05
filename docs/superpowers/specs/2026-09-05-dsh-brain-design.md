@@ -83,8 +83,10 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 - 常驻 `dsh --profile sdk`，网关通过 stdio JSON-RPC 驱动（2026-09-05 已在 mac 上实测：
   initialize 0.6s，每轮 7.7–9.5s，同 session 记得上文，不同 session 隔离）。
 - 一个微信会话（一个群或一个私聊对象）= 一个 dsh session，sessionId 就是会话名。
-- 模型：主用 `songkey/deepseek-v4-flash`（免费、实测每轮 8–10s），
-  备用 `glm-5.2`（settings.yaml 里记着它工具调用最稳）。模拟阶段两者都跑一遍再定。
+- 模型：主用 `songkey/songkey-auto`（用户 2026-09-05 指定；网关自己挑当下能用的上游）。
+  已知风险：mac 上 dsh settings.yaml 的 8-27 注释记着它会被路由到 grok-4.5、长 write 参数
+  会挂。大脑的工具参数都很短（气泡 ≤ 220 字），期 0 专门验它调 MCP 工具的成功率，
+  低于 9/10 就退到 `deepseek-v4-flash`（已实测每轮 8–10s）。
 - 人设走工作区根目录的 `AGENTS.md`（dsh 会读 cwd 下的说明文件，实测确认）。
   它读 cwd 这个特性因此是**受控的**：cwd 里只有肥肉自己的东西。
 - 通过 profile patch 关掉：`dsh-tool-bash`、`dsh-tool-pwsh`、`dsh-tool-subagent`、
@@ -200,14 +202,14 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 上线到测试群的判据：
 - 100 条回放里，零条超预算、零条重复开头、零条收尾套话；
 - 用户看过对照表认可；
-- 两个模型各跑一轮，定下主用哪个。
+- songkey-auto 跑通一轮；若期 0 判定它工具调用不稳，改用 deepseek-v4-flash 再跑一轮。
 之后由用户在测试群真机测试，再逐步扩到其它会话。
 
 ## 9. 分期
 
 | 期 | 内容 | 产出 |
 |---|---|---|
-| 0 验证 | sdk session 重启接续？AGENTS.md 人设生效？patch 关工具生效？deepseek-v4-flash 调 MCP 工具稳不稳？OrbStack 容器里跑 tailscaled + 出口防火墙可行？ | 五条各一句结论 |
+| 0 验证 | sdk session 重启接续？AGENTS.md 人设生效？patch 关工具生效？songkey-auto 调 MCP 工具稳不稳（10 次里成功几次）？OrbStack 容器里跑 tailscaled + 出口防火墙可行？ | 五条各一句结论 |
 | 1 大脑本体 | 网关 + 工具 + 闸门 + 人设 + 技能目录 + 回放工具，先在 mac 本机跑 | 对照表第一轮 |
 | 2 容器化 | Dockerfile、tailscaled、ACL、出口防火墙、两个用户、数据卷 | 验收判据 §2.1 通过 |
 | 3 机器人接入 | 插件 + 面板页 + 知识库只读端点 | 单测全绿 |
