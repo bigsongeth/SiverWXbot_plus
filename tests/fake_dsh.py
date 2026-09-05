@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """假 dsh sdk 服务：stdin 读 JSON-RPC 行，模拟 initialize / session/prompt / shutdown。
 prompt 文本里含 "SLOW" 时 sleep 3 秒再回；含 "CRASH" 时直接退出进程；
-含 "HANG" 时回一次 ack 后不再读 stdin、直接 sleep 30 秒（模拟进程卡死不响应 shutdown）。"""
+含 "HANG" 时回一次 ack 后不再读 stdin、直接 sleep 30 秒（模拟进程卡死不响应 shutdown）；
+含 "TURNERR" 时发一个带错误的 turn/end 事件。"""
 import json
 import sys
 import time
@@ -43,10 +44,13 @@ for line in sys.stdin:
         event(s, "turn/start", {"turn": 1})
         if "SLOW" in text:
             time.sleep(3)
-        event(s, "assistant/message", {"turn": 1, "step": 1, "message": {"role": "assistant", "content": [
-            {"type": "reasoning", "text": "thinking about: " + text},
-            {"type": "text", "text": "echo: " + text}]}})
-        event(s, "turn/end", {"turn": 1})
+        if "TURNERR" in text:
+            event(s, "turn/end", {"turn": 1, "reason": {"kind": "error", "error": {"message": "boom"}}})
+        else:
+            event(s, "assistant/message", {"turn": 1, "step": 1, "message": {"role": "assistant", "content": [
+                {"type": "reasoning", "text": "thinking about: " + text},
+                {"type": "text", "text": "echo: " + text}]}})
+            event(s, "turn/end", {"turn": 1})
         out({"jsonrpc": "2.0", "method": "session.status", "params": {"sessionId": s, "status": "idle"}})
     elif m == "shutdown":
         out({"jsonrpc": "2.0", "id": i, "result": {}})

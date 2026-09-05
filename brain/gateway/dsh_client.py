@@ -22,6 +22,7 @@ class TurnResult:
     text: str = ""
     events: List[dict] = field(default_factory=list)
     timed_out: bool = False
+    error: str = ""
 
 
 class DshClient:
@@ -187,6 +188,11 @@ class DshClient:
                             res.text += b.get("text", "")
                 elif typ == "turn/end":
                     turn_ended = True
+                    reason = (ev.get("data") or {}).get("reason") or {}
+                    if reason.get("kind") == "error":
+                        error_msg = (reason.get("error") or {}).get("message", "")
+                        if error_msg:
+                            res.error = error_msg
             elif meth == "session.status" and prm.get("status") == "idle" and turn_ended:
                 return res
         res.timed_out = True

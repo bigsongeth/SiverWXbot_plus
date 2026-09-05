@@ -50,6 +50,7 @@ class Gateway:
         self.cfg, self.data, self.ws = cfg, data_dir, workspace_dir
         self.dsh_factory = dsh_factory
         self.dsh = None
+        self.dsh_epoch = ""
         self.lock = threading.Lock()
         self.inflight: Optional[Inflight] = None
         self.recent = RecentReplies(os.path.join(data_dir, "log", "recent.json"),
@@ -84,7 +85,12 @@ class Gateway:
             self.dsh = None
             raise
         self.dsh = new
+        self.dsh_epoch = time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:4]
         self.primed.clear()   # 进程重来了，会话是否接续未知，保守地允许再预热一次
+
+    def _session_id(self, conversation: str) -> str:
+        """返回复合会话 ID：对话名#epoch，防止 dsh 重启后的会话 ID 碰撞。"""
+        return f"{conversation}#{self.dsh_epoch}"
 
     def _restart_dsh_after_timeout(self) -> None:
         """一轮超时后 dsh 仍在跑那一轮，后续的工具回调会串到下一条消息上；直接重建进程。"""
@@ -122,10 +128,11 @@ class Gateway:
             self.inflight = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
             msg = _stamp_turn_id(context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
                                                             skills, prime), self.inflight.turn_id)
-            turn = self.dsh.prompt(conv, msg, self.cfg["turn_timeout_sec"])
+            session_id = self._session_id(conv)
+            turn = self.dsh.prompt(session_id, msg, self.cfg["turn_timeout_sec"])
             reasoning = turn.reasoning
-            if self.inflight.result is None and not turn.timed_out:
-                turn2 = self.dsh.prompt(conv, NUDGE, self.cfg["turn_timeout_sec"])
+            if self.inflight.result is None and not turn.timed_out and not turn.error:
+                turn2 = self.dsh.prompt(session_id, NUDGE, self.cfg["turn_timeout_sec"])
                 reasoning += "\n---nudge---\n" + turn2.reasoning
                 turn.timed_out = turn2.timed_out
             restarted = False
@@ -136,18 +143,24 @@ class Gateway:
                 restarted = True
             result = self.inflight.result
             if result is None:
-                result = {"no_reply": True, "reason": "timeout" if turn.timed_out else "model_silent"}
+                if turn.error:
+                    result = {"no_reply": True, "reason": "dsh_error"}
+                else:
+                    result = {"no_reply": True, "reason": "timeout" if turn.timed_out else "model_silent"}
             if result.get("bubbles"):
                 self.recent.add(conv, result["bubbles"])
             truncated = memory_guard.enforce(os.path.join(self.ws, "memory"), self.cfg["memory_max_bytes"])
             self.turns += 1
-            self._log({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
+            log_rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
                        "sender": sender, "text": text, "budget": self.inflight.budget, "skills": skills,
-                       "turn_id": self.inflight.turn_id,
+                       "turn_id": self.inflight.turn_id, "session_id": session_id,
                        "primed": prime is not None, "result": result, "attempts": self.inflight.attempts,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted,
-                       "ms": int((time.time() - t0) * 1000)})
+                       "ms": int((time.time() - t0) * 1000)}
+            if turn.error:
+                log_rec["dsh_error"] = turn.error
+            self._log(log_rec)
             return result
         finally:
             self.inflight = None

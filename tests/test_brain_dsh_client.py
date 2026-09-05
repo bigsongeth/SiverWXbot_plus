@@ -70,6 +70,11 @@ class DshClientTest(unittest.TestCase):
         self.assertLess(elapsed, 5.0, f"stop() 耗时 {elapsed:.2f}s，应在约 5 秒内返回")
         self.assertFalse(c.alive())
 
+    def test_turn_error_is_surfaced(self):
+        r = self.c.prompt("s1", "TURNERR", timeout_sec=5)
+        self.assertEqual(r.error, "boom")
+        self.assertFalse(r.timed_out)
+
 
 if __name__ == "__main__":
     unittest.main()

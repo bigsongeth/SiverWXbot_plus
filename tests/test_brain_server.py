@@ -20,6 +20,7 @@ class FakeDsh:
         self.stopped = 0
         self.timeout_next = False       # 为 True 时 prompt 直接返回 timed_out
         self.init_fail_once = False     # 为 True 时 initialize 抛一次
+        self.error_next = False         # 为 True 时 prompt 直接返回 error
 
     def start(self): self._alive = True
     def initialize(self, cwd, provider, model):
@@ -38,6 +39,9 @@ class FakeDsh:
             self.script.pop(0)(self.gw_ref[0])
         if self.timeout_next:
             return TurnResult(reasoning="卡住了", timed_out=True)
+        if self.error_next:
+            self.error_next = False
+            return TurnResult(reasoning="", error="id collision", events=[{"type": "turn/end"}])
         return TurnResult(reasoning="想了一下", text="草稿：不会被发出去", events=[{"type": "turn/end"}])
 
 
@@ -60,7 +64,8 @@ class GatewayTest(unittest.TestCase):
         self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["大理还开着，黄山也在。"]})]
         out = self.gw.handle_reply({"conversation": "肥肉测试1🐶", "is_group": True, "sender": "松爸", "text": "大理还开吗"})
         self.assertEqual(out["bubbles"], ["大理还开着，黄山也在。"])
-        self.assertEqual(self.fake.prompts[0][0], "肥肉测试1🐶")
+        # 会话 ID 现在包含 epoch
+        self.assertTrue(self.fake.prompts[0][0].startswith("肥肉测试1🐶#"))
         self.assertIn("[群聊:肥肉测试1🐶 | 发言人:松爸", self.fake.prompts[0][1])
         with open(os.path.join(self.data, "log", "replies-" + __import__("time").strftime("%Y%m%d") + ".jsonl"), encoding="utf-8") as f:
             log = f.read()
@@ -110,7 +115,8 @@ class GatewayTest(unittest.TestCase):
             {"role": "assistant", "content": "记不清了"},
             {"role": "user", "content": "松爸: 西湖附近有啥推荐"}]})
         self.assertEqual(out["choices"][0]["message"]["content"], "西湖边那家||SPLIT||松爸推荐的")
-        self.assertEqual(self.fake.prompts[0][0], "共建杭州美食地图")
+        # 会话 ID 现在包含 epoch
+        self.assertTrue(self.fake.prompts[0][0].startswith("共建杭州美食地图#"))
         self.assertIn("发言人:松爸", self.fake.prompts[0][1])
         self.assertIn("此前的聊天记录", self.fake.prompts[0][1])
         self.assertIn("小A: 上次那家咖啡店叫啥", self.fake.prompts[0][1])
@@ -208,6 +214,43 @@ class GatewayTest(unittest.TestCase):
         self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["活了"]})]
         out2 = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out2["bubbles"], ["活了"])
+
+    def test_session_id_changes_after_dsh_restart(self):
+        # 第一条消息
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["第一轮"]})]
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        first_session_id = self.fake.prompts[0][0]
+        self.assertTrue(first_session_id.startswith("K#"))
+        # 强制重启
+        self.fake._alive = False
+        fakes = []
+        def factory():
+            f = FakeDsh([self.gw])
+            f.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["第二轮"]})]
+            fakes.append(f)
+            return f
+        self.gw.dsh_factory = factory
+        # 第二条消息
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯嗯"})
+        second_session_id = self.fake.prompts[1][0] if len(self.fake.prompts) > 1 else fakes[0].prompts[0][0]
+        # 验证：两个 session_id 都以 K# 开头，且互不相同，都不是纯 "K"
+        self.assertTrue(first_session_id.startswith("K#"))
+        self.assertTrue(second_session_id.startswith("K#"))
+        self.assertNotEqual(first_session_id, second_session_id)
+        self.assertNotEqual(first_session_id, "K")
+        self.assertNotEqual(second_session_id, "K")
+
+    def test_turn_error_reported_not_masked(self):
+        self.fake.error_next = True
+        out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        # 应该返回 dsh_error，不是 model_silent
+        self.assertEqual(out, {"no_reply": True, "reason": "dsh_error"})
+        # 只发了一个 prompt（主提示），没有 nudge
+        self.assertEqual(len(self.fake.prompts), 1)
+        # 日志里应该包含 dsh_error
+        log = self.gw.read_log(1)[0]
+        self.assertEqual(log["result"]["reason"], "dsh_error")
+        self.assertEqual(log["dsh_error"], "id collision")
 
 
 if __name__ == "__main__":
