@@ -21,7 +21,8 @@ from .proposals import Proposals
 from .replies import RecentReplies
 from .validate import validate_reply
 
-NUDGE = "你刚才没有调用 wx_reply 也没有调用 no_reply。现在二选一：要说话就调 wx_reply 把话放进 bubbles；不该接话就调 no_reply。"
+NUDGE = ("[系统提示｜这不是聊天对象说的话，不要回复它、不要向对方复述它]\n"
+         "你刚才没有调用 wx_reply 也没有调用 no_reply。现在二选一：要说话就调 wx_reply 把话放进 bubbles；不该接话就调 no_reply。")
 STALE_TURN = "这个调用属于已经结束的上一轮，已忽略。"
 TURN_TOOLS = ("wx_reply", "no_reply", "propose_shared_knowledge")
 
@@ -92,8 +93,24 @@ class Gateway:
         """返回复合会话 ID：对话名#epoch，防止 dsh 重启后的会话 ID 碰撞。"""
         return f"{conversation}#{self.dsh_epoch}"
 
+    def _recover_after_timeout(self, session_id: str) -> str:
+        """一轮超时后 dsh 仍在跑那一轮，迟到的工具回调会串到下一条消息上（turn_id 校验是第一道）。
+
+        先试 session/cancel：进程、其它会话、预热都保住，只丢这一轮。回放第一轮里
+        「超时→重建→重预热 20 条→更慢→再超时」连锁把一条私聊 15 轮打掉 11 轮，重建是负反馈。
+        取消失败（等不到 idle）才退回重建进程。返回 "cancelled" / "restarted"。
+        """
+        if self.dsh is not None:
+            try:
+                if self.dsh.cancel(session_id):
+                    return "cancelled"
+            except Exception:
+                pass
+        self._restart_dsh_after_timeout()
+        return "restarted"
+
     def _restart_dsh_after_timeout(self) -> None:
-        """一轮超时后 dsh 仍在跑那一轮，后续的工具回调会串到下一条消息上；直接重建进程。"""
+        """取消不成才走这条：重建进程，下一条消息冷启动 + 重预热。"""
         if self.dsh is not None:
             try:
                 self.dsh.stop()
@@ -122,7 +139,7 @@ class Gateway:
                 return {"error": f"dsh init failed: {type(e).__name__}: {e}"}
             prime = None
             if conv not in self.primed:
-                prime = context.filter_prime(payload.get("prime") or [], self.cfg["prime_count"]) or None
+                prime = context.filter_prime(payload.get("prime") or [], self.cfg["prime_count"], is_group) or None
                 self.primed.add(conv)
             skills = context.match_skills(self.skill_index, conv, is_group)
             self.inflight = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
@@ -136,12 +153,12 @@ class Gateway:
                 reasoning += "\n---nudge---\n" + turn2.reasoning
                 turn.timed_out = turn2.timed_out
                 turn.error = turn.error or turn2.error   # nudge 那轮的 dsh 错误同样如实上报
-            restarted = False
+            recovery = ""
             if turn.timed_out:
                 # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上；
-                # turn_id 校验是第一道，重建进程是第二道保险。
-                self._restart_dsh_after_timeout()
-                restarted = True
+                # turn_id 校验是第一道，取消那一轮（不成则重建进程）是第二道保险。
+                recovery = self._recover_after_timeout(session_id)
+            restarted = recovery == "restarted"
             result = self.inflight.result
             if result is None:
                 if turn.error:
@@ -158,6 +175,7 @@ class Gateway:
                        "primed": prime is not None, "result": result, "attempts": self.inflight.attempts,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted,
+                       "dsh_cancelled_after_timeout": recovery == "cancelled",
                        "ms": int((time.time() - t0) * 1000)}
             if turn.error:
                 log_rec["dsh_error"] = turn.error

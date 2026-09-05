@@ -32,7 +32,7 @@ _CLOSING = re.compile(r"(需要我|要不要|还要|想知道|继续吗|要我|�
 _FIELDS = ("conversation", "is_group", "sender", "text", "prime")
 
 
-def post(url: str, payload: dict, timeout: float = 150) -> dict:
+def post(url: str, payload: dict, timeout: float = 300) -> dict:
     req = urllib.request.Request(url.rstrip("/") + "/reply", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                                  headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:

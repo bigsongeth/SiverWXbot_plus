@@ -153,6 +153,29 @@ class DshClient:
     def initialize(self, cwd: str, provider: str, model: str) -> dict:
         return self._request("initialize", {"cwd": cwd, "provider": provider, "model": model}, timeout=60)
 
+    def cancel(self, session_id: str, drain_sec: float = 8.0) -> bool:
+        """取消该会话正在跑的那一轮（dsh 的 session/cancel，keepInbox），再等它回到 idle。
+
+        超时后用这个代替重建进程：进程与预热都保住，只丢那一轮。等不到 idle 返回 False，
+        调用方应退回重建进程。
+        """
+        try:
+            self._request("session/cancel", {"sessionId": session_id}, timeout=5)
+        except Exception:
+            return False
+        q = self._session_queue(session_id)
+        deadline = time.time() + drain_sec
+        while time.time() < deadline:
+            if not self.alive():
+                return False
+            try:
+                m = q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if m.get("method") == "session.status" and (m.get("params") or {}).get("status") == "idle":
+                return True
+        return False
+
     def prompt(self, session_id: str, text: str, timeout_sec: float) -> TurnResult:
         q = self._session_queue(session_id)
         while not q.empty():  # 丢掉上一轮残留的通知

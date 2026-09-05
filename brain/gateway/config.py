@@ -9,8 +9,8 @@ DEFAULTS = {
     "bind": "0.0.0.0",
     "provider": "songkey",
     "model": "songkey-auto",
-    "turn_timeout_sec": 60,
-    "lock_timeout_sec": 70,
+    "turn_timeout_sec": 120,   # songkey-auto 目前落到 grok-4.6，一句话也要先烧 700 个推理 token（24s 起步）
+    "lock_timeout_sec": 250,   # 主 prompt + nudge 各 120s 的最坏情况
     "budget": {"base": 30, "factor": 2.5, "min": 40, "max_group": 150, "max_private": 220},
     "max_bubbles_group": 2,
     "max_bubbles_private": 3,

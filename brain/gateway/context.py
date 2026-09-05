@@ -58,11 +58,28 @@ def _is_dropped_self_fallback(item: dict) -> bool:
     return any(s in content for s in cfg["drop_assistant_substrings"])
 
 
-def filter_prime(items: List[dict], count: int) -> List[dict]:
-    kept = [x for x in filter_history(list(items or []))
-            if x.get("attr") in ("friend", "self") and x.get("type", "text") == "text"
+_PRIME_TYPES = ("text", "quote")   # 机器人自己的回复在流水里多半是 quote（引用回复），不是 text
+
+
+def _basic_prime_filter(items: List[dict]) -> List[dict]:
+    return [x for x in items
+            if x.get("attr") in ("friend", "self") and x.get("type", "text") in _PRIME_TYPES
             and not is_checkin_text(str(x.get("content", "")))
             and not _is_dropped_self_fallback(x)]
+
+
+def filter_prime(items: List[dict], count: int, is_group: bool = False) -> List[dict]:
+    """私聊走 context_guard 的 filter_history（坏回复整轮连坐）再做基础过滤；
+    群聊不走连坐：那条规则按"一问一答"写的，群里两条 self 之间夹着十几条别人的发言，
+    连坐会把整段历史清成 0（回放第一轮联邦群 20 条 → 0）。私聊连坐后若一条不剩，
+    也退回基础过滤——没历史比带一点脏历史更糟。"""
+    raw = list(items or [])
+    if is_group:
+        kept = _basic_prime_filter(raw)
+    else:
+        kept = _basic_prime_filter(filter_history(list(raw)))
+        if not kept and any(x.get("attr") == "friend" for x in raw):
+            kept = _basic_prime_filter(raw)
     return kept[-count:]
 
 

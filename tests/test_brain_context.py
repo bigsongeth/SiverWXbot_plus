@@ -37,6 +37,31 @@ class PrimeTest(unittest.TestCase):
         items = [{"time": "t", "type": "text", "attr": "friend", "sender": "a", "content": str(i)} for i in range(30)]
         self.assertEqual([x["content"] for x in context.filter_prime(items, 3)], ["27", "28", "29"])
 
+    def test_prime_keeps_quote_replies(self):
+        items = [
+            {"time": "1", "type": "text", "attr": "friend", "sender": "K", "content": "滴滴"},
+            {"time": "2", "type": "quote", "attr": "self", "sender": "self", "content": "汪"},
+        ]
+        self.assertEqual([x["content"] for x in context.filter_prime(items, 20)], ["滴滴", "汪"])
+
+    def test_group_prime_not_wiped_by_round_connivance(self):
+        # 群里两条兜底文案之间夹着十几条别人的发言：私聊式"整轮连坐"会把它们全摘掉
+        items = [{"time": "0", "type": "text", "attr": "self", "sender": "self", "content": "在忙，我稍后回复您"}]
+        items += [{"time": str(i), "type": "text", "attr": "friend", "sender": f"u{i}", "content": f"闲聊{i}"} for i in range(1, 15)]
+        items += [{"time": "15", "type": "text", "attr": "self", "sender": "self", "content": "在忙，我稍后回复您"},
+                  {"time": "16", "type": "text", "attr": "friend", "sender": "K", "content": "@肥肉 在吗"}]
+        out = context.filter_prime(items, 20, is_group=True)
+        self.assertEqual(len(out), 15)
+        self.assertNotIn("在忙，我稍后回复您", [x["content"] for x in out])
+
+    def test_private_prime_falls_back_when_connivance_empties_it(self):
+        items = [
+            {"time": "1", "type": "text", "attr": "friend", "sender": "K", "content": "问题一"},
+            {"time": "2", "type": "text", "attr": "self", "sender": "self", "content": "在忙，我稍后回复您"},
+        ]
+        out = context.filter_prime(items, 20, is_group=False)
+        self.assertEqual([x["content"] for x in out], ["问题一"])
+
     def test_prime_drops_fallback_even_if_context_guard_disabled(self):
         items = [
             {"time": "2026/09/05 10:00:00", "type": "text", "attr": "friend", "sender": "K", "content": "第一个问题"},

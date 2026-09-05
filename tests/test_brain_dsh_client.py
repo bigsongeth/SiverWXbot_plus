@@ -70,6 +70,14 @@ class DshClientTest(unittest.TestCase):
         self.assertLess(elapsed, 5.0, f"stop() 耗时 {elapsed:.2f}s，应在约 5 秒内返回")
         self.assertFalse(c.alive())
 
+    def test_cancel_hanging_turn_keeps_process(self):
+        r = self.c.prompt("s7", "HANGTURN", timeout_sec=1)
+        self.assertTrue(r.timed_out)
+        self.assertTrue(self.c.cancel("s7"))          # 等到了 idle
+        self.assertTrue(self.c.alive())
+        r2 = self.c.prompt("s7", "又来", timeout_sec=5)  # 同一进程、同一会话还能用
+        self.assertEqual(r2.text, "echo: 又来")
+
     def test_turn_error_is_surfaced(self):
         r = self.c.prompt("s1", "TURNERR", timeout_sec=5)
         self.assertEqual(r.error, "boom")

@@ -54,7 +54,7 @@ def from_qa_jsonl(path: str) -> List[dict]:
 
 
 def _as_prime(x: dict) -> dict:
-    """prime 条目：网关 filter_prime 只认 type=text，所以 quote 在这里归一成 text（只改副本）。"""
+    """prime 条目：quote 归一成 text（只改副本；网关 filter_prime 现在两种都收，这里保留只为老对照表可比）。"""
     y = dict(x)
     y["type"] = "text"
     y["content"] = str(x.get("content", ""))

@@ -22,6 +22,8 @@ class FakeDsh:
         self.init_fail_once = False     # 为 True 时 initialize 抛一次
         self.error_next = False         # 为 True 时 prompt 直接返回 error
         self.error_at = None            # 第 N 次 prompt（1 起）返回 error，用来打 nudge 那轮
+        self.cancels = []               # cancel 被调过的 session_id
+        self.cancel_ok = True           # False 模拟 cancel 等不到 idle
 
     def start(self): self._alive = True
     def initialize(self, cwd, provider, model):
@@ -33,6 +35,9 @@ class FakeDsh:
     def stop(self):
         self._alive = False
         self.stopped += 1
+    def cancel(self, session_id):
+        self.cancels.append(session_id)
+        return self.cancel_ok
 
     def prompt(self, session_id, text, timeout_sec):
         self.prompts.append((session_id, text))
@@ -175,14 +180,31 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(out["bubbles"], ["无标识"])
         self.assertIn({"tool": "wx_reply", "no_turn_id": True}, seen)
 
-    def test_timeout_restarts_dsh(self):
+    def test_timeout_cancels_turn_and_keeps_dsh(self):
         self.fake.timeout_next = True
+        out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(out, {"no_reply": True, "reason": "timeout"})
+        self.assertEqual(len(self.fake.cancels), 1)
+        self.assertTrue(self.fake.cancels[0].startswith("K#"))
+        self.assertEqual(self.fake.stopped, 0)        # 进程保住
+        self.assertIs(self.gw.dsh, self.fake)
+        self.assertIn("K", self.gw.primed)            # 预热保住，下一条不重灌历史
+        self.assertEqual(len(self.fake.prompts), 1)   # 超时后不再 nudge
+        log = self.gw.read_log(1)[0]
+        self.assertTrue(log["dsh_cancelled_after_timeout"])
+        self.assertFalse(log["dsh_restarted_after_timeout"])
+
+    def test_timeout_restarts_dsh_when_cancel_fails(self):
+        self.fake.timeout_next = True
+        self.fake.cancel_ok = False
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out, {"no_reply": True, "reason": "timeout"})
         self.assertEqual(self.fake.stopped, 1)
         self.assertIsNone(self.gw.dsh)
-        self.assertEqual(len(self.fake.prompts), 1)  # 超时后不再 nudge
-        self.assertTrue(self.gw.read_log(1)[0]["dsh_restarted_after_timeout"])
+        self.assertEqual(len(self.fake.prompts), 1)
+        log = self.gw.read_log(1)[0]
+        self.assertTrue(log["dsh_restarted_after_timeout"])
+        self.assertFalse(log["dsh_cancelled_after_timeout"])
 
     def test_ensure_dsh_stops_old_client(self):
         ref = [None]
