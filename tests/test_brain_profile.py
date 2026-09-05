@@ -22,16 +22,82 @@ class ProfileTest(unittest.TestCase):
     def test_prepare_dsh_home_writes_settings_once(self):
         d = tempfile.mkdtemp()
         profile.prepare_dsh_home(d, "sk-x", "songkey-auto")
-        s = open(os.path.join(d, "settings.yaml"), encoding="utf-8").read()
+        with open(os.path.join(d, "settings.yaml"), encoding="utf-8") as f:
+            s = f.read()
         self.assertIn("model: songkey-auto", s)
         with open(os.path.join(d, "settings.yaml"), "a", encoding="utf-8") as f:
             f.write("# 人手改过\n")
         profile.prepare_dsh_home(d, "sk-x", "songkey-auto")
-        self.assertIn("人手改过", open(os.path.join(d, "settings.yaml"), encoding="utf-8").read())
+        with open(os.path.join(d, "settings.yaml"), encoding="utf-8") as f:
+            s2 = f.read()
+        self.assertIn("人手改过", s2)
 
     def test_dsh_argv(self):
         self.assertEqual(profile.dsh_argv("node", "/d/bin.js", "/p.yml"),
                          ["node", "/d/bin.js", "--profile", "sdk", "--patch", "/p.yml"])
+
+    def _find_by_id(self, doc, target_id):
+        """在渲染出的 patch 结构里递归找 id == target_id 的条目（有的条目嵌在
+        `insert:` 列表下面，不是顶层元素）。"""
+        found = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                if node.get("id") == target_id:
+                    found.append(node)
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(doc)
+        return found
+
+    def test_render_patch_is_valid_yaml_with_multiline_persona(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML 未安装，跳过 YAML 解析校验")
+            return
+        persona = "你是肥肉。\n第二行。"
+        argv = ["/usr/bin/python3", "/x/feirou_tools.py", "--extra-arg"]
+        txt = profile.render_patch(persona, argv, "/srv/server.js", "sk-test")
+        doc = yaml.safe_load(txt)
+        self.assertIsInstance(doc, list)
+
+        mcp_feirou = self._find_by_id(doc, "mcp-feirou")
+        self.assertEqual(len(mcp_feirou), 1)
+        self.assertEqual(mcp_feirou[0]["config"]["args"], argv[1:])
+
+        sysprompt = self._find_by_id(doc, "system-prompt")
+        self.assertEqual(len(sysprompt), 1)
+        self.assertEqual(sysprompt[0]["config"]["persona"], persona + "\n")
+
+        mcp_grok = self._find_by_id(doc, "mcp-grok")
+        self.assertEqual(len(mcp_grok), 1)
+        self.assertEqual(mcp_grok[0]["config"]["env"]["SONGKEY_API_KEY"], "sk-test")
+
+    def test_render_patch_is_valid_yaml_without_grok_single_arg(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML 未安装，跳过 YAML 解析校验")
+            return
+        persona = "单行人设"
+        argv = ["py", "t.py"]
+        txt = profile.render_patch(persona, argv, None, "sk-test")
+        doc = yaml.safe_load(txt)
+        self.assertIsInstance(doc, list)
+
+        mcp_feirou = self._find_by_id(doc, "mcp-feirou")
+        self.assertEqual(len(mcp_feirou), 1)
+        self.assertEqual(mcp_feirou[0]["config"]["args"], argv[1:])
+
+        sysprompt = self._find_by_id(doc, "system-prompt")
+        self.assertEqual(sysprompt[0]["config"]["persona"], persona + "\n")
+
+        self.assertEqual(self._find_by_id(doc, "mcp-grok"), [])
 
 
 if __name__ == "__main__":

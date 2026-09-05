@@ -1,6 +1,9 @@
 # brain/profile/cordis.patch.yml.tmpl
-# 肥肉大脑的 sdk profile 覆盖层。由 gateway/profile.py 渲染，占位符：__PERSONA__ __FEIROU_CMD__ __FEIROU_ARGS__ __GROK_BLOCK__
-# 关掉的东西：shell 类工具、子代理、dsh 自带联网。审批 never（沙箱兜底，不存在人来点允许）。
+# 肥肉大脑的 sdk profile 覆盖层。由 gateway/profile.py 渲染，人设正文、feirou 命令与参数、
+# grok 可选块由渲染函数按位置注入下方对应字段（此处不写占位符字面量，避免和真正的占位符
+# 一起被 str.replace 命中、把注释炸成非法 YAML）。
+# 关掉的东西：shell 类工具、子代理、dsh 自带联网；同时禁用 approval 与 permission 两个插件
+# （原因见下方注释，效果等价于「从不询问」）。
 - id: tool-bash
   disabled: true
 - id: tool-pwsh
