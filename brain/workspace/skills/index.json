@@ -1,4 +1,19 @@
 {
-  "hz-food-map": {"groups": ["共建杭州美食地图"]},
-  "ncc-community": {"scope": "all"}
+  "hz-food-map": {
+    "groups": [
+      "共建杭州美食地图"
+    ]
+  },
+  "ai-geek-cold": {
+    "groups": [
+      "🏜️AI 及其代理人联邦🐶",
+      "🏜️AI 及其代理人联邦"
+    ]
+  },
+  "crypto-cynic": {
+    "groups": []
+  },
+  "ncc-community": {
+    "scope": "all"
+  }
 }

@@ -57,8 +57,9 @@ class BrainAPI:
             sender = self.conversation
         if image_path or image_url:
             text = (text + " [图片]").strip()
+        # 机器人的 memory_context_count 可能是 1000，网关预热只取最后 20 条，整包发纯属浪费
         payload = {"conversation": self.conversation, "is_group": self.is_group, "sender": sender,
-                   "text": text, "prime": list(history or [])}
+                   "text": text, "prime": list(history or [])[-60:]}
         try:
             r = HTTP.post(self.gateway_url + "/reply", json=payload, timeout=self.timeout_sec)
         except Exception as e:
