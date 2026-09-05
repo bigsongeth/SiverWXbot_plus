@@ -8,6 +8,7 @@ from . import shape
 
 def validate_reply(bubbles: List[str], is_group: bool, budget: int, recent: List[str],
                    attempt: int, cfg: dict) -> Tuple[Optional[List[str]], Optional[str]]:
+    budget = max(int(budget), 1)
     bubbles = [shape.strip_markdown(b).strip() for b in (bubbles or []) if isinstance(b, str)]
     bubbles = [b for b in bubbles if b]
     if not bubbles:
@@ -21,9 +22,15 @@ def validate_reply(bubbles: List[str], is_group: bool, budget: int, recent: List
             return None, f"总字数 {total} 超过预算 {budget}。压到 {budget} 字以内，只留最有信息量的话，去掉铺垫和客套。"
         bubbles = shape.truncate_to(bubbles, budget)
     if attempt < 2:
-        for b in bubbles:
-            hit = shape.repeats(b, recent, cfg.get("repeat_threshold", 0.5))
+        for i, b in enumerate(bubbles):
+            hit = shape.repeats(b, recent + bubbles[:i], cfg.get("repeat_threshold", 0.5))
             if hit:
-                return None, f"「{b[:12]}…」和你之前说过的「{hit[:12]}…」开头或措辞重复了。换个说法，别用同一个开场白。"
+                if i > 0 and hit in bubbles[:i]:
+                    earlier_idx = bubbles[:i].index(hit)
+                    return None, f"第 {i+1} 条和第 {earlier_idx+1} 条重复了，合并成一条或删掉一条。"
+                else:
+                    return None, f"「{b[:12]}…」和你之前说过的「{hit[:12]}…」开头或措辞重复了。换个说法，别用同一个开场白。"
     bubbles = shape.strip_closing(bubbles)
+    if not bubbles:
+        return None, "处理后没有剩下任何内容。要么重新给一条有信息量的话，要么调用 no_reply。"
     return bubbles, None

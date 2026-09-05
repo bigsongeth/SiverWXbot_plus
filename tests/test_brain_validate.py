@@ -36,6 +36,30 @@ class ValidateTest(unittest.TestCase):
         ok, err = validate_reply(["大理还开着。", "要不要我把地址发你？"], True, 100, [], 1, DEFAULTS)
         self.assertEqual(ok, ["大理还开着。"])
 
+    def test_intra_reply_duplicate_rejected_first_attempt_passes_second(self):
+        # Attempt 1: should reject duplicate within same reply
+        ok, err = validate_reply(["晚上有空吗", "晚上有空吗"], True, 100, [], 1, DEFAULTS)
+        self.assertIsNone(ok)
+        self.assertIn("重复", err)
+        # Attempt 2: should pass duplicate within same reply
+        ok, err = validate_reply(["晚上有空吗", "晚上有空吗"], True, 100, [], 2, DEFAULTS)
+        self.assertIsNone(err)
+        self.assertEqual(len(ok), 2)
+
+    def test_zero_budget_never_returns_empty_accept(self):
+        # Attempt 1: budget 0 should mention "预算"
+        ok, err = validate_reply(["一" * 10], True, 0, [], 1, DEFAULTS)
+        self.assertIsNone(ok)
+        self.assertIn("预算", err)
+        # Attempt 2: should not return empty list with no error
+        ok, err = validate_reply(["一" * 10], True, 0, [], 2, DEFAULTS)
+        self.assertFalse(ok == [] and err is None, "Should not return ([], None)")
+        # Should either have error or non-empty accepted list
+        if err is None:
+            self.assertTrue(ok, "If no error, accepted list must be non-empty")
+        else:
+            self.assertIsNone(ok, "If error exists, ok should be None")
+
 
 if __name__ == "__main__":
     unittest.main()
