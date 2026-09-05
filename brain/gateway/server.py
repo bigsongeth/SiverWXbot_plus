@@ -21,8 +21,11 @@ from .proposals import Proposals
 from .replies import RecentReplies
 from .validate import validate_reply
 
-NUDGE = ("[系统提示｜这不是聊天对象说的话，不要回复它、不要向对方复述它]\n"
-         "你刚才没有调用 wx_reply 也没有调用 no_reply。现在二选一：要说话就调 wx_reply 把话放进 bubbles；不该接话就调 no_reply。")
+# 回放 A/B 里 grok-4.6 会把回复写在正文里、然后把这条追问本身当成"系统提示不该回"而调 no_reply，
+# 所以措辞要点明"正文没发出去"，抬头也别用方括号（用户消息首行就是方括号，弱模型分不清）。
+NUDGE = ("【网关提示】刚才你写在正文里的内容没有发给对方（正文永远不会发送）。现在只做一件事："
+         "要说话就调用 wx_reply，把要说的话精简后放进 bubbles；确实不该接话才调用 no_reply。"
+         "本提示不是对方发的消息，不要回复它、不要向对方复述它。")
 STALE_TURN = "这个调用属于已经结束的上一轮，已忽略。"
 TURN_TOOLS = ("wx_reply", "no_reply", "propose_shared_knowledge")
 
