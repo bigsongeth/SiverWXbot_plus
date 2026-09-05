@@ -92,6 +92,11 @@ netstat -ano | findstr LISTEN | findstr :100
 另有不成插件的核心内改动：3.1 面板监听地址、3.10 时间戳清洗与接话闸门（`test_reply_gate.py`）、
 3.12 绕开系统代理的 `HTTP` 会话、3.14 `SEARCH_CHAT_TIMEOUT`。
 
+另有 **`brain/`（肥肉大脑，2026-09-05 立项）**：常驻 dsh 智能体 + 网关 + 说话工具，机器人以后只把消息交给它，
+自己不再挑接口和人设。设计文档 `docs/superpowers/specs/2026-09-05-dsh-brain-design.md`（§2 是用户拍板的硬约束），
+跑法/目录/期 0 结论见 `brain/README.md`。期 1 只在 mac 侧跑、只接测试群；机器人侧插件 `plugins/dsh_brain/` 在期 3 才有。
+单测 `tests/test_brain_*.py`，直接跑文件。
+
 ### 3.1 面板局域网访问（`web_server.py` 的 `host='0.0.0.0'`）★ 容易被合并冲掉
 我们对面板的远程访问是靠**开放局域网监听**实现的：`web_server.py` 末尾的
 ```python
@@ -1060,5 +1065,6 @@ cd /Volumes/SiverWXbot_plus-main && python3 -m py_compile wxbot_core.py web_serv
 | 面板模板 | `templates/dashboard.html` |
 | 配置 | `config/config.json` |
 | 日志 | `panel_logs/`、`wxauto_logs/` |
+| 肥肉大脑 | `brain/`（网关 :8500，运行数据 `~/feirou-brain-data`，见 `brain/README.md`） |
 | 测试 | `tests/`（mac 上直接跑文件，见 5.5） |
 | 行尾 / 忽略规则 | `.gitattributes`、`.gitignore`（见第 5 节） |
