@@ -8,12 +8,15 @@ import re
 from typing import Iterable, List, Optional
 
 _WS = re.compile(r"\s+")
+_URL = re.compile(r"https?://\S+")
 _SENT_END = "。！!？?~～"
 _CLOSING = re.compile(r"(需要我|要不要|还要|想知道|继续吗|要我|想听)")
 
 
 def text_len(s: Optional[str]) -> int:
-    return len(_WS.sub("", s or ""))
+    """算字数预算用：空白不算，链接也不算（美食地图一条短链 38 字符，三家店就把群聊预算吃光了；
+    链接是给人点的，不是"话"）。"""
+    return len(_WS.sub("", _URL.sub("", s or "")))
 
 
 def budget(incoming: str, is_group: bool, cfg: dict) -> int:

@@ -22,6 +22,9 @@ class BudgetTest(unittest.TestCase):
     def test_text_len_ignores_whitespace(self):
         self.assertEqual(shape.text_len(" a b\n c "), 3)
 
+    def test_text_len_ignores_urls(self):
+        self.assertEqual(shape.text_len("蛙喔牛蛙 https://food.bigsong.site/p/B0IUHDMPBE 紫苏味"), 7)
+
     def test_max_bubbles(self):
         self.assertEqual(shape.max_bubbles(True, DEFAULTS), 2)
         self.assertEqual(shape.max_bubbles(False, DEFAULTS), 3)
