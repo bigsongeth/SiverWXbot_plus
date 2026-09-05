@@ -231,6 +231,9 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 | 期 | 内容 | 产出 |
 |---|---|---|
 | 0 验证 | sdk session 重启接续？AGENTS.md 人设生效？patch 关工具生效？songkey-auto 调 MCP 工具稳不稳（10 次里成功几次）？OrbStack 容器里跑 tailscaled + 出口防火墙可行？ | 五条各一句结论 |
+
+期 0 结论（2026-09-05）：① session 重启不接续，`RESULT: RESUME_LOST`（第二个进程问"我叫什么"答案为空、不含"松爸"）——`Gateway._prime_if_new` 是必须项，不是兜底。② patch 生效：`--dump-config` 显示 `id: tool-bash` 命中 `disabled: true`，人设文本原样出现在渲染结果里（`PATCH persona present: True`），实际调用 `列出全部工具名` 时返回的工具表里不含 bash/pwsh 等 shell 工具，只有 MCP 工具（`mcp__feirou__echo`、`mcp__hzfood__*`）和只读/规划类内置工具。③ `songkey-auto` 调 MCP 工具成功率 `RESULT: model=songkey-auto tool_calls_ok=10/10`，选定 `songkey-auto` 为主用模型，不需要再测 `deepseek-v4-flash` 备选。（过程中发现并修正了 brief 模板本身的一个阻断性 bug：`config: policy: never` 会让 `id: approval`/`id: permission`（`@deepseek-ai/dsh-user-approval` / `@deepseek-ai/dsh-permission-presets`）两个插件因缺少 `shell` 服务而永久 `pending`、进程直接起不来，改为对这两个 id 都 `disabled: true` 后才能正常启动；已同步进 `brain/profile/cordis.patch.yml.tmpl` 并加注释。）
+
 | 1 大脑本体 | 网关 + 工具 + 闸门 + 人设 + 技能目录 + 回放工具，先在 mac 本机跑 | 对照表第一轮 |
 | 2 容器化 | Dockerfile、tailscaled、ACL、出口防火墙、两个用户、数据卷 | 验收判据 §2.1 通过 |
 | 3 机器人接入 | 插件 + 面板页 + 知识库只读端点 | 单测全绿 |

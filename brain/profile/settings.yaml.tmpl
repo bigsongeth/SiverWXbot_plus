@@ -1,0 +1,14 @@
+# brain/profile/settings.yaml.tmpl
+llm-pi-ai:
+  providers:
+    songkey:
+      apiKeyEnv: SONGKEY_API_KEY
+      api: openai-completions
+      baseURL: https://key.bigsong.site/v1
+      models:
+        - id: songkey-auto
+        - id: deepseek-v4-flash
+        - id: glm-5.2
+agent-default-model:
+  provider: songkey
+  model: __MODEL__
