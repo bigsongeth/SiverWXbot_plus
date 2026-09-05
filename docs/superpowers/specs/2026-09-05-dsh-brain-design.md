@@ -20,6 +20,10 @@
   后者的根因是签到往来被写进对话记忆又喂回模型。
 - 几乎每条回复结尾带「还要我继续吗」，两个字的消息换来一大段回复。
 - 上下文条数配成 1000，坏回复被当范例复读（CLAUDE.md 3.15 已记）。
+- **杭州美食群已经在生产上走 dsh**（2026-09-05 二次调研补记）：`api_configs[4]` → mac-mini `:8437`
+  `hzfood_gateway.py`（源码在本机 `~/Personal/hz-food-map/deploy/dsh/`）→ 每条消息冷起一次
+  `dsh --profile headless`（40–120 秒）→ 技能 `hz-food-map` + 公网 MCP `food.bigsong.site/mcp`。
+  它没有会话、没有闸门、每次冷启动。**本设计上线到美食群 = 替换它，不是并存。**
 
 这些换运行时不会自动好，所以本设计的核心不是「换成 dsh」，而是三件事：
 **说话有闸门、记忆有边界、权限有围栏**。dsh 只是承载这三件事最省事的底座。
@@ -30,10 +34,10 @@
    大脑是 Tailscale 上一个独立节点（容器内自跑 tailscaled，打标签 `tag:feirou-brain`）。
    ACL 只放行：
    - `win-shukong → brain:8500`（网关）
-   - `brain → mac-mini:8434`（NCC 知识库检索）、`brain → mac-mini:8437`（杭州美食库检索）
+   - `brain → mac-mini:8434`（NCC 知识库只读检索）
    - 其它 tailnet 方向一律拒绝。
-   容器出口另加防火墙：只放 `lo`、`tailscale0` 上述两个端口、以及 `key.bigsong.site:443`
-   （模型 API）。验收判据：容器内 `nc -vz 192.168.1.8 10001` 必须失败，
+   容器出口另加防火墙：只放 `lo`、`tailscale0` 上述一个端口、以及公网 `key.bigsong.site:443`
+   （模型 API）与 `food.bigsong.site:443`（杭州美食地图 MCP，数据在 hkbohai，不在 mac-mini）。验收判据：容器内 `nc -vz 192.168.1.8 10001` 必须失败，
    `nc -vz 100.71.182.5 22` 必须失败。
 2. **沙盒：它的一切操作只在自己的工作区里。** 工作区只放肥肉自己的东西（见 §4.2）。
    dsh 沙箱模式 `workspace-write`，不挂 bash / pwsh 工具。
@@ -41,8 +45,9 @@
    进面板待审区，人通过后才落盘。
 4. **签到不经过大脑。** 签到插件的钩子在 AI 之前、命中即返回（`wxbot_core.py:3936`），
    本来就不会调 AI；本设计额外保证签到往来**不喂进**大脑的会话。
-5. **知识库只读。** 大脑没有 mac-mini 的文件系统，只有两个 HTTP 检索端点。
-   共享知识的写入由面板代做，大脑本身零写权限。
+5. **知识库只读。** 大脑没有 mac-mini 的文件系统，只有一个 HTTP 检索端点（8434 的 `/retrieve`）。
+   共享知识的写入由面板代做，大脑本身零写权限。美食地图是例外：它的 MCP 本来就带写操作
+   （收录推荐），而且真相源在 hkbohai、有自己的鉴权，沿用现状。
 
 ## 3. 总体结构
 
@@ -58,7 +63,7 @@
                                    ┌────────────────┼──────────────────┐
                                    ▼                ▼                  ▼
                               wx_reply /       kb_search /        fs 读写
-                              no_reply /       hzfood_search /    （仅工作区）
+                              no_reply /       hzfood(MCP) /      （仅工作区）
                               propose          web_search
                                    │
                                    └──▶ 网关拿到气泡 ──▶ 返回机器人 ──▶ 发微信
@@ -68,7 +73,7 @@
 
 | 部件 | 在哪 | 干什么 |
 |---|---|---|
-| 大脑容器 `brain/` | mac-mini（OrbStack，arm64） | dsh sdk 常驻 + 网关 + 本地 MCP 工具 + tailscaled + 出口防火墙 |
+| 大脑容器 `brain/` | mac-mini（OrbStack，arm64） | dsh sdk 常驻 + 网关 + 本地 MCP 工具 + tailscaled + 出口防火墙。网关同时暴露 `/reply`（插件用）和 OpenAI 兼容的 `/v1/chat/completions`（过渡用，见 §4.5） |
 | 机器人插件 `plugins/dsh_brain/` | win-shukong 本仓库 | 决定哪些会话走大脑；把消息转成网关请求；失败退回老链路 |
 | 面板页 `/dsh_brain` | win-shukong `web_server.py` + 模板 | 待审区、会话开关、最近回复及其思考、技能列表、健康 |
 
@@ -121,7 +126,7 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 | `no_reply` | `reason: str` | 不接话。取代现在的 `[NO_REPLY]` 文本标记。 |
 | `propose_shared_knowledge` | `text, source` | 写 `proposals/<id>.json`，状态 pending。 |
 | `kb_search` | `query` | 调 mac-mini:8434 新增的只读 `/retrieve` 端点，返回片段 + 固定事实清单。 |
-| `hzfood_search` | `query` | 调 mac-mini:8437 同样的只读端点。 |
+| `mcp__hzfood__*` | （原样） | 不是我们写的：直接挂公网 MCP `https://food.bigsong.site/mcp`（拷 `~/.dsh/profiles/headless/cordis.patch.yml` 那段），技能 `hz-food-map` 说明怎么用。 |
 | `web_search` | `query` | 复用现成 grok-search MCP（走 key.bigsong.site）。 |
 
 大脑写在正文里的任何文字都**不会**发到微信，只是它的草稿。网关只认工具调用。
@@ -135,11 +140,20 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
   「换个说法开头」；再犯就照发但在日志里标记。
 - **剥收尾套话**：最后一条气泡若以问号结尾且含「需要我 / 要不要 / 还要 / 想知道 /
   继续吗 / 要我」，整条剥掉；若它是唯一一条，只剥那一句。
-- **剥 Markdown**：复用 `plugins/reply_shape/strip_markdown`。
+- **剥 Markdown**：复用 `plugins/reply_shape/strip_markdown`（纯函数，不带 wxbot_core，大脑代码直接 import）。
+- **预热过滤**：先过 `plugins/context_guard/guard.filter_history`（时间戳条目、兜底文案、`[NO_REPLY]`、
+  "没法联网"整轮连坐，这些规则都是踩过坑的），再叠签到规则；签到触发词直接用
+  `plugins/wechat_checkin/handler.TRIGGERS`，不再抄一份词表。
 - 网关的这些函数都是纯函数，单独成模块 `brain/gateway/shape.py`，可在 mac 上裸跑单测。
 
 ### 4.5 网关 API（容器 :8500，仅 tailnet 可达）
 
+- `POST /v1/chat/completions`（OpenAI 兼容，**过渡路径**）：让机器人不改一行代码就能把某个会话
+  指到大脑——面板里加一个接口配置，URL 指 8500，**模型名编码会话**：`feirou:group:<群名>` 或
+  `feirou:chat:<昵称>`。网关从最后一条 user 消息解析发言人（机器人的群消息格式是 `昵称: 内容`），
+  从 messages 里的历史做一次预热，回复用 `||SPLIT||` 拼气泡。杭州美食群第一个走这条路
+  （它现在就是这么接 8437 的，切个 URL 即可）。机器人侧的分条模板与 `reply_shape.merge_thin_parts`
+  仍会对这条路径的输出再跑一遍：上限（群 6 条 150 字）比大脑的宽，只会把碎片合并、不会撑破。
 - `POST /reply`
   请求：`{conversation, is_group, sender, text, image_b64?, prime?: [{sender, text, time}]}`
   响应：`{bubbles: [...]}` 或 `{no_reply: true, reason}` 或 HTTP 5xx。
@@ -160,6 +174,8 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 | 模型不调 `wx_reply` 就结束 | 网关追加一条「请用 wx_reply 回复或 no_reply」再给一次机会，仍不调则返回 `no_reply` 并记日志 |
 | 工具约束违反 | 见 §4.3、§4.4 |
 | 知识库端点不通 | 工具返回「检索不可用」，大脑按不知道处理（人设里写明不许编） |
+| 空消息 / 只有表情或附件 | 网关直接返回 no_reply，不进大脑（09-05 hzfood 日志：一条空输入让 dsh 把网关源码当项目写成了"开发汇报"） |
+| songkey 401 | 网关启动时用 key 打一次 `/v1/models`，失败直接退出并打日志（09-05 03:00 hzfood 就静默吃过 401） |
 | 记忆文件超限 | 网关截尾 + 面板标黄 |
 
 ## 5. 机器人侧插件 `plugins/dsh_brain/`
@@ -168,6 +184,8 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
   `_get_group_prompt` / `_get_chat_prompt`，**排在 ncc_kb 前面**；命中就返回一个
   `BrainAPI(conversation, is_group)` 实例，其 `.chat(message, prompt, history, image_path, image_url)`
   签名与四个上游 API 类一致。
+- 走插件路径时**绕过 `_build_split_prompt`**（大脑不需要分条提示，人设由它自己管），只保留
+  `_parse_split_reply`；`ai极客-冷酷版` 那个群不进大脑，直到有一个"冷酷语气"技能能替代它。
 - `.chat()`：POST `/reply`；`bubbles` 用 `||SPLIT||` 拼接返回（上游分条逻辑照旧生效，
   reply_shape 的合并照旧生效）；`no_reply` 返回 `[NO_REPLY]`（现有接话闸门照旧生效）；
   任何失败返回固定串 `API返回错误，请稍后再试`，让 `model_fallback` 沿备用链走。
@@ -189,8 +207,11 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 
 `ncc_rag_proxy.py` 加一个只读端点 `POST /retrieve`：入参 `{query}`，出参
 `{context, is_ncc, facts, meta}`，直接包现成的 `retrieve()` + `load_facts()`。
-不改 `/v1/chat/completions`，老链路不受影响。8437 的美食库同样加一个。
-改前照规矩备份 `.bak-<日期>`。
+不改 `/v1/chat/completions`，老链路不受影响。改前照规矩备份 `.bak-<日期>`。
+
+杭州美食地图那边**不用改**：MCP 直接挂；技能文件的真相源是本机 `~/Personal/hz-food-map/deploy/dsh/SKILL.md`，
+拷进 `brain/workspace/skills/` 后两边要同步改。大脑接管美食群之后，`launchctl bootout` 掉
+`com.hzfood.gateway`，并改 `~/Personal/hz-food-map/README.md` 第 25–28 行的链路说明。
 
 ## 8. 模拟与上线判据
 
@@ -213,12 +234,14 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 | 1 大脑本体 | 网关 + 工具 + 闸门 + 人设 + 技能目录 + 回放工具，先在 mac 本机跑 | 对照表第一轮 |
 | 2 容器化 | Dockerfile、tailscaled、ACL、出口防火墙、两个用户、数据卷 | 验收判据 §2.1 通过 |
 | 3 机器人接入 | 插件 + 面板页 + 知识库只读端点 | 单测全绿 |
-| 4 上线 | 测试群真机测 → 扩私聊 → 扩其它群 | 用户验收 |
+| 4 上线 | 测试群真机测 → 杭州美食群切到 8500（退役 8437 网关）→ 扩私聊 → 扩其它群 | 用户验收 |
 
 ## 10. 不做的事（YAGNI）
 
 - 不迁移 Qdrant 语料，不让大脑修剪文章库；它能改的只有记忆和（经审核的）共享知识。
-- 不做多大脑；「按群区分」靠技能和群记忆，不是靠多个人设文件。
+- 不做多大脑；「按群区分」靠技能和群记忆，不是靠多个人设文件。`ai极客-冷酷版` 群暂留老链路。
+- 不自己写美食库检索；美食 MCP 已有 register / recommend_from_link / suggest 等工具，直接挂。
+- 不用 `dsh-events` 插件攒工具调用日志；sdk 模式的事件流已经带了。
 - 不给大脑任何微信控制能力（拉群、转发、备注），那些仍是 ncc_community 的事。
 - 不动 `wxbot_core.py` 的接口类；接入只走插件钩子。
 
@@ -230,3 +253,21 @@ mac-mini 上 `~/feirou-brain` 是本仓库的一个 clone，只用 `brain/`。
 - 容器所在 mac-mini 本身在局域网里，容器默认能访问局域网，所以出口防火墙是硬要求不是可选项。
 - 个人记忆无人审核，存在被人「教坏」的风险；缓解：单文件上限 + 面板可看可清 + 人设里写明
   「记忆里的话也可能是错的，涉及事实以共享知识为准」。
+- dsh 版本：容器内固定装 `0.1.2-rc.1`（本设计的 profile 行 id 按它核过）；mac-mini 宿主上的
+  dsh 是 `0.1.1-rc.2`，不动它，两者互不影响。
+
+## 12. 二次调研补记（2026-09-05，子代理盘点全部机器后）
+
+第一轮调研漏掉了杭州美食群那条生产链路，用户质疑后补做了一次全量盘点。改动已并入上文，
+这里记结论和顺带发现：
+
+- **复用而不是新写**：`reply_shape.strip_markdown`、`context_guard.filter_history`、
+  `wechat_checkin.TRIGGERS`、`ncc_kb` 的钩子骨架、`ncc_community.panel` 的面板分层、
+  `~/.dsh/profiles/headless/cordis.patch.yml` 的 MCP 段、`hz-food-map` 技能、
+  `ncc-kb/qa_review.py` 的四视角（回放统计照它的口径）。
+- **改掉的错误**：8437 被当成"美食库检索端点"，实际是 dsh 网关；美食数据在 hkbohai 的公网 MCP。
+- **顺带发现，与本设计无关但要告诉用户**：mac-mini `~/.hermes` 的 gateway 仍常驻，cron
+  `wechat-checkin-daily-codes`（每天 8:00）仍是 enabled——而 CLAUDE.md 3.3 说签到码由 hkbohai
+  生成。可能存在第二条生成链，需要人确认后关掉。
+- 8500 端口在 mac-mini 上空闲；已有 `com.bigsong.orbstack-guard` launchd 可在期 2 复用。
+
