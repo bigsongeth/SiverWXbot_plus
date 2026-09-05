@@ -33,6 +33,7 @@ class DshClient:
         self._pending: Dict[int, queue.Queue] = {}
         self._notes: Dict[str, queue.Queue] = {}
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
 
     # ---- 进程 ----
     def start(self) -> None:
@@ -45,17 +46,46 @@ class DshClient:
         return self.p is not None and self.p.poll() is None
 
     def stop(self) -> None:
-        if not self.alive():
+        if self.p is None:
             return
-        try:
-            self._request("shutdown", {}, timeout=3)
-        except Exception:
-            pass
-        try:
-            self.p.terminate()
-            self.p.wait(timeout=3)
-        except Exception:
-            self.p.kill()
+        if self.alive():
+            # graceful shutdown 请求跑在后台线程里：_request 的 timeout 只挡得住等回包，
+            # 挡不住前面那次阻塞的 stdin.write（进程卡死、管道写满时会永久阻塞）。
+            # 主线程只等这个线程最多 3 秒，超时就不再等，直接走强制路径。
+            shutdown_done = threading.Event()
+
+            def _do_shutdown() -> None:
+                try:
+                    self._request("shutdown", {}, timeout=3)
+                except Exception:
+                    pass
+                finally:
+                    shutdown_done.set()
+
+            threading.Thread(target=_do_shutdown, daemon=True).start()
+            shutdown_done.wait(timeout=3)
+            try:
+                self.p.terminate()
+                self.p.wait(timeout=3)
+            except Exception:
+                try:
+                    self.p.kill()
+                    self.p.wait(timeout=3)
+                except Exception:
+                    pass
+        self._close_pipes()
+
+    def _close_pipes(self) -> None:
+        # 崩溃路径（进程自己退出）和正常路径都要走到这里，否则 stdin/stdout 的
+        # TextIOWrapper 会一直不关，触发 ResourceWarning: unclosed file。
+        if self.p is None:
+            return
+        for f in (self.p.stdin, self.p.stdout):
+            try:
+                if f is not None:
+                    f.close()
+            except Exception:
+                pass
 
     # ---- 线路 ----
     def _reader(self) -> None:
@@ -88,8 +118,11 @@ class DshClient:
             rid = self._id
             self._pending[rid] = queue.Queue()
         frame = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, ensure_ascii=False)
-        self.p.stdin.write(frame + "\n")
-        self.p.stdin.flush()
+        # 写锁只保这一段：并发的 _request 若不加锁，两条 frame 的 write+flush 可能交错，
+        # 把换行分帧的协议写坏（尤其是 frame 超过 PIPE_BUF 时）。
+        with self._write_lock:
+            self.p.stdin.write(frame + "\n")
+            self.p.stdin.flush()
         try:
             m = self._pending[rid].get(timeout=timeout)
         except queue.Empty:

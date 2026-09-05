@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """假 dsh sdk 服务：stdin 读 JSON-RPC 行，模拟 initialize / session/prompt / shutdown。
-prompt 文本里含 "SLOW" 时 sleep 3 秒再回；含 "CRASH" 时直接退出进程。"""
+prompt 文本里含 "SLOW" 时 sleep 3 秒再回；含 "CRASH" 时直接退出进程；
+含 "HANG" 时回一次 ack 后不再读 stdin、直接 sleep 30 秒（模拟进程卡死不响应 shutdown）。"""
 import json
 import sys
 import time
@@ -34,6 +35,10 @@ for line in sys.stdin:
         out({"jsonrpc": "2.0", "id": i, "result": {"messageId": "m1"}})
         if "CRASH" in text:
             sys.exit(3)
+        if "HANG" in text:
+            # 卡死模拟：不再发任何事件，也不再读下一行 stdin（本次循环体内同步 sleep）。
+            time.sleep(30)
+            continue
         out({"jsonrpc": "2.0", "method": "session.status", "params": {"sessionId": s, "status": "running"}})
         event(s, "turn/start", {"turn": 1})
         if "SLOW" in text:
