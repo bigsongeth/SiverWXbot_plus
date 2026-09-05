@@ -189,10 +189,13 @@ class DshClient:
                 elif typ == "turn/end":
                     turn_ended = True
                     reason = (ev.get("data") or {}).get("reason") or {}
-                    if reason.get("kind") == "error":
-                        error_msg = (reason.get("error") or {}).get("message", "")
-                        if error_msg:
-                            res.error = error_msg
+                    kind = reason.get("kind")
+                    if kind in ("error", "aborted"):
+                        err = reason.get("error") or {}
+                        # message 为空或 aborted 也要留痕，否则会被上层当成 model_silent
+                        res.error = err.get("message") or f"turn/end kind={kind}"
+                        if err.get("code"):
+                            res.error += f" (code={err['code']})"
             elif meth == "session.status" and prm.get("status") == "idle" and turn_ended:
                 return res
         res.timed_out = True

@@ -21,6 +21,7 @@ class FakeDsh:
         self.timeout_next = False       # 为 True 时 prompt 直接返回 timed_out
         self.init_fail_once = False     # 为 True 时 initialize 抛一次
         self.error_next = False         # 为 True 时 prompt 直接返回 error
+        self.error_at = None            # 第 N 次 prompt（1 起）返回 error，用来打 nudge 那轮
 
     def start(self): self._alive = True
     def initialize(self, cwd, provider, model):
@@ -39,7 +40,7 @@ class FakeDsh:
             self.script.pop(0)(self.gw_ref[0])
         if self.timeout_next:
             return TurnResult(reasoning="卡住了", timed_out=True)
-        if self.error_next:
+        if self.error_next or self.error_at == len(self.prompts):
             self.error_next = False
             return TurnResult(reasoning="", error="id collision", events=[{"type": "turn/end"}])
         return TurnResult(reasoning="想了一下", text="草稿：不会被发出去", events=[{"type": "turn/end"}])
@@ -250,6 +251,15 @@ class GatewayTest(unittest.TestCase):
         # 日志里应该包含 dsh_error
         log = self.gw.read_log(1)[0]
         self.assertEqual(log["result"]["reason"], "dsh_error")
+        self.assertEqual(log["dsh_error"], "id collision")
+
+    def test_nudge_turn_error_reported_not_masked(self):
+        # 首轮模型沉默、nudge 那轮 dsh 报错：也要报 dsh_error，不能伪装成 model_silent
+        self.fake.error_at = 2
+        out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(out, {"no_reply": True, "reason": "dsh_error"})
+        self.assertEqual(len(self.fake.prompts), 2)
+        log = self.gw.read_log(1)[0]
         self.assertEqual(log["dsh_error"], "id collision")
 
 

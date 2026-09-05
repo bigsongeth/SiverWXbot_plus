@@ -135,6 +135,7 @@ class Gateway:
                 turn2 = self.dsh.prompt(session_id, NUDGE, self.cfg["turn_timeout_sec"])
                 reasoning += "\n---nudge---\n" + turn2.reasoning
                 turn.timed_out = turn2.timed_out
+                turn.error = turn.error or turn2.error   # nudge 那轮的 dsh 错误同样如实上报
             restarted = False
             if turn.timed_out:
                 # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上；
