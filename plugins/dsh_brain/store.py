@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""dsh_brain 插件配置（带 mtime 缓存 + 原子写，与 ncc_kb.store 同套路）。改配置下一条消息生效，不用重启。"""
+"""dsh_brain 插件配置（带 mtime 缓存 + 原子写，与 ncc_community.store 同套路）。改配置下一条消息生效，不用重启。"""
 from __future__ import annotations
 
 import copy

@@ -2363,7 +2363,7 @@ class WXBot:
     def _resolve_group_api(self, group_name):
         """
         获取群聊对应的 AI 接口实例。
-        - 若该群开启了知识库（ncc_kb 插件），返回知识库接口
+        - 若该群交给了肥肉大脑（dsh_brain 插件），返回大脑接口
         - 若配置了 group_api_map 映射，则返回对应接口（惰性初始化并缓存）
         - 否则返回默认接口 self.api
         """
@@ -2375,14 +2375,6 @@ class WXBot:
                 return _brain
         except Exception as _brain_err:
             log(level="ERROR", message=f"dsh_brain api hook error: {_brain_err}")
-        # ncc_kb plugin hook: 知识库开关（业务逻辑见 plugins/ncc_kb/）
-        try:
-            from plugins.ncc_kb import kb_api_for
-            _kb = kb_api_for(self, group_name, True)
-            if _kb is not None:
-                return _kb
-        except Exception as _kb_err:
-            log(level="ERROR", message=f"ncc_kb api hook error: {_kb_err}")
         raw = self.config.group_api_map.get(group_name)
         if raw is None:
             return self.api
@@ -3694,14 +3686,6 @@ class WXBot:
                 return _brain
         except Exception as _brain_err:
             log(level="ERROR", message=f"dsh_brain api hook error: {_brain_err}")
-        # ncc_kb plugin hook: 私聊知识库开关（在全局模式下也生效，补齐上游的空缺）
-        try:
-            from plugins.ncc_kb import kb_api_for
-            _kb = kb_api_for(self, user_name, False)
-            if _kb is not None:
-                return _kb
-        except Exception as _kb_err:
-            log(level="ERROR", message=f"ncc_kb api hook error: {_kb_err}")
         if not self.config.AllListen_switch:
             idx = self.config.chat_api_map.get(user_name)
             if idx is not None:
@@ -3721,15 +3705,7 @@ class WXBot:
             return base_prompt
 
     def _get_chat_prompt(self, user_name):
-        """获取私聊用户对应的 prompt 内容（知识库开启时用 NCC 人设 > 白名单 chat_prompt_map > default_prompt）"""
-        # ncc_kb plugin hook
-        try:
-            from plugins.ncc_kb import kb_prompt_for
-            _kb_p = kb_prompt_for(self, user_name, False)
-            if _kb_p:
-                return self._guard_prompt(_kb_p)
-        except Exception as _kb_err:
-            log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
+        """获取私聊用户对应的 prompt 内容（白名单 chat_prompt_map > default_prompt）"""
         if not self.config.AllListen_switch:
             name = self.config.chat_prompt_map.get(user_name) or self.config.default_prompt
         else:
@@ -3737,15 +3713,7 @@ class WXBot:
         return self._guard_prompt(self.config.get_prompt_content(name))
 
     def _get_group_prompt(self, group_name):
-        """获取群组对应的 prompt 内容（知识库开启时用 NCC 人设 > group_prompt_map > default_prompt）"""
-        # ncc_kb plugin hook
-        try:
-            from plugins.ncc_kb import kb_prompt_for
-            _kb_p = kb_prompt_for(self, group_name, True)
-            if _kb_p:
-                return self._guard_prompt(_kb_p)
-        except Exception as _kb_err:
-            log(level="ERROR", message=f"ncc_kb prompt hook error: {_kb_err}")
+        """获取群组对应的 prompt 内容（group_prompt_map > default_prompt）"""
         name = self.config.group_prompt_map.get(group_name) or self.config.default_prompt
         return self._guard_prompt(self.config.get_prompt_content(name))
 

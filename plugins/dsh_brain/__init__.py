@@ -3,7 +3,7 @@
 
 与上游零冲突：wxbot_core.py 只在 _resolve_group_api / _resolve_chat_api 各加一段最小 hook，
 先问本插件"这个会话交给大脑了吗"，交了就返回 BrainAPI（长得和四个接口类一样），
-没交走原逻辑（ncc_kb → group_api_map → 默认接口）。人设/知识库/技能都在大脑那边，
+没交走原逻辑（group_api_map → 默认接口）。人设/知识库/技能都在大脑那边，
 机器人不再挑接口和人设。设计见 docs/superpowers/specs/2026-09-05-dsh-brain-design.md §5，
 跑法见 brain/README.md。配置 data/config.json（不进库，默认全关）。
 """
