@@ -843,7 +843,7 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 - **hook 2 处**：`_resolve_group_api` / `_resolve_chat_api` 开头各一段（大脑自己会查知识库；原 ncc_kb 钩子已于 09-06 删除）。
   返回的 `BrainAPI` 长得和四个接口类一样（`.chat(message, prompt=, history=)`），所以历史/分条/接话闸门/故障转移全复用：
   多条气泡用 `SPLIT_SEPARATOR` 拼、不接话返回 `[NO_REPLY]`、网关出错/超时返回 model_fallback 认的失败串 → 备用链换老接口顶上。
-- **超时 300 秒、不重试**：网关串行，一轮 8–115 秒还要排队；上游 OpenAIAPI 那套 30 秒 + 重试 2 次会把同一条消息发三遍，
+- **超时 420 秒（≥ 网关排队 200 + 一轮 180）、不重试**：网关串行，一轮 8–180 秒还要排队；上游 OpenAIAPI 那套 30 秒 + 重试 2 次会把同一条消息发三遍，
   绝不能拿"OpenAI 兼容接口"配置项去指大脑（最终评审 Important 3）。
 - 走 `requests.Session(trust_env=False)` 直连 Tailscale 地址，同 3.12。刻意不 import `wxbot_core`。
 - 配置 `plugins/dsh_brain/data/config.json`（不进库）：`enabled` 总开关**默认关**，`gateway_url`、`timeout_sec`、

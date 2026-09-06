@@ -9,8 +9,8 @@ DEFAULTS = {
     "bind": "127.0.0.1",   # /tool/* 与 /proposals 审批都没有鉴权，期 1 只准本机访问；期 2 容器化后再在 config.json 放开
     "provider": "songkey",
     "model": "songkey-auto",
-    "turn_timeout_sec": 120,   # songkey-auto 目前落到 grok-4.6，一句话也要先烧 700 个推理 token（24s 起步）
-    "lock_timeout_sec": 250,   # 主 prompt + nudge 各 120s 的最坏情况
+    "turn_timeout_sec": 180,   # 09-06 用户拍板 3 分钟：超时几乎全来自搜索工具（小红书 20–40s/次），两次搜索 + 组织回复要给够
+    "lock_timeout_sec": 200,   # 排队等锁的上限；机器人侧插件 timeout_sec 要 ≥ lock + turn（现在 420）
     "budget": {"base": 30, "factor": 2.5, "min": 40, "max_group": 150, "max_private": 220},
     "max_bubbles_group": 2,
     "max_bubbles_private": 3,

@@ -17,8 +17,8 @@ DEFAULT_CONFIG = {
     "enabled": False,
     # 大脑网关（brain/run.py）地址。期 1 跑在 mac 上，走 Tailscale。
     "gateway_url": "http://100.127.39.63:8500",
-    # 等大脑一轮的上限，必须 ≥ 网关 lock_timeout_sec（250）：网关串行，排队 + 一轮 8–115 秒。
-    "timeout_sec": 300,
+    # 等大脑一轮的上限，必须 ≥ 网关 lock_timeout_sec(200) + turn_timeout_sec(180)：网关串行，先排队再跑一轮。
+    "timeout_sec": 420,
     # 走大脑的群 / 私聊对象名；写 "*" 表示该类全开。排除名单优先于通配。
     "enabled_groups": [],
     "enabled_chats": [],
