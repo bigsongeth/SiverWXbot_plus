@@ -2,7 +2,8 @@
 """假 dsh sdk 服务：stdin 读 JSON-RPC 行，模拟 initialize / session/prompt / shutdown。
 prompt 文本里含 "SLOW" 时 sleep 3 秒再回；含 "CRASH" 时直接退出进程；
 含 "HANG" 时回一次 ack 后不再读 stdin、直接 sleep 30 秒（模拟进程卡死不响应 shutdown）；
-含 "TURNERR" 时发一个带错误的 turn/end 事件。"""
+含 "TURNERR" 时发一个带错误的 turn/end 事件；
+含 "HANGCHILD" 时先起一个继承 stdout 的孙进程（sleep 60）再卡死——模拟 dsh 被 kill 后管道写端仍被 MCP 子进程持有。"""
 import json
 import sys
 import time
@@ -36,6 +37,9 @@ for line in sys.stdin:
         out({"jsonrpc": "2.0", "id": i, "result": {"messageId": "m1"}})
         if "CRASH" in text:
             sys.exit(3)
+        if "HANGCHILD" in text:
+            import subprocess
+            subprocess.Popen(["sleep", "60"])   # 继承本进程的 stdout（管道写端）
         if "HANG" in text:
             # 卡死模拟：不再发任何事件，也不再读下一行 stdin（本次循环体内同步 sleep）。
             time.sleep(30)

@@ -138,7 +138,9 @@ class Gateway:
             msg = _stamp_turn_id(context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
                                                             skills, prime), self.inflight.turn_id)
             session_id = self._session_id(conv)
+            t_prompt0 = time.time()
             turn = self.dsh.prompt(session_id, msg, self.cfg["turn_timeout_sec"])
+            t_prompt_ms = int((time.time() - t_prompt0) * 1000)
             reasoning = turn.reasoning
             if self.inflight.result is None and not turn.timed_out and not turn.error:
                 turn2 = self.dsh.prompt(session_id, NUDGE, self.cfg["turn_timeout_sec"])
@@ -146,10 +148,13 @@ class Gateway:
                 turn.timed_out = turn2.timed_out
                 turn.error = turn.error or turn2.error   # nudge 那轮的 dsh 错误同样如实上报
             restarted = False
+            t_restart_ms = 0
             if turn.timed_out:
                 # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上；
                 # turn_id 校验是第一道，重建进程是第二道保险。
+                t_r0 = time.time()
                 self._restart_dsh_after_timeout()
+                t_restart_ms = int((time.time() - t_r0) * 1000)
                 restarted = True
             result = self.inflight.result
             if result is None:
@@ -169,6 +174,7 @@ class Gateway:
                        "primed": prime is not None, "result": result, "attempts": self.inflight.attempts,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
+                       "t_prompt_ms": t_prompt_ms, "t_restart_ms": t_restart_ms,
                        "ms": int((time.time() - t0) * 1000)}
             if turn.error:
                 log_rec["dsh_error"] = turn.error

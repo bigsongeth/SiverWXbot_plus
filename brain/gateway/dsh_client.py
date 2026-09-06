@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import queue
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ class DshClient:
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._stderr_f = None   # 真文件对象时才持有，_close_pipes 里一并关掉
+        self._reader_t: Optional[threading.Thread] = None
 
     # ---- 进程 ----
     def start(self) -> None:
@@ -47,7 +49,8 @@ class DshClient:
         except Exception:
             self._close_stderr()
             raise
-        threading.Thread(target=self._reader, daemon=True).start()
+        self._reader_t = threading.Thread(target=self._reader, daemon=True)
+        self._reader_t.start()
 
     def alive(self) -> bool:
         return self.p is not None and self.p.poll() is None
@@ -80,20 +83,30 @@ class DshClient:
                     self.p.wait(timeout=3)
                 except Exception:
                     pass
-        self._close_pipes()
+        # 读线程还卡在 readline 里时绝不能关 stdout：BufferedReader.close 会等它那把锁，
+        # 而子进程的孙进程（MCP 服务）若继承了管道写端，读线程要等它们全退出才拿到 EOF——
+        # 2026-09-06 11:04 一轮超时后 stop() 就这样卡了 12 分钟，整个网关跟着停摆。
+        t = self._reader_t
+        if t is not None:
+            t.join(timeout=5)
+        self._close_pipes(close_stdout=(t is None or not t.is_alive()))
 
-    def _close_pipes(self) -> None:
+    def _close_pipes(self, close_stdout: bool = True) -> None:
         # 崩溃路径（进程自己退出）和正常路径都要走到这里，否则 stdin/stdout 的
         # TextIOWrapper 会一直不关，触发 ResourceWarning: unclosed file。
         self._close_stderr()
         if self.p is None:
             return
-        for f in (self.p.stdin, self.p.stdout):
+        files = [self.p.stdin] + ([self.p.stdout] if close_stdout else [])
+        for f in files:
             try:
                 if f is not None:
                     f.close()
             except Exception:
                 pass
+        if not close_stdout:
+            # 读线程会在 EOF 到来时自己退出；这里宁可漏关一个 fd，也不能让 stop() 阻塞。
+            sys.stderr.write("[dsh_client] stdout 读线程未退出（孙进程仍持有管道），跳过关闭\n")
 
     def _close_stderr(self) -> None:
         f, self._stderr_f = self._stderr_f, None

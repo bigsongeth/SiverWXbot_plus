@@ -70,6 +70,21 @@ class DshClientTest(unittest.TestCase):
         self.assertLess(elapsed, 5.0, f"stop() 耗时 {elapsed:.2f}s，应在约 5 秒内返回")
         self.assertFalse(c.alive())
 
+    def test_stop_does_not_block_when_grandchild_holds_stdout(self):
+        # 2026-09-06 11:04：dsh 被 kill 后 MCP 孙进程还握着管道写端，读线程拿不到 EOF，
+        # stdout.close() 等锁等了 12 分钟。stop() 必须在几秒内返回，宁可漏关一个 fd。
+        c = DshClient(FAKE, cwd=os.getcwd(), env=dict(os.environ))
+        c.start()
+        c.initialize(os.getcwd(), "songkey", "songkey-auto")
+        c.prompt("s1", "HANGCHILD", timeout_sec=1)
+        t0 = time.time()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            c.stop()
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 12.0, f"stop() 耗时 {elapsed:.2f}s")
+        self.assertFalse(c.alive())
+
     def test_turn_error_is_surfaced(self):
         r = self.c.prompt("s1", "TURNERR", timeout_sec=5)
         self.assertEqual(r.error, "boom")
