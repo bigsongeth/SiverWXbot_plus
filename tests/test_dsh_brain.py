@@ -94,6 +94,24 @@ class BrainApiTest(unittest.TestCase):
         BrainAPI("g", True, self.url, 5).chat("松爸: （这是正常括号）不带那个空格")
         self.assertEqual(_FakeGateway.seen[-1][1]["text"], "（这是正常括号）不带那个空格")
 
+    def test_heartbeat_ticks_while_waiting(self):
+        import sys, types
+        from plugins.dsh_brain import client as client_mod
+        beats = []
+        fake_wd = types.ModuleType("plugins.ui_watchdog"); fake_wd.heartbeat = lambda: beats.append(1)
+        old = sys.modules.get("plugins.ui_watchdog"); sys.modules["plugins.ui_watchdog"] = fake_wd
+        old_every = client_mod.HEARTBEAT_EVERY_SEC; client_mod.HEARTBEAT_EVERY_SEC = 0.05
+        try:
+            stop = client_mod._start_heartbeat_ticker()
+            import time; time.sleep(0.3); stop.set(); time.sleep(0.1)
+            n = len(beats); time.sleep(0.2)
+            self.assertGreaterEqual(n, 3)
+            self.assertEqual(len(beats), n)   # set() 之后不再跳
+        finally:
+            client_mod.HEARTBEAT_EVERY_SEC = old_every
+            if old is None: sys.modules.pop("plugins.ui_watchdog", None)
+            else: sys.modules["plugins.ui_watchdog"] = old
+
     def test_image_marker_appended(self):
         BrainAPI("g", True, self.url, 5).chat("a: 看这个", image_path="/tmp/x.png")
         self.assertEqual(_FakeGateway.seen[-1][1]["text"], "看这个 [图片]")

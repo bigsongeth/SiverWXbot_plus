@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 
 import requests
 
@@ -37,6 +38,33 @@ def split_sender(message: str):
     if m:
         return m.group(1).strip(), message[m.end():].strip()
     return "", (message or "").strip()
+
+
+HEARTBEAT_EVERY_SEC = 30
+
+
+def _start_heartbeat_ticker():
+    """等大脑期间每 30 秒给 ui_watchdog 打一次心跳，返回一个 Event，请求结束后 set() 停掉。
+
+    看门狗把「主循环心跳停滞 ≥300 秒」判成 wxautox UI 死锁并整进程重启。大脑一轮最长 180 秒、
+    排队再加 200 秒，全局模式下新私聊的首条消息是在主循环里同步等大脑的，不打心跳就会被看门狗
+    误杀（回复丢、机器人重启一分钟）。等 HTTP 不是 UI 死锁，打心跳是如实的。ui_watchdog 缺席时静默跳过。
+    """
+    stop = threading.Event()
+    try:
+        from plugins.ui_watchdog import heartbeat as _beat
+    except Exception:
+        return stop
+
+    def _tick():
+        while not stop.wait(HEARTBEAT_EVERY_SEC):
+            try:
+                _beat()
+            except Exception:
+                pass
+
+    threading.Thread(target=_tick, name="dsh_brain-heartbeat", daemon=True).start()
+    return stop
 
 
 class BrainAPI:
@@ -64,11 +92,14 @@ class BrainAPI:
         # 机器人的 memory_context_count 可能是 1000，网关预热只取最后 20 条，整包发纯属浪费
         payload = {"conversation": self.conversation, "is_group": self.is_group, "sender": sender,
                    "text": text, "prime": list(history or [])[-60:]}
+        stop = _start_heartbeat_ticker()
         try:
             r = HTTP.post(self.gateway_url + "/reply", json=payload, timeout=self.timeout_sec)
         except Exception as e:
+            stop.set()
             _log.warning("dsh_brain: 网关不可达 %s: %s", type(e).__name__, e)
             return API_ERROR_TEXT
+        stop.set()
         if r.status_code != 200:
             _log.warning("dsh_brain: 网关 HTTP %s: %s", r.status_code, r.text[:200])
             return API_ERROR_TEXT
