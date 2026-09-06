@@ -33,6 +33,15 @@ DEFAULTS = {
         "enabled": True,
         "screenshot": True,       # 失败时截屏（PIL.ImageGrab，约 200ms，只在失败时做）
         "keep_success": True,     # 成功也记一行（只有调用序列，没有截图），用来和失败对比
+        # 实验开关（默认关）：AddListenChat 期间把 wxautox 的 SendMessage 鼠标消息改成 PostMessage，
+        # 让 Qt 拿到真实时间戳来判双击。先在独立进程实验里验证过再在生产打开。见 tap.py 头注释。
+        "post_clicks": False,
+        # 开窗失败（MoveWindow 1400）时的复位动作，做完原地重试一次：
+        #   "click"  真实鼠标单击微信窗口空白处（2026-09-06 实测 2/2 救回，见 tap.py）
+        #   "minmax" 主窗口最小化再还原（不碰鼠标）
+        #   ""       关闭复位
+        "unstick": "click",
+        "unstick_points": [[600, 900], [700, 600], [37, 700]],   # click 模式候选点（主窗口客户区坐标）
     },
 }
 

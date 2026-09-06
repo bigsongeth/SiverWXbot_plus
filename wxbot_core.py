@@ -91,6 +91,11 @@ WxParam.DEFAULT_MESSAGE_YBIAS = 40
 # failure("未找到会话")——2026-07-29/30 的拉群连挂两次就是这么来的（详见
 # plugins/ncc_community/invite.py 顶部复盘）。放宽到 5 秒。
 WxParam.SEARCH_CHAT_TIMEOUT = 5
+# ★ 监听线程数 4 → 1（2026-09-06 钉死的 MoveWindow 1400 根因，见 CLAUDE.md 3.18）：
+# wxautox 的监听线程用 SendMessage 往各个子窗口发假点击，4 个线程并发时按下/抬起在不同窗口间
+# 交错，Qt 进程级的鼠标状态被搞乱，此后所有假双击都当成"按着不放的移动"，独立窗口再也开不出来。
+# 独立进程实测：挂 5 个监听，4 线程 1/8 成功，1 线程 8/8。串行化后不再交错。
+WxParam.LISTENER_EXCUTOR_WORKERS = 1
 
 # ============================================================
 # SDK 名称常量（面板显示名，兼容旧名 "OpenAI SDK"）
@@ -2741,6 +2746,14 @@ class WXBot:
         # 绑定 @ 标识（格式："@机器人昵称"）
         self.config.AtMe = "@" + self.wx.nickname
         log(message='绑定@：' + self.config.AtMe)
+
+        # listen_health plugin hook：开窗录像机 + 失败复位，要赶在下面初始化那几个监听之前装上
+        # （2026-09-02 那次发作就是从初始化监听开始的）。幂等，probe.register 里还会再调一次。
+        try:
+            from plugins.listen_health.tap import install as _install_listen_tap
+            _install_listen_tap(self)
+        except Exception as _tap_err:
+            log(level="WARNING", message=f"listen_health 录像机挂载失败（不影响机器人）：{_tap_err!r}")
 
         # 初始化记忆管理器
         try:

@@ -84,6 +84,139 @@ class TestWrapDecode(Base):
         self.assertEqual((c["x"], c["y"]), (-16, -1))
 
 
+class TestUnstickRetry(Base):
+    """开窗失败（MoveWindow 1400）→ 复位动作 → 原地重试一次。"""
+
+    def setUp(self):
+        super().setUp()
+        self.unsticks = []
+        self._orig_unstick = tap.unstick
+        tap.unstick = lambda mode, hwnd=None, points=None: (self.unsticks.append(mode), "已点")[1]
+
+    def tearDown(self):
+        tap.unstick = self._orig_unstick
+        super().tearDown()
+
+    def _wx_fail_then_ok(self):
+        state = {"n": 0}
+
+        class Wx:
+            def AddListenChat(_s, nickname=None, callback=None):
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise OSError("error(1400, 'MoveWindow', '无效的窗口句柄。')")
+                return True
+        return Wx(), state
+
+    def test_movewindow_failure_triggers_unstick_and_retry(self):
+        tap.load = lambda: {"tap": {"enabled": True, "screenshot": False, "unstick": "click"}}
+        wx, state = self._wx_fail_then_ok()
+        tap.install(FakeBot(wx))
+        self.assertTrue(wx.AddListenChat(nickname="x", callback=None))   # 对调用方透明：直接拿到成功
+        self.assertEqual(self.unsticks, ["click"])
+        self.assertEqual(state["n"], 2)
+        # 两行记录：复位前的失败 + 重试后的成功
+        self.assertEqual([r["ok"] for r in self.rows], [False, True])
+        self.assertEqual(self.rows[0]["note"], "复位前的那次")
+        self.assertFalse(tap._ACTIVE[0])
+
+    def test_other_errors_do_not_unstick(self):
+        tap.load = lambda: {"tap": {"enabled": True, "screenshot": False, "unstick": "click"}}
+        wx = FakeWx(raises=LookupError("Find Control Timeout"))
+        tap.install(FakeBot(wx))
+        with self.assertRaises(LookupError):
+            wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.unsticks, [])
+        self.assertEqual(len(wx.calls), 1)
+
+    def test_unstick_disabled_by_empty_mode(self):
+        tap.load = lambda: {"tap": {"enabled": True, "screenshot": False, "unstick": ""}}
+        wx, state = self._wx_fail_then_ok()
+        tap.install(FakeBot(wx))
+        with self.assertRaises(OSError):
+            wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.unsticks, [])
+        self.assertEqual(state["n"], 1)
+
+    def test_retry_failure_reraises(self):
+        tap.load = lambda: {"tap": {"enabled": True, "screenshot": False, "unstick": "minmax"}}
+        wx = FakeWx(raises=OSError("error(1400, 'MoveWindow', '无效的窗口句柄。')"))
+        tap.install(FakeBot(wx))
+        with self.assertRaises(OSError):
+            wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.unsticks, ["minmax"])
+        self.assertEqual(len(wx.calls), 2)
+        self.assertEqual([r["ok"] for r in self.rows], [False, False])
+
+    def test_unstick_exception_does_not_mask_original(self):
+        tap.load = lambda: {"tap": {"enabled": True, "screenshot": False, "unstick": "click"}}
+        tap.unstick = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no wechat"))
+        wx, state = self._wx_fail_then_ok()
+        tap.install(FakeBot(wx))
+        with self.assertRaises(OSError):
+            wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(state["n"], 1)
+
+
+class TestPostClicks(Base):
+    """实验开关 post_clicks：AddListenChat 期间把 SendMessage 的鼠标消息改成 PostMessage。"""
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []
+        self.posted = []
+        self.fake = types.SimpleNamespace(
+            SendMessage=lambda h, m, w, l: self.sent.append((h, m)) or "sent",
+            PostMessage=lambda h, m, w, l: self.posted.append((h, m)) or 1,
+        )
+        tap._ORIG_POST["fake"] = self.fake.PostMessage
+        tap.wrap(self.fake, "PostMessage", "fake.PostMessage")
+        tap.wrap(self.fake, "SendMessage", "fake.SendMessage")
+
+    def tearDown(self):
+        tap._ORIG_POST.pop("fake", None)
+        tap._POST_CLICKS[0] = False
+        super().tearDown()
+
+    def test_off_by_default_passes_through(self):
+        tap._ACTIVE[0] = True
+        self.assertEqual(self.fake.SendMessage(1, 0x0203, 0, 0), "sent")
+        self.assertEqual(self.posted, [])
+        self.assertEqual(tap.CALLS[0]["call"], "fake.SendMessage")
+
+    def test_on_converts_only_click_messages_while_active(self):
+        tap._POST_CLICKS[0] = True
+        # 未激活：哪怕开关开着也原样 SendMessage（别的 UI 操作不受影响）
+        self.assertEqual(self.fake.SendMessage(1, 0x0203, 0, 0), "sent")
+        self.assertEqual(self.posted, [])
+        tap._ACTIVE[0] = True
+        self.assertEqual(self.fake.SendMessage(262950, 0x0201, 1, (497 << 16) | 180), 0)
+        self.assertEqual(self.fake.SendMessage(262950, 0x0203, 1, (497 << 16) | 180), 0)
+        self.assertEqual(self.fake.SendMessage(262950, 0x0010, 0, 0), "sent")   # WM_CLOSE 不转
+        self.assertEqual(self.posted, [(262950, 0x0201), (262950, 0x0203)])
+        self.assertEqual(self.sent, [(1, 0x0203), (262950, 0x0010)])
+        tags = [c["call"] for c in tap.CALLS]
+        self.assertEqual(tags, ["fake.SendMessage→PostMessage", "fake.SendMessage→PostMessage", "fake.SendMessage"])
+        self.assertEqual((tap.CALLS[0]["x"], tap.CALLS[0]["y"]), (180, 497))
+
+    def test_switch_is_hot_read_from_config_on_each_call(self):
+        tap.load = lambda: {"tap": {"enabled": True, "post_clicks": True, "screenshot": False}}
+
+        def inner():
+            self.fake.SendMessage(5, 0x0203, 0, 0)
+
+        wx = FakeWx(result=True, inner=inner)
+        tap.install(FakeBot(wx))
+        wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.posted, [(5, 0x0203)])
+        self.assertFalse(tap._ACTIVE[0])
+        # 配置改回 False，下一次调用立刻不转
+        tap.load = lambda: {"tap": {"enabled": True, "post_clicks": False, "screenshot": False}}
+        wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.posted, [(5, 0x0203)])
+        self.assertEqual(self.sent[-1], (5, 0x0203))
+
+
 class TestInstall(Base):
     def test_install_wraps_once(self):
         wx = FakeWx()

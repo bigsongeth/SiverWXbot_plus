@@ -835,6 +835,44 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 - `restart_panel.bat` 起来之后进程列表里会有**两个** `web_server.py`（一个 `python web_server.py`、
   一个全路径的，只有后者监听 10001），重启前后都是这个结构，不是残留。
 
+#### ★★ 2026-09-06 根因钉死 + 修法（MoveWindow 1400 一案到此为止）
+
+**机制**：wxautox 41.x 的监听线程（`LISTENER_EXCUTOR_WORKERS`=4 个）各自用 `win32api.SendMessage`
+往自己那个子窗口发假点击（按下/抬起）。4 个线程并发时，按下/抬起在**不同窗口之间交错**，
+Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直按着，此后任何假双击都被当成"按着不放的
+移动"——独立窗口再也开不出来，`AddListenChat` 拿到 0 句柄，报 `MoveWindow 1400`。
+坏状态**不会自愈**：把监听全撤了、UI 线程完全空闲（CPU 0%、WM_NULL 往返 <1ms）照样开不出来。
+这解释了此前的全部现象：开着的子窗口越多越容易坏、白天群里活跃更容易坏、凌晨没消息不坏、
+重启机器人后第一次成功（初始化过程等价于一次复位）第二次起又坏、独立进程干净跑永远复现不了。
+
+**录像机拿到的判据**（`data/tap-20260906.jsonl`，14:59 Pablo 4 次失败 vs 当天 14 次成功）：
+失败时发的 5 条消息和成功时逐字节相同（同句柄、同坐标、截图确认点在正确的行），
+唯一差别是微信处理那条 `WM_LBUTTONDBLCLK` 的耗时：成功 0.38–0.70s（在建窗），失败 0.15–0.21s（没当双击）。
+
+**实验链**（独立进程 diag_open_window.py，机器人停掉；每组 2–8 轮）：
+- 灌水 WM_NULL 每 20ms 一条：0/8；改 PostMessage：0/8；真实鼠标双击：0/4 → 当时以为是灌水造成的，
+  **错**——微信从 14:59 起就在坏状态里，这三组都是在坏状态上测的。
+- 真实鼠标点击之后：灌水 200ms 6/6、不灌水 4/4、灌水 20ms 2/2 → 灌水本身不致病。
+- 挂上 5 个生产监听（4 线程）再测：1/8，挂到第 4 个时就已经坏了 → **病因是监听线程并发假点击**。
+- 撤掉监听、把轮询间隔改 5s：0/8 → 坏状态不自愈，也和轮询频率无关。
+- 复位动作：Esc（把主窗口收进托盘了，别用）、`SwitchToThisWindow`、`WM_CANCELMODE` 都无效；
+  **一次真实鼠标单击**微信任一窗口空白处立刻 2/2 恢复；最小化再还原（`minmax`）在已恢复状态下 2/2，
+  单独效果未证实。
+- 挂 5 个监听 + `LISTENER_EXCUTOR_WORKERS=1`：8/8 → **预防手段成立**。
+
+**修法（三层，都已上线 2026-09-06 16:36）**：
+1. 预防：`wxbot_core.py` 顶部 `WxParam.LISTENER_EXCUTOR_WORKERS = 1`，监听串行化不再交错。
+   代价是 6 个子窗口轮流扫、消息延迟多一两秒。**合并上游后确认这行还在。**
+2. 兜底：`plugins/listen_health/tap.py` 包住 `AddListenChat`，遇 `MoveWindow` 失败先做复位
+   （配置 `tap.unstick`，默认 `click`=真实单击微信窗口空白处，候选点 `tap.unstick_points`，
+   点之前用 `WindowFromPoint` 确认最上面是微信的窗口，点完光标放回原处），再原地重试一次，对调用方透明。
+3. 取证：录像机现在在 `init_wx_listeners` 里 WeChat 初始化后就挂（`wxbot_core.py` hook 1 处，幂等），
+   初始化那几个监听也录。失败行带 `note`="复位前的那次"。
+- 单测 `tests/test_listen_tap.py`（17 个）。诊断脚本各开关：`--flood/--post/--realclick/--listen @文件/
+  --listen-interval/--listen-workers/--unstick`，`.cmd` 里写不了中文和 emoji，监听名走 `@C:\Users\Admin\diag_listen.txt`。
+- 顺带发现：Esc 发给微信主窗口会把它**收进托盘**（`IsWindowVisible`=0），需要 `ShowWindow(SW_SHOW)`+
+  `SwitchToThisWindow` 才回来；诊断脚本的登录态守门会把这种情况判成"不在登录态"而停下。
+
 ---
 
 ### 3.21 肥肉大脑接入插件 `plugins/dsh_brain/`（2026-09-06 加，最小版）★ 指定会话的 AI 回复整个交给大脑

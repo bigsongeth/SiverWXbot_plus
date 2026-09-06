@@ -3,35 +3,38 @@
 diag_open_window.py —— 把「AddListenChat 弹不出独立窗口（MoveWindow 1400）」这个黑盒打透明。
 
 ★ 必须在会话 2 跑（SWXRun），且机器人已停（面板 /stop_bot）。两个进程抢同一个微信 = 结果作废。
-★ 不碰 wxautox 源码（都是 .pyd），只在【它调用的底层模块】上打桩。
+★ 不碰 wxautox 源码（都是 .pyd），只在【它调用的底层模块】上打桩（打桩实现在 tap.py，和生产共用）。
 
 背景（2026-09-02 复盘 1154 个探针样本 + 8 月全部日志得出的结论，见 CLAUDE.md 3.18）：
   - 失败 = 微信压根没建出新窗口（顶层窗口数前后不变），不是"建了但没找到"。
   - 已证伪：前台是谁 / 会话列表被谁盖住 / 别的线程并发操作 UI / 「找到当前会话」分支 /
-    重启能治（8-12 重启→第 1 次成功→第 2 次起继续失败，4 天重启 20 次）。
-  - 41.x 的双击是 `uiplug.Win32.click_by_bbox(double_click=True)` 往句柄【发消息】，
-    不是真鼠标 —— 所以鼠标/前台类假说全都不相关，而"发了什么消息、发给谁、间隔多久"
-    从来没人看过。本脚本就是补这一眼。
+    重启能治 / CPU 负载 / 主窗口尺寸（09-03 凌晨独立进程 24/24 全成功）。
+  - 41.x 的双击是 `uiplug.Win32.click_by_bbox(double_click=True)` 用 `win32api.SendMessage`
+    往主窗口句柄直送 5 条消息：按下/抬起、按下/抬起、WM_LBUTTONDBLCLK。
+  - 2026-09-06 14:59 生产录像（tap.py）：4 次失败发的 5 条消息与成功时逐字节相同（同句柄、同坐标），
+    区别只在微信处理那条 DBLCLK 花的时间：成功 0.38–0.70s（在建窗），失败 0.15–0.21s（没建）。
+    → 问题在微信怎么解读这组假点击。SendMessage 不进队列、Qt 给它的时间戳取自
+    GetMessageTime()（该线程上一条从队列取出的消息的时间），而 Qt 判双击靠两次按下的时间戳差。
 
-它干三件事：
-  1. 打桩：win32gui / win32api / ctypes user32 上的 PostMessage/SendMessage/SendInput/
-     mouse_event/SetCursorPos 全部包一层，AddListenChat 期间每次调用记
-     「往哪个 hwnd、什么消息、坐标（从 lParam 反算）、相对时间」。
-     uiplug.pyd 是在调用时才从模块取属性，所以打桩有效；某条通道一条都没记到，
-     说明它没走这条路 —— 这同样是信息。
-  2. 循环 N 次：AddListenChat(靶子) → GetSubWindow 校验 → RemoveListenChat。
-     每轮记成败、耗时、微信顶层窗口清单前后、CPU 负载、DoubleClickTime、主窗口 rect、
-     以及第 1 步抓到的调用序列。失败那轮截屏。
-  3. 可选 A/B：
-       --load K     起 K 个吃满 CPU 的子进程再跑（验"双击两下之间被拖慢、微信没认成双击"）
-       --resize WxH 先把主窗口调到指定大小再跑（验"1500x1048 时失败率 31%、1040x736 时 2%"）
+2026-09-06 16:31 定案（全部实验结果见 CLAUDE.md 3.18「根因钉死」）：病因是 wxautox 的 4 个监听线程
+并发往不同子窗口发假点击，交错后 Qt 进程级鼠标状态卡住；一次真实鼠标单击可复位；
+`LISTENER_EXCUTOR_WORKERS=1` 可预防（挂 5 个监听 8/8）。灌水 WM_NULL / PostMessage / 时间戳那一层是弯路。
 
-跑法（会话 2）：
-  把 C:\\Users\\Admin\\swx_payload.cmd（或 swx_run.cmd 的 payload 段）改成：
+本脚本能做的实验：
+  --listen @文件     先像生产一样挂上一批监听再测（一行一个名字，UTF-8）——这是能复现故障的那一组
+  --listen-workers N 改 WxParam.LISTENER_EXCUTOR_WORKERS（1 = 预防修法）
+  --listen-interval N 改 WxParam.LISTEN_INTERVAL（已证伪：与轮询频率无关）
+  --unstick MODE     循环前做一次复位：click（有效）/ minmax / activate（无效）/ cancelmode（无效）/ esc（别用，收托盘）
+  --flood MS         每 MS 毫秒往主窗口 PostMessage 一条 WM_NULL（已证伪：灌水本身不致病）
+  --post             wxautox 的 SendMessage 鼠标消息改 PostMessage（已证伪）
+  --realclick        拦下假点击改真实鼠标双击（坏状态下也开不出）
+  --load K / --resize WxH   更早的 A/B（已证伪）
+
+跑法（会话 2）：payload 改成
       set PYTHONIOENCODING=utf-8
       cd /d C:\\Users\\Admin\\SiverWXbot_plus-main
-      python plugins\\listen_health\\diag_open_window.py --n 30 --interval 5
-  然后 schtasks /run /tn SWXRun。跑完再来一轮 --load 3，两轮对比。
+      python plugins\\listen_health\\diag_open_window.py --n 8 --interval 15 --flood 20
+  然后 schtasks /run /tn SWXRun。建议顺序：--flood 20 → --flood 20 --post → 空载对照。
 
 输出：plugins/listen_health/data/diag-<时间戳>.jsonl（逐轮）+ 同名 .log（人读）
       失败截图 data/diag-shot-<时间戳>-<轮次>.png
@@ -44,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -52,23 +56,12 @@ sys.path.insert(0, ROOT)
 
 from plugins.listen_health.config import DATA_DIR          # noqa: E402
 from plugins.listen_health.probe import _wx_top_windows, _env_snapshot  # noqa: E402
+from plugins.listen_health import tap as T                  # noqa: E402
 
 STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 OUT_JSONL = os.path.join(DATA_DIR, f"diag-{STAMP}.jsonl")
 OUT_LOG = os.path.join(DATA_DIR, f"diag-{STAMP}.log")
-
-MSG_NAMES = {
-    0x0006: "WM_ACTIVATE", 0x0007: "WM_SETFOCUS", 0x0021: "WM_MOUSEACTIVATE",
-    0x0100: "WM_KEYDOWN", 0x0101: "WM_KEYUP", 0x0102: "WM_CHAR",
-    0x0200: "WM_MOUSEMOVE", 0x0201: "WM_LBUTTONDOWN", 0x0202: "WM_LBUTTONUP",
-    0x0203: "WM_LBUTTONDBLCLK", 0x0204: "WM_RBUTTONDOWN", 0x0205: "WM_RBUTTONUP",
-    0x0206: "WM_RBUTTONDBLCLK", 0x020A: "WM_MOUSEWHEEL", 0x0010: "WM_CLOSE",
-    0x0112: "WM_SYSCOMMAND",
-}
-MOUSE_MSGS = {0x0200, 0x0201, 0x0202, 0x0203, 0x0204, 0x0205, 0x0206}
-
-CALLS: list = []          # 当前这一轮抓到的底层调用
-_T0 = [0.0]               # 本轮起点，用于相对时间
+CLICK_NAMES = ("WM_LBUTTONDOWN", "WM_LBUTTONUP", "WM_LBUTTONDBLCLK")
 
 
 def w(line: str = "") -> None:
@@ -82,78 +75,6 @@ def w(line: str = "") -> None:
         print(s)
     except Exception:
         pass
-
-
-def _fmt(x):
-    try:
-        if isinstance(x, (int, float, str, bool)) or x is None:
-            return x
-        return repr(x)[:60]
-    except Exception:
-        return "?"
-
-
-def _decode(tag, args):
-    """把 (hwnd, msg, wParam, lParam) 翻成人能读的：消息名 + 客户区坐标。"""
-    row = {"t": round(time.perf_counter() - _T0[0], 4), "call": tag, "args": [_fmt(a) for a in args[:4]]}
-    try:
-        if len(args) >= 4 and isinstance(args[1], int):
-            msg = args[1]
-            row["msg"] = MSG_NAMES.get(msg, hex(msg))
-            row["hwnd"] = int(args[0]) if args[0] is not None else None
-            if msg in MOUSE_MSGS and isinstance(args[3], int):
-                lp = args[3] & 0xFFFFFFFF
-                x = lp & 0xFFFF
-                y = (lp >> 16) & 0xFFFF
-                # 客户区坐标是有符号 16 位
-                row["x"] = x - 0x10000 if x >= 0x8000 else x
-                row["y"] = y - 0x10000 if y >= 0x8000 else y
-    except Exception:
-        pass
-    return row
-
-
-def _wrap(obj, name, tag):
-    orig = getattr(obj, name, None)
-    if orig is None:
-        return False
-
-    def wrapper(*a, **k):
-        try:
-            return orig(*a, **k)
-        finally:
-            try:
-                CALLS.append(_decode(tag, a))
-            except Exception:
-                pass
-
-    try:
-        setattr(obj, name, wrapper)
-        return True
-    except Exception:
-        return False
-
-
-def install_taps() -> list:
-    """给所有可能承载"点击"的底层入口打桩，返回成功打上的名单。"""
-    import win32api
-    import win32gui
-    done = []
-    for mod, mname in ((win32gui, "win32gui"), (win32api, "win32api")):
-        for fn in ("PostMessage", "SendMessage", "SetCursorPos", "mouse_event"):
-            if _wrap(mod, fn, f"{mname}.{fn}"):
-                done.append(f"{mname}.{fn}")
-    u32 = ctypes.windll.user32
-    for fn in ("PostMessageW", "PostMessageA", "SendMessageW", "SendMessageA",
-               "SendMessageTimeoutW", "SendInput", "mouse_event", "SetCursorPos",
-               "SetForegroundWindow"):
-        try:
-            getattr(u32, fn)          # 触发 ctypes 把 _FuncPtr 缓存到实例上
-        except Exception:
-            continue
-        if _wrap(u32, fn, f"user32.{fn}"):
-            done.append(f"user32.{fn}")
-    return done
 
 
 def _main_hwnd():
@@ -201,9 +122,107 @@ def _resize_main(spec: str) -> None:
     w(f"主窗口已调整为 {wdt}x{hgt}，当前 rect={win32gui.GetWindowRect(h)}")
 
 
+class Flood:
+    """实验期间往主窗口队列里灌 WM_NULL。用打桩前存下的原始 PostMessage，不会混进录制。"""
+
+    def __init__(self, hwnd: int, interval_ms: int):
+        self.hwnd = hwnd
+        self.interval = max(1, int(interval_ms)) / 1000.0
+        self._stop = threading.Event()
+        self.sent = 0
+        self._thread = threading.Thread(target=self._run, name="wm_null_flood", daemon=True)
+
+    def _run(self):
+        post = T._ORIG_POST.get("win32api")
+        if post is None:
+            import win32api
+            post = win32api.PostMessage
+        while not self._stop.is_set():
+            try:
+                post(self.hwnd, 0x0000, 0, 0)   # WM_NULL
+                self.sent += 1
+            except Exception:
+                pass
+            time.sleep(self.interval)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+
 def _wx_titles(wins):
-    return [(x.get("t"), x.get("v"), x.get("r")) for x in (wins or [])
-            if x.get("cls") == "Qt51514QWindowIcon"]
+    return T._wx_titles(wins)
+
+
+def _unstick(mode: str, hwnd: int) -> str:
+    """把微信从"再也开不出独立窗口"的坏状态里拉回来的候选动作（2026-09-06 16:13 实测：
+    监听轮询把它搞坏之后，哪怕轮询全停、UI 线程完全空闲，双击照样不算数）。"""
+    import win32api
+    import win32con
+    import win32gui
+    if mode == "esc":
+        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+        win32api.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+        return "PostMessage Esc 到主窗口"
+    if mode == "click":
+        sx, sy = win32gui.ClientToScreen(hwnd, (600, 900))     # 聊天区空白处，避开会话列表和输入框
+        win32api.SetCursorPos((sx, sy))
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.05)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        return f"真实鼠标单击主窗口空白处 ({sx},{sy})"
+    if mode == "minmax":
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        time.sleep(1)
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(1)
+        return "最小化再还原主窗口"
+    if mode == "cancelmode":
+        win32api.SendMessage(hwnd, 0x001F, 0, 0)     # WM_CANCELMODE
+        return "SendMessage WM_CANCELMODE"
+    if mode == "activate":
+        win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+        ctypes.windll.user32.SwitchToThisWindow(hwnd, True)
+        time.sleep(0.5)
+        return "SwitchToThisWindow 激活主窗口（wxautox 初始化里的 _show）"
+    return f"不认识的 unstick 模式 {mode!r}"
+
+
+class RealClick:
+    """--realclick：拦下 wxautox 那 5 条假点击消息，改用真实鼠标输入在同一个位置双击。
+
+    第一条 WM_LBUTTONDOWN 到来时：把它的客户区坐标换算成屏幕坐标，SetCursorPos 过去，
+    mouse_event 按下/抬起两次（间隔 80ms）；随后 4 条消息直接吞掉。
+    用来判定：灌水状态下微信认不认【真】双击。认 → 问题只在假消息的解读；不认 → 微信整条双击链路被堵。
+    """
+
+    def __init__(self):
+        self.count = 0
+        self.done = 0
+
+    def __call__(self, args) -> bool:
+        import win32api
+        import win32con
+        import win32gui
+        self.count += 1
+        if self.count % 5 != 1:          # 只在每组 5 条的第一条上动手，其余吞掉
+            return True
+        hwnd, _msg, _wp, lp = args[0], args[1], args[2], args[3]
+        lp &= 0xFFFFFFFF
+        x, y = lp & 0xFFFF, (lp >> 16) & 0xFFFF
+        sx, sy = win32gui.ClientToScreen(hwnd, (x, y))
+        win32api.SetCursorPos((sx, sy))
+        time.sleep(0.05)
+        for _ in range(2):
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.03)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(0.08)
+        self.done += 1
+        return True
 
 
 def _logged_in(wins) -> bool:
@@ -228,7 +247,6 @@ def run(args) -> int:
     open(OUT_LOG, "w", encoding="utf-8").close()
     w(f"# diag_open_window @ {datetime.now():%Y-%m-%d %H:%M:%S}  args={vars(args)}")
 
-    # 自检：是不是在会话 2。会话 0 里 EnumWindows 看不到微信，跑了也是白跑。
     wins0 = _wx_top_windows() or []
     if not any(x.get("cls") == "Qt51514QWindowIcon" for x in wins0):
         w("!! 枚举不到任何微信顶层窗口 —— 多半没在会话 2（SSH 是 session 0），停。")
@@ -239,19 +257,61 @@ def run(args) -> int:
         return 3
 
     import psutil
-    psutil.cpu_percent(interval=None)   # 预热，之后每次调用给的是区间均值
+    psutil.cpu_percent(interval=None)
     w(f"DoubleClickTime={ctypes.windll.user32.GetDoubleClickTime()} ms  "
       f"屏幕={ctypes.windll.user32.GetSystemMetrics(0)}x{ctypes.windll.user32.GetSystemMetrics(1)}")
 
-    taps = install_taps()
+    taps = T.install_taps()
     w(f"打桩成功: {taps}")
+    T._POST_CLICKS[0] = bool(args.post)
+    if args.post:
+        w("实验开关：鼠标消息改走 PostMessage")
+    realclick = None
+    if args.realclick:
+        realclick = RealClick()
+        T._INTERCEPT[0] = realclick
+        w("实验开关：拦下假点击，改用真实鼠标在同一位置双击")
 
-    from wxautox4 import WeChat
+    from wxautox4 import WeChat, WxParam
+    if args.listen_interval:
+        WxParam.LISTEN_INTERVAL = int(args.listen_interval)
+        w(f"WxParam.LISTEN_INTERVAL 改为 {WxParam.LISTEN_INTERVAL}s")
+    if args.listen_workers:
+        WxParam.LISTENER_EXCUTOR_WORKERS = int(args.listen_workers)
+        w(f"WxParam.LISTENER_EXCUTOR_WORKERS 改为 {WxParam.LISTENER_EXCUTOR_WORKERS}")
     try:
         wx = WeChat(version="微信")
     except Exception:
         wx = WeChat(version="WeChat")
-    w(f"WeChat 初始化完成，HWND={getattr(wx, 'HWND', None)}")
+    main_hwnd = _main_hwnd()
+    w(f"WeChat 初始化完成，主窗口 hwnd={main_hwnd}")
+
+    # --listen：先像生产一样挂上一批监听（各自开独立窗口 + wxautox 监听线程轮询），再测靶子。
+    # 用来判定"生产里往微信 UI 线程灌水的是不是 wxautox 自己的监听轮询"。
+    listened = []
+    listen_spec = args.listen or ""
+    if listen_spec.startswith("@"):        # .cmd 里写不了中文/emoji，名字从 UTF-8 文件读，一行一个
+        with open(listen_spec[1:], "r", encoding="utf-8-sig") as f:
+            listen_spec = "|".join(line.strip() for line in f if line.strip())
+    for name in [s.strip() for s in listen_spec.split("|") if s.strip()]:
+        try:
+            r = wx.AddListenChat(nickname=name, callback=lambda m: None)
+            ok_l = bool(r) and wx.GetSubWindow(nickname=name) is not None
+        except Exception as e:
+            ok_l = False
+            w(f"  预挂监听 {name} 异常: {e!r}")
+        w(f"  预挂监听 {name}: {'OK' if ok_l else 'BAD'}")
+        if ok_l:
+            listened.append(name)
+    if listened:
+        time.sleep(3)
+        w(f"已挂 {len(listened)} 个监听，等 3 秒让轮询线程跑起来")
+    if args.unstick:
+        try:
+            w(f"复位动作 --unstick {args.unstick}: {_unstick(args.unstick, main_hwnd)}")
+        except Exception as e:
+            w(f"复位动作 {args.unstick} 异常: {e!r}")
+        time.sleep(1)
 
     if args.resize:
         _resize_main(args.resize)
@@ -259,9 +319,17 @@ def run(args) -> int:
     if load_procs:
         time.sleep(2)
         w(f"已起 {len(load_procs)} 个负载子进程，CPU={psutil.cpu_percent(interval=1)}%")
+    flood = None
+    if args.flood:
+        if not main_hwnd:
+            w("!! 找不到主窗口句柄，--flood 无法执行")
+            return 4
+        flood = Flood(main_hwnd, args.flood)
+        flood.start()
+        w(f"WM_NULL 灌水线程已起，每 {args.flood}ms 一条")
 
     ok_n = 0
-    odd_fail = 0      # 连续出现"不是目标现象"的失败（如 EditControl 找不到），说明微信状态不对，停
+    odd_fail = 0
     aborted = None
     try:
         for i in range(1, args.n + 1):
@@ -271,16 +339,19 @@ def run(args) -> int:
                 w("!! " + aborted)
                 break
             env = _env_snapshot()
-            CALLS.clear()
-            _T0[0] = time.perf_counter()
+            T.CALLS.clear()
+            T._T0[0] = time.perf_counter()
+            T._ACTIVE[0] = True
             err = None
             t0 = time.time()
             try:
                 wx.AddListenChat(nickname=args.target, callback=lambda m: None)
             except Exception as e:
                 err = repr(e)
+            finally:
+                T._ACTIVE[0] = False
             cost = round(time.time() - t0, 2)
-            calls = list(CALLS)
+            calls = list(T.CALLS)
             sub = None
             try:
                 sub = wx.GetSubWindow(nickname=args.target)
@@ -303,6 +374,7 @@ def run(args) -> int:
             row = {
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "round": i, "ok": ok, "err": err,
                 "cost_sec": cost, "cpu_pct": cpu, "load_procs": len(load_procs),
+                "flood_ms": args.flood, "flood_sent": (flood.sent if flood else 0), "post": bool(args.post),
                 "wx_before": _wx_titles(before), "wx_after": _wx_titles(after),
                 "main_rect": env.get("wx_main_rect"), "fg": env.get("fg_title"),
                 "rustdesk_conns": env.get("rustdesk_conns"), "calls": calls, "shot": shot,
@@ -311,14 +383,16 @@ def run(args) -> int:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
             ok_n += int(ok)
-            mouse = [c for c in calls if c.get("msg") in
-                     ("WM_LBUTTONDOWN", "WM_LBUTTONUP", "WM_LBUTTONDBLCLK", "WM_MOUSEMOVE")
+            mouse = [c for c in calls if c.get("msg") in CLICK_NAMES
                      or c["call"].endswith(("mouse_event", "SendInput", "SetCursorPos"))]
+            dbl_cost = ""
+            if len(mouse) >= 5 and mouse[4].get("msg") == "WM_LBUTTONDBLCLK":
+                dbl_cost = f" 双击处理耗时={mouse[4]['t'] - mouse[3]['t']:.2f}s"
             w(f"[{i:02d}] {'OK ' if ok else 'BAD'} cost={cost}s cpu={cpu}% "
-              f"窗口 {len(before or [])}->{len(after or [])} 底层调用 {len(calls)} 条（鼠标类 {len(mouse)}）"
+              f"窗口 {len(before or [])}->{len(after or [])} 底层调用 {len(calls)} 条（鼠标类 {len(mouse)}）{dbl_cost}"
               f"{'  ' + err if err else ''}")
             for c in mouse[:12]:
-                w(f"      t+{c['t']:.3f}s {c['call']:<24} {c.get('msg', '')} hwnd={c.get('hwnd')} "
+                w(f"      t+{c['t']:.3f}s {c['call']:<32} {c.get('msg', '')} hwnd={c.get('hwnd')} "
                   f"x={c.get('x')} y={c.get('y')}")
             if len(mouse) > 12:
                 w(f"      ... 共 {len(mouse)} 条")
@@ -336,15 +410,27 @@ def run(args) -> int:
                     break
             time.sleep(args.interval)
     finally:
+        if flood:
+            flood.stop()
+        T._POST_CLICKS[0] = False
+        T._INTERCEPT[0] = None
+        if realclick:
+            w(f"真实双击共执行 {realclick.done} 次")
+        for name in listened:
+            try:
+                wx.RemoveListenChat(name)
+            except Exception as e:
+                w(f"  撤预挂监听 {name} 失败: {e!r}")
         for p in load_procs:
             try:
                 p.kill()
             except Exception:
                 pass
 
-    w(f"# 完成：{ok_n}/{args.n} 成功。逐轮数据 {OUT_JSONL}")
+    w(f"# 完成：{ok_n}/{args.n} 成功"
+      f"{'（灌水共 %d 条）' % flood.sent if flood else ''}。逐轮数据 {OUT_JSONL}")
     w("# 读法：失败轮的 calls 里若一条鼠标类调用都没有 → 点击走的通道没被打桩到（换通道再挂）；"
-      "若有且坐标/hwnd 与成功轮一致 → 微信收到了同样的消息却没建窗，问题在微信侧（时序/状态）；"
+      "若有且坐标/hwnd 与成功轮一致 → 微信收到了同样的消息却没建窗，看双击处理耗时（建窗≈0.4–0.7s，没建≈0.15s）；"
       "若坐标或 hwnd 不同 → wxautox 找错了会话项/窗口。")
     return 0
 
@@ -356,6 +442,13 @@ def main() -> int:
     ap.add_argument("--target", default="文件传输助手", help="靶子会话")
     ap.add_argument("--load", type=int, default=0, help="起 K 个吃 CPU 的子进程做 A/B")
     ap.add_argument("--resize", default="", help="先把主窗口调成 WxH，如 1500x1048 / 1040x736")
+    ap.add_argument("--flood", type=int, default=0, help="实验期间每 N 毫秒往主窗口 PostMessage 一条 WM_NULL")
+    ap.add_argument("--post", action="store_true", help="把 wxautox 的 SendMessage 鼠标消息改成 PostMessage")
+    ap.add_argument("--realclick", action="store_true", help="拦下假点击，改用真实鼠标输入在同一位置双击")
+    ap.add_argument("--listen", default="", help="先挂上这些监听再测，用 | 分隔，如 '松爸|肥肉测试1🐶'")
+    ap.add_argument("--listen-interval", type=int, default=0, help="改 WxParam.LISTEN_INTERVAL（秒），0=不改")
+    ap.add_argument("--unstick", default="", help="循环前做一次复位动作：esc / click / minmax / cancelmode / activate")
+    ap.add_argument("--listen-workers", type=int, default=0, help="改 WxParam.LISTENER_EXCUTOR_WORKERS（监听线程数），0=不改")
     return run(ap.parse_args())
 
 

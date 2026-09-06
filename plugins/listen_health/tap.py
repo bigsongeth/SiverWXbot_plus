@@ -45,6 +45,16 @@ _T0 = [0.0]                   # 本次起点，用于相对时间
 _ACTIVE = [False]             # 只有 AddListenChat 执行期间才录
 _TAPS_INSTALLED = [False]     # 底层函数只包一次（进程级）
 _LOCK = threading.Lock()
+# 实验开关：AddListenChat 期间把 wxautox 用 SendMessage 发的鼠标按键消息改成 PostMessage。
+# 动机（2026-09-06 录像）：失败时 5 条消息和成功时逐字节相同，差别只在微信怎么解读。
+# SendMessage 是同步直送、不进消息队列，Qt 给它打的时间戳取自 GetMessageTime()，
+# 即这个线程【上一条从队列取出的消息】的时间——而 Qt 判双击靠的正是两次按下的时间戳差。
+# 队列里有别的消息穿插时时间戳就乱了，双击不被承认，窗口不建。PostMessage 进队列、带真实时间戳。
+_POST_CLICKS = [False]
+_CLICK_MSGS = (0x0201, 0x0202, 0x0203)
+_ORIG_POST = {}               # {'win32api': 原 PostMessage}，转发时用原函数，不经过录制包装
+# 实验钩子（只给 diag 用）：callable(args) -> True 表示"我已经自己处理了这次点击，吞掉原消息"
+_INTERCEPT = [None]
 
 
 def _fmt(x):
@@ -81,14 +91,29 @@ def wrap(obj, name, tag) -> bool:
     orig = getattr(obj, name, None)
     if orig is None:
         return False
+    convertible = name == "SendMessage"    # 只有 SendMessage 的鼠标消息会被实验开关改成 PostMessage
 
     def wrapper(*a, **k):
+        used_tag = tag
         try:
+            if (convertible and _ACTIVE[0] and _INTERCEPT[0] is not None and len(a) >= 4
+                    and isinstance(a[1], int) and a[1] in _CLICK_MSGS):
+                try:
+                    if _INTERCEPT[0](a):
+                        used_tag = tag + "→intercepted"
+                        return 0
+                except Exception:
+                    pass
+            if (convertible and _ACTIVE[0] and _POST_CLICKS[0] and len(a) >= 4
+                    and isinstance(a[1], int) and a[1] in _CLICK_MSGS and _ORIG_POST.get(tag.split(".")[0])):
+                used_tag = tag + "→PostMessage"
+                _ORIG_POST[tag.split(".")[0]](a[0], a[1], a[2], a[3])
+                return 0
             return orig(*a, **k)
         finally:
             if _ACTIVE[0]:
                 try:
-                    CALLS.append(decode(tag, a))
+                    CALLS.append(decode(used_tag, a))
                 except Exception:
                     pass
 
@@ -111,6 +136,8 @@ def install_taps() -> list:
         return []
     done = []
     for mod, mname in ((win32gui, "win32gui"), (win32api, "win32api")):
+        if getattr(mod, "PostMessage", None) is not None:
+            _ORIG_POST[mname] = mod.PostMessage     # 先存原函数，再包装
         for fn in ("PostMessage", "SendMessage", "SetCursorPos", "mouse_event"):
             if wrap(mod, fn, f"{mname}.{fn}"):
                 done.append(f"{mname}.{fn}")
@@ -165,6 +192,99 @@ def _is_failure(result, err) -> bool:
         return True
 
 
+# ---------------------------------------------------------------------------
+# 复位（2026-09-06 16:24 实测钉死的修法）
+#
+# 坏状态：wxautox 监听线程往微信 UI 线程高密度灌假点击之后，微信内部的鼠标/按压状态卡住，
+# 此后哪怕 UI 线程完全空闲（CPU 0%、WM_NULL 往返 <1ms），双击也再也不算数，独立窗口永远开不出来。
+# 试过的复位动作：Esc（把主窗口收进托盘了，别用）、SwitchToThisWindow 激活、WM_CANCELMODE 都没用；
+# 一次【真实鼠标单击】微信任一窗口的空白处立刻恢复（2/2）。minmax（最小化再还原）见 diag 结果。
+# ---------------------------------------------------------------------------
+_WX_PROCS = ("weixin.exe", "wechat.exe")
+
+
+def _wx_main_hwnd():
+    try:
+        return (_env_snapshot() or {}).get("wx_main_hwnd")
+    except Exception:
+        return None
+
+
+def _point_owner_is_wechat(sx: int, sy: int) -> bool:
+    """屏幕点 (sx,sy) 最上面那个窗口是不是微信的——点下去必须落在微信身上，别点到别的程序。"""
+    try:
+        import ctypes as _ct
+        import psutil
+        import win32gui
+        import win32process
+
+        class _PT(_ct.Structure):
+            _fields_ = [("x", _ct.c_long), ("y", _ct.c_long)]
+        u32 = _ct.windll.user32
+        u32.WindowFromPoint.argtypes = [_PT]
+        u32.WindowFromPoint.restype = _ct.c_void_p
+        h = u32.WindowFromPoint(_PT(sx, sy))
+        if not h:
+            return False
+        root = win32gui.GetAncestor(int(h), 2)
+        _, pid = win32process.GetWindowThreadProcessId(root)
+        return psutil.Process(pid).name().lower() in _WX_PROCS
+    except Exception:
+        return False
+
+
+def unstick(mode: str, hwnd=None, points=None) -> str:
+    """把微信从坏状态拉回来。返回一句人读的说明；失败抛异常。
+
+    mode='click'：在主窗口客户区若干候选空白点里挑第一个"最上面确实是微信窗口"的点，
+                  用真实鼠标（mouse_event）单击一下，点完把光标放回原处。
+                  生产里主窗口上面通常叠着几个子窗口（同 rect），点到子窗口的空白处一样有效——
+                  卡住的是 Qt 进程级的鼠标状态，不分窗口。
+    mode='minmax'：主窗口最小化再还原，不碰鼠标。
+    """
+    import win32api
+    import win32con
+    import win32gui
+    hwnd = hwnd or _wx_main_hwnd()
+    if not hwnd:
+        raise RuntimeError("找不到微信主窗口")
+    if mode == "minmax":
+        win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+        time.sleep(1)
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(1)
+        return "主窗口最小化再还原"
+    if mode == "click":
+        # 候选点：聊天区下方空白 / 聊天区中部 / 左侧导航栏下方空白（客户区坐标）
+        cands = points or [(600, 900), (700, 600), (37, 700)]
+        old = None
+        try:
+            old = win32api.GetCursorPos()
+        except Exception:
+            pass
+        for cx, cy in cands:
+            try:
+                sx, sy = win32gui.ClientToScreen(hwnd, (int(cx), int(cy)))
+            except Exception:
+                continue
+            if not _point_owner_is_wechat(sx, sy):
+                continue
+            win32api.SetCursorPos((sx, sy))
+            time.sleep(0.05)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(0.3)
+            if old:
+                try:
+                    win32api.SetCursorPos(old)
+                except Exception:
+                    pass
+            return f"真实鼠标单击微信窗口空白处 ({sx},{sy})"
+        raise RuntimeError("候选点上面都不是微信窗口，没点")
+    raise ValueError(f"不认识的复位模式 {mode!r}")
+
+
 def wrap_add_listen_chat(wx, tcfg: dict | None = None):
     """给 wx.AddListenChat 套一层录像。幂等：已经套过就原样返回。"""
     orig = getattr(wx, "AddListenChat", None)
@@ -183,6 +303,11 @@ def wrap_add_listen_chat(wx, tcfg: dict | None = None):
                 before = _wx_top_windows()
             except Exception:
                 pass
+            # 实验开关每次热读：改 data/config.json 的 tap.post_clicks 下一条消息就生效，不用重启
+            try:
+                _POST_CLICKS[0] = bool(((load().get("tap") or {}).get("post_clicks", False)))
+            except Exception:
+                pass
             CALLS.clear()
             _T0[0] = time.perf_counter()
             _ACTIVE[0] = True
@@ -194,6 +319,35 @@ def wrap_add_listen_chat(wx, tcfg: dict | None = None):
                 return result
             except Exception as e:
                 err = repr(e)
+                # 复位后原地重试一次：只对「开不出窗口」这一种失败做，别的异常原样抛
+                mode = str(tcfg.get("unstick", "click") or "")
+                if mode and "MoveWindow" in err:
+                    _ACTIVE[0] = False
+                    calls_first = list(CALLS)
+                    try:
+                        how = unstick(mode, points=tcfg.get("unstick_points"))
+                        log("WARNING", f"录像机：{nickname} 开窗失败，已做复位（{how}），原地重试一次")
+                    except Exception as ue:
+                        log("WARNING", f"录像机：{nickname} 开窗失败，复位动作失败（{ue!r}），不重试")
+                        raise e
+                    try:
+                        _dump(nickname, True, err, round(time.time() - t0, 2), calls_first, before, want_shot,
+                              note="复位前的那次")
+                    except Exception:
+                        pass
+                    CALLS.clear()
+                    _T0[0] = time.perf_counter()
+                    _ACTIVE[0] = True
+                    t0 = time.time()
+                    try:
+                        result = orig(*a, **k)
+                        err = None
+                        log("INFO", f"录像机：{nickname} 复位后重试成功")
+                        return result
+                    except Exception as e2:
+                        err = repr(e2)
+                        log("WARNING", f"录像机：{nickname} 复位后重试仍失败：{err}")
+                        raise
                 raise
             finally:
                 _ACTIVE[0] = False
@@ -216,7 +370,7 @@ def wrap_add_listen_chat(wx, tcfg: dict | None = None):
     return wrapped
 
 
-def _dump(nickname, failed, err, cost, calls, before, want_shot):
+def _dump(nickname, failed, err, cost, calls, before, want_shot, note=None):
     after = None
     env = {}
     shot = None
@@ -242,7 +396,7 @@ def _dump(nickname, failed, err, cost, calls, before, want_shot):
         "wx_after": _wx_titles(after) if after is not None else None,
         "fg": env.get("fg_title"), "fg_proc": env.get("fg_proc"),
         "main_rect": env.get("wx_main_rect"), "rustdesk_conns": env.get("rustdesk_conns"),
-        "hit_test": env.get("hit_test"), "shot": shot,
+        "hit_test": env.get("hit_test"), "shot": shot, "note": note,
     }
     _record(row)
     if failed:
@@ -264,6 +418,9 @@ def install(bot) -> bool:
         log("WARNING", "开窗录像机：bot.wx 为空，不挂载")
         return False
     taps = install_taps()
+    _POST_CLICKS[0] = bool(tcfg.get("post_clicks", False))
+    if _POST_CLICKS[0]:
+        log("INFO", "开窗录像机：实验开关 post_clicks 已打开，AddListenChat 期间鼠标消息改走 PostMessage")
     wrapped = wrap_add_listen_chat(wx, tcfg)
     ok = bool(wrapped is not None and getattr(wrapped, "_lh_tap", False))
     log("INFO", f"开窗录像机已挂载：底层打桩 {len([t for t in taps if t != '(already)'])} 处"
