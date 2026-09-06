@@ -66,7 +66,9 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 2. 会话第一次出现时把机器人传来的 `prime` 历史过一遍 `plugins.context_guard` 的 `filter_history`（加不看插件开关的兜底）和签到过滤，作为预热喂给 dsh。
 3. 用户消息首行是 `[群聊:X | 发言人:Y | 时间 | 相关技能:a,b|无 | 轮次:<turn_id>]`，dsh sessionId 是 `<会话名>#<dsh 进程纪元>`。
 4. 模型调 `wx_reply` → 网关按预算 `clamp(30+2.5×len, 40, 群150/私聊220)`、条数（群≤2/私聊≤3）、反口头禅（开头 8 字或 4-gram Jaccard>0.5，含同一回复内互查）、剥收尾套话、剥 Markdown 校验；不过就退回让模型重写，第 2 次起截断放行。
-5. 模型一轮结束没说话且没报错 → 追问一次（nudge）；仍沉默记 `model_silent`。超时则 `dsh.stop()` 重建进程（换纪元）。
+5. 模型一轮结束没说话且没报错 → 追问一次（nudge）；仍沉默记 `model_silent`。超时只给这个会话换代
+   （会话号加 `#<代>`，下一条重灌它自己的历史），进程和其它会话的上下文都保住；同一进程连续超时 `restart_after_timeouts`(3)
+   次才真重建（换纪元）。网关启动时就预热 dsh，不等第一条消息。
 6. 每轮落一行 JSON 到 `log/replies-*.jsonl`：turn_id、session_id、tools、attempts、reasoning、draft、耗时。
 
 ## 期 0 结论（2026-09-05）
@@ -135,8 +137,9 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
   指到数据目录、`$DSH_HOME/skills` 软链到工作区 `skills/`（dsh 不扫工作区里的 `skills/`），实测目录里只剩
   hz-food-map / ncc-community。硬约束 ②（只看自己的工作区）真正兜底仍要等容器化。
 - **sdk 运行时只有 initialize / session/prompt / shutdown 三个方法，没有取消轮次的手段**（09-05 实测
-  `session/cancel` / `session/control` 都回 unknown method）。所以一轮超时只能重建整个进程：冷启动 + 重预热，
-  且后台那一轮还在烧模型。超时阈值必须放在模型真实延迟之上，否则会连锁（回放第一轮一条私聊 15 轮打掉 11 轮）。
+  `session/cancel` / `session/control` 都回 unknown method）。超时那一轮会在后台跑完（照样烧模型和工具调用），
+  它迟到的说话靠 turn_id 拦。09-06 起超时不再杀进程，只给那个会话换代；连续 3 次超时才重建（冷启动 + 全部重预热，
+  实测 60–90 秒）。超时阈值仍要放在模型真实延迟之上（回放第一轮 60 秒时一条私聊 15 轮打掉 11 轮）。
 - `songkey-auto` 当前（09-05）落到 `grok-4.6`：一句「你好」也先烧 700 多个推理 token、24 秒起步，且不回传推理内容
   （日志里 reasoning 为空是它的行为，不是收集漏了）。`deepseek-v4-flash` 同题 6 秒并回传推理。模型由用户定，
   这里只记事实；回放第二轮做了两者的 A/B。
