@@ -888,6 +888,9 @@ Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直�
   `enabled_groups/chats`（支持 `*`）、`excluded_*`。改配置下一条消息生效；**改插件代码要整进程重启**。
   文件缺失不落盘（默认全关，合进 main 不改任何行为）。**生产现状（2026-09-06 起）：群/私聊都是 `*`，排除文件传输助手**——
   也就是 group_prompt_map、default_prompt 那套在生产上已被绕过（ncc_kb 插件已删），人设/知识库/各群风格都在 `brain/workspace/` 里改。
+- ★ **历史每轮都带（2026-09-06 用户拍板，别改回只首轮预热）**：插件每次传最近 60 条，网关首轮预热、之后每轮带「上次之后没看过的」
+  （按 fingerprint 判，含小程序卡片/位置/链接，渲染成 `[大众点评卡片] …` / `[位置] …`）。美食群靠这个把群友发的点评/美团卡片收进地图，
+  美食 MCP 补了 `remove_place` 走「先收后删」。注意 `group_reply_at=true` 时不 @ 的卡片仍不进大脑，只有下一次 @ 时才作为历史被看到。
 - 网关不通/超时时插件返回 model_fallback 的失败串 → 自动退回老接口链，群里表现是"回到以前的肥肉"而不是没人应；
   排障先看 mac 上 `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl` 和 `launchctl print gui/501/com.bigsong.feirou-brain`。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。

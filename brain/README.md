@@ -61,6 +61,10 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 
 1. 网关拿全局锁（同一时刻只处理一条消息），空文本直接 `empty`。
 2. 会话第一次出现时把机器人传来的 `prime` 历史过一遍 `plugins.context_guard` 的 `filter_history`（加不看插件开关的兜底）和签到过滤，作为预热喂给 dsh。
+   **之后每轮也带历史**（2026-09-06 用户拍板）：网关按会话记住模型看过哪些流水（`context.fingerprint`，不按时间——@ 消息是回复时才落盘的），
+   每轮把机器人传来的最近 60 条里没看过的挑出来（`context.select_new`，上限 `history_delta_max`）挂在正文前面。
+   小程序卡片/位置/链接也进历史，渲染成 `[大众点评卡片] 潮汕菜大排档…`、`[美团外卖卡片] 凡老头米线砂锅`、`[位置] 舟村…金昌路2136号`
+   （`context.render_content` 剥掉微信拼的前缀）。dsh 报错/超时那轮不记「已看过」，下轮再带。日志字段 `history_new`。
 3. 用户消息首行是 `[群聊:X | 发言人:Y | 时间 | 相关技能:a,b|无 | 轮次:<turn_id>]`，dsh sessionId 是 `<会话名>#<dsh 进程纪元>`。
 4. 模型调 `wx_reply` → 网关按预算 `clamp(30+2.5×len, 40, 群150/私聊220)`、条数（群≤2/私聊≤3）、反口头禅（开头 8 字或 4-gram Jaccard>0.5，含同一回复内互查）、剥收尾套话、剥 Markdown 校验；不过就退回让模型重写，第 2 次起截断放行。
 5. 模型一轮结束没说话且没报错 → 追问一次（nudge）；仍沉默记 `model_silent`。超时则 `dsh.stop()` 重建进程（换纪元）。
