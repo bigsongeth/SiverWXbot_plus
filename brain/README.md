@@ -5,8 +5,11 @@
 设计文档：`docs/superpowers/specs/2026-09-05-dsh-brain-design.md`；本期（期 1）计划：
 `docs/superpowers/plans/2026-09-05-dsh-brain-phase1.md`。用户拍板的硬约束见设计文档 §2，改代码前先读。
 
-容器化（期 2）还没做；网关目前由这台 mac 的 launchd `com.bigsong.feirou-brain` 常驻
-（`~/Personal/feirou-brain/run_gateway.sh`，绑 100.127.39.63:8500，模型 deepseek-v4-flash，数据目录 `~/feirou-brain-data`）。
+容器化（期 2）还没做；网关 2026-09-06 13:30 起由 **mac-mini** 的 launchd `com.bigsong.feirou-brain` 常驻
+（代码 `mac-mini:~/feirou-brain/app`，dsh 0.1.2-rc.1 单独装在 `~/feirou-brain/dsh`，key 在 `~/feirou-brain/env`，
+数据 `~/feirou-brain-data`，绑 100.71.182.5:8500，模型 deepseek-v4-flash）。之前跑在 BigSong 的笔记本上，
+09-06 12:55–13:16 合盖睡了一觉群里失联 20 分钟，才搬的。**改了 `brain/` 要跑 `sh ~/Personal/feirou-brain/deploy.sh --remote`**
+（同步到 mac-mini 并重启），mac 侧脚本在 `~/Personal/feirou-brain/`。
 **网关跑的是本地副本 `~/Personal/feirou-brain/app`，不是 /Volumes 上的仓库**：改了 `brain/` 或它依赖的三个插件
 （context_guard / reply_shape / wechat_checkin）后要跑 `sh ~/Personal/feirou-brain/deploy.sh [仓库路径]` 同步并重启网关。
 09-06 09:03 SMB 卷掉了一次，直接 cd 仓库的网关连续 35 次起不来，期间所有会话退回老接口——所以不能依赖挂载。

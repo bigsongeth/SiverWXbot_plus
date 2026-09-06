@@ -852,7 +852,8 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
   也就是 group_prompt_map、default_prompt 那套在生产上已被绕过（ncc_kb 插件已删），人设/知识库/各群风格都在 `brain/workspace/` 里改。
 - **改了 `brain/` 要跑 `sh ~/Personal/feirou-brain/deploy.sh` 才生效**：mac 上的网关跑的是本地副本，不读 SMB 上的仓库（SMB 掉过一次，网关起不来）。
 - 网关不通/超时时插件返回 model_fallback 的失败串 → 自动退回老接口链，群里表现是"回到以前的肥肉"而不是没人应；
-  排障先看 mac 上 `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl` 和 `launchctl print gui/501/com.bigsong.feirou-brain`。
+  排障先看 **mac-mini** 上 `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl` 和 `launchctl print gui/501/com.bigsong.feirou-brain`
+  （09-06 13:30 起网关跑在 mac-mini，改代码后 `sh ~/Personal/feirou-brain/deploy.sh --remote`）。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
 - 单测：`PYTHONPATH=. python3 tests/test_dsh_brain.py`（本地假网关，不连微信不连大脑）。
 
