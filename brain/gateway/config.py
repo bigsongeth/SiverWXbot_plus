@@ -19,6 +19,8 @@ DEFAULTS = {
     "repeat_threshold": 0.5,
     "memory_max_bytes": 4096,
     "prime_count": 20,
+    "history_delta_max": 40,            # 预热后每轮最多带多少条"上次之后的新消息"（机器人每次传最近 60 条）
+    "seen_max_per_conversation": 600,   # 每个会话记多少条"已看过"的 fingerprint
     "kb_url": "http://100.71.182.5:8434",
     "kb_timeout_sec": 20,
 }

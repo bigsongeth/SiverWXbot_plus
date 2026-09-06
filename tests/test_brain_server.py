@@ -95,14 +95,34 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(len(self.fake.prompts), 2)
         self.assertIn("wx_reply", self.fake.prompts[1][1])
 
-    def test_prime_only_first_time(self):
+    def test_history_every_turn(self):
+        # 首轮整段预热；之后每轮只带上次之后的新消息（含卡片），旧的不重复灌。用户 2026-09-06：历史必须带
         self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["在"]}),
-                            lambda gw: gw.tool_call("wx_reply", {"bubbles": ["还在"]})]
-        prime = [{"time": "t", "attr": "friend", "sender": "K", "content": "早", "type": "text"}]
-        self.gw.handle_reply({"conversation": "K", "is_group": False, "sender": "K", "text": "在吗", "prime": prime})
-        self.gw.handle_reply({"conversation": "K", "is_group": False, "sender": "K", "text": "还在吗", "prime": prime})
-        self.assertIn("此前的聊天记录", self.fake.prompts[0][1])
-        self.assertNotIn("此前的聊天记录", self.fake.prompts[1][1])
+                            lambda gw: gw.tool_call("wx_reply", {"bubbles": ["还在"]}),
+                            lambda gw: gw.tool_call("wx_reply", {"bubbles": ["收了"]})]
+        prime = [{"time": "t1", "attr": "friend", "sender": "K", "content": "早", "type": "text"}]
+        self.gw.handle_reply({"conversation": "G", "is_group": True, "sender": "K", "text": "在吗", "prime": prime})
+        self.gw.handle_reply({"conversation": "G", "is_group": True, "sender": "K", "text": "还在吗", "prime": prime})
+        card = {"time": "t2", "attr": "friend", "sender": "鹅", "type": "miniapp",
+                "content": "小程序大众点评美食电影运动旅游门票潮汕菜大排档"}
+        self.gw.handle_reply({"conversation": "G", "is_group": True, "sender": "K", "text": "收一下上面那家", "prime": prime + [card]})
+        p0, p1, p2 = (p[1] for p in self.fake.prompts)
+        self.assertIn("此前的聊天记录", p0); self.assertIn("K: 早", p0)
+        self.assertNotIn("聊天记录", p1); self.assertNotIn("新出现的消息", p1); self.assertNotIn("K: 早", p1)
+        self.assertIn("上一轮之后", p2); self.assertIn("[大众点评卡片] 潮汕菜大排档", p2); self.assertNotIn("K: 早", p2)
+
+    def test_delta_not_marked_seen_when_dsh_errors(self):
+        # dsh 那轮报错，模型没看到；下一轮要把这些新消息再带一遍
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["在"]}), lambda gw: None,
+                            lambda gw: gw.tool_call("wx_reply", {"bubbles": ["收了"]})]
+        prime = [{"time": "t1", "attr": "friend", "sender": "K", "content": "早", "type": "text"}]
+        card = {"time": "t2", "attr": "friend", "sender": "鹅", "type": "miniapp", "content": "小程序美团外卖丨外卖美食奶茶咖啡水果凡老头米线砂锅"}
+        self.gw.handle_reply({"conversation": "G", "is_group": True, "sender": "K", "text": "在吗", "prime": prime})
+        self.fake.error_next = True
+        out = self.gw.handle_reply({"conversation": "G", "is_group": True, "sender": "K", "text": "收一下", "prime": prime + [card]})
+        self.assertEqual(out.get("error"), "dsh_error")
+        self.gw.handle_reply({"conversation": "G", "is_group": True, "sender": "K", "text": "再收一下", "prime": prime + [card]})
+        self.assertIn("[美团外卖卡片] 凡老头米线砂锅", self.fake.prompts[-1][1])
 
     def test_empty_text_is_no_reply_without_touching_dsh(self):
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "  "})

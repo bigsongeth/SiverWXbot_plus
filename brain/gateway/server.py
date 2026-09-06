@@ -62,6 +62,9 @@ class Gateway:
         self.proposals = Proposals(workspace_dir)
         self.skill_index = context.load_skill_index(workspace_dir)
         self.primed = set()
+        # 每轮都带历史（用户 2026-09-06 拍板，见 context.select_new）：按会话记住模型已看过哪些流水的 fingerprint，
+        # 之后每轮只带没看过的。有界，免得长会话把内存吃光。
+        self.seen: dict = {}
         self.started_at = time.time()
         self.turns = 0
 
@@ -91,6 +94,7 @@ class Gateway:
         self.dsh = new
         self.dsh_epoch = time.strftime("%Y%m%d%H%M%S") + uuid.uuid4().hex[:4]
         self.primed.clear()   # 进程重来了，会话是否接续未知，保守地允许再预热一次
+        self.seen.clear()
 
     def _session_id(self, conversation: str) -> str:
         """返回复合会话 ID：对话名#epoch，防止 dsh 重启后的会话 ID 碰撞。"""
@@ -129,14 +133,19 @@ class Gateway:
                 self._ensure_dsh()
             except Exception as e:
                 return {"error": f"dsh init failed: {type(e).__name__}: {e}"}
-            prime = None
-            if conv not in self.primed:
-                prime = context.filter_prime(payload.get("prime") or [], self.cfg["prime_count"], is_group) or None
-                self.primed.add(conv)
+            raw_hist = list(payload.get("prime") or [])
+            first_time = conv not in self.primed
+            if first_time:
+                prime = context.filter_prime(raw_hist, self.cfg["prime_count"], is_group) or None
+                label = context.PRIME_LABEL
+            else:
+                prime = context.select_new(raw_hist, self.seen.get(conv, set()), is_group, exclude=(sender, text),
+                                           count=self.cfg["history_delta_max"]) or None
+                label = context.DELTA_LABEL
             skills = context.match_skills(self.skill_index, conv, is_group)
             self.inflight = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
             msg = _stamp_turn_id(context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
-                                                            skills, prime), self.inflight.turn_id)
+                                                            skills, prime, prime_label=label), self.inflight.turn_id)
             session_id = self._session_id(conv)
             turn = self.dsh.prompt(session_id, msg, self.cfg["turn_timeout_sec"])
             reasoning = turn.reasoning
@@ -151,6 +160,10 @@ class Gateway:
                 # turn_id 校验是第一道，重建进程是第二道保险。
                 self._restart_dsh_after_timeout()
                 restarted = True
+            if not turn.error and not turn.timed_out:
+                # 模型真的看到了这轮的消息才记作"已看过"；dsh 报错/超时的那轮下次要再带一遍
+                self.primed.add(conv)
+                self._mark_seen(conv, raw_hist)
             result = self.inflight.result
             if result is None:
                 # 故障不许伪装成「不想说话」：模型没调 no_reply，是它压根没跑成。
@@ -168,7 +181,8 @@ class Gateway:
             log_rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
                        "sender": sender, "text": text, "budget": self.inflight.budget, "skills": skills,
                        "turn_id": self.inflight.turn_id, "session_id": session_id,
-                       "primed": prime is not None, "result": result, "attempts": self.inflight.attempts,
+                       "primed": first_time and prime is not None, "history_new": 0 if first_time else len(prime or []),
+                       "result": result, "attempts": self.inflight.attempts,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
                        "ms": int((time.time() - t0) * 1000)}
@@ -179,6 +193,15 @@ class Gateway:
         finally:
             self.inflight = None
             self.lock.release()
+
+    def _mark_seen(self, conv: str, items: list) -> None:
+        """这次传来的历史（含被过滤掉的）全部记作已看过：比预热更早的旧消息以后也不该再冒出来。"""
+        seen = self.seen.setdefault(conv, set())
+        seen.update(context.fingerprint(x) for x in items)
+        if len(seen) > self.cfg["seen_max_per_conversation"]:
+            # 机器人每次只传最近 60 条，早于这一批的 fingerprint 不会再来，随便丢一半即可
+            for fp in list(seen)[: len(seen) // 2]:
+                seen.discard(fp)
 
     def handle_completion(self, body: dict) -> dict:
         """OpenAI 兼容过渡路径：模型名编码会话，最后一条 user 是消息，其余历史做一次预热。"""
