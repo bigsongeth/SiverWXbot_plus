@@ -77,7 +77,7 @@ def main() -> None:
     # HOME 指到数据目录：dsh 还会扫 ~/.agents/skills（宿主上几十个与肥肉无关的技能会进它的目录，
     # 硬约束 ② 在容器化前至少先把这条堵上）；node/dsh 都是绝对路径，不依赖 HOME。
     env = dict(os.environ, HOME=data, DSH_HOME=dsh_home, SONGKEY_API_KEY=key,
-               FEIROU_GW=f"http://127.0.0.1:{cfg['port']}")
+               FEIROU_GW=profile.bridge_gateway_url(cfg["bind"], cfg["port"]))
 
     def factory():
         return DshClient(profile.dsh_argv(node, dsh_bin, patch_path), cwd=ws, env=env,

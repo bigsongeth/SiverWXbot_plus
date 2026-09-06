@@ -19,6 +19,11 @@ class ProfileTest(unittest.TestCase):
         self.assertIn("serverName: grok", txt)
         self.assertIn("SONGKEY_API_KEY: sk-test", txt)
 
+    def test_bridge_gateway_url_follows_bind(self):
+        self.assertEqual(profile.bridge_gateway_url("127.0.0.1", 8500), "http://127.0.0.1:8500")
+        self.assertEqual(profile.bridge_gateway_url("0.0.0.0", 8500), "http://127.0.0.1:8500")
+        self.assertEqual(profile.bridge_gateway_url("100.127.39.63", 8500), "http://100.127.39.63:8500")
+
     def test_prepare_dsh_home_links_workspace_skills(self):
         d = tempfile.mkdtemp()
         skills = os.path.join(d, "ws-skills"); os.makedirs(skills)

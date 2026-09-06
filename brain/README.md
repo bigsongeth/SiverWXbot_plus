@@ -5,8 +5,11 @@
 设计文档：`docs/superpowers/specs/2026-09-05-dsh-brain-design.md`；本期（期 1）计划：
 `docs/superpowers/plans/2026-09-05-dsh-brain-phase1.md`。用户拍板的硬约束见设计文档 §2，改代码前先读。
 
-期 1 网关只在 mac 侧跑、只接测试群；容器化（期 2）还没做。机器人侧插件 `plugins/dsh_brain/` 已有最小版
-（2026-09-06，CLAUDE.md 3.21）：指定群/私聊的 AI 回复整个交给网关 `/reply`，超时 300 秒不重试，配置默认全关。
+容器化（期 2）还没做；网关目前由这台 mac 的 launchd `com.bigsong.feirou-brain` 常驻
+（`~/Personal/feirou-brain/run_gateway.sh`，绑 100.127.39.63:8500，模型 deepseek-v4-flash，数据目录 `~/feirou-brain-data`）。
+机器人侧插件 `plugins/dsh_brain/`（CLAUDE.md 3.21）**2026-09-06 起全量接管**：所有群聊与私聊（除文件传输助手）的 AI 回复
+都交给网关；网关不通时自动退回老接口链。各群原来的人设变成风格技能：`ai-geek-cold` 挂「🏜️AI 及其代理人联邦」，
+`crypto-cynic` 备用（目前没有币圈群在监听），其余群和私聊用 PERSONA 本体（融合版肥肉）。
 
 ## 跑起来
 
@@ -137,7 +140,7 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 - 每轮真调模型 10–115 秒，群里体验偏慢；提速方向是模型路由与去掉 kb 侧 rerank（约 6 秒）。
 - 回放对照表里的"原回复"来自老链路流水，群里老机器人没答的轮次没有对照。
 
-## 让某个群走大脑（测试群 / 以后的美食群）
+## 让某个群走大脑（现在是全量：`enabled_groups`/`enabled_chats` 都是 `*`）
 
 1. mac 上把网关常驻起来，`~/feirou-brain-data/config.json` 写 `{"bind": "<本机 Tailscale 地址>", "model": "deepseek-v4-flash"}`
    （`bind` 默认只绑本机，要让 win-shukong 打进来必须改；网关无鉴权，只准 tailnet 可达）。
