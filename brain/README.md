@@ -7,6 +7,9 @@
 
 容器化（期 2）还没做；网关目前由这台 mac 的 launchd `com.bigsong.feirou-brain` 常驻
 （`~/Personal/feirou-brain/run_gateway.sh`，绑 100.127.39.63:8500，模型 deepseek-v4-flash，数据目录 `~/feirou-brain-data`）。
+**网关跑的是本地副本 `~/Personal/feirou-brain/app`，不是 /Volumes 上的仓库**：改了 `brain/` 或它依赖的三个插件
+（context_guard / reply_shape / wechat_checkin）后要跑 `sh ~/Personal/feirou-brain/deploy.sh [仓库路径]` 同步并重启网关。
+09-06 09:03 SMB 卷掉了一次，直接 cd 仓库的网关连续 35 次起不来，期间所有会话退回老接口——所以不能依赖挂载。
 机器人侧插件 `plugins/dsh_brain/`（CLAUDE.md 3.21）**2026-09-06 起全量接管**：所有群聊与私聊（除文件传输助手）的 AI 回复
 都交给网关；网关不通时自动退回老接口链。各群原来的人设变成风格技能：`ai-geek-cold` 挂「🏜️AI 及其代理人联邦」，
 `crypto-cynic` 备用（目前没有币圈群在监听），其余群和私聊用 PERSONA 本体（融合版肥肉）。

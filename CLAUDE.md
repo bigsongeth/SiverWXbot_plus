@@ -850,6 +850,7 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
   `enabled_groups/chats`（支持 `*`）、`excluded_*`。改配置下一条消息生效；**改插件代码要整进程重启**。
   文件缺失不落盘（默认全关，合进 main 不改任何行为）。**生产现状（2026-09-06 起）：群/私聊都是 `*`，排除文件传输助手**——
   也就是 group_prompt_map、default_prompt 那套在生产上已被绕过（ncc_kb 插件已删），人设/知识库/各群风格都在 `brain/workspace/` 里改。
+- **改了 `brain/` 要跑 `sh ~/Personal/feirou-brain/deploy.sh` 才生效**：mac 上的网关跑的是本地副本，不读 SMB 上的仓库（SMB 掉过一次，网关起不来）。
 - 网关不通/超时时插件返回 model_fallback 的失败串 → 自动退回老接口链，群里表现是"回到以前的肥肉"而不是没人应；
   排障先看 mac 上 `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl` 和 `launchctl print gui/501/com.bigsong.feirou-brain`。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
