@@ -87,10 +87,11 @@ class GatewayTest(unittest.TestCase):
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out["bubbles"], ["短的。"])
 
-    def test_silent_model_gets_nudge_then_no_reply(self):
+    def test_silent_model_gets_nudge_then_error(self):
+        # nudge 完仍不调工具 = 大脑失灵，报 error 让机器人换老接口顶上，不能伪装成「不接话」
         self.fake.script = [lambda gw: None, lambda gw: None]
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
-        self.assertTrue(out["no_reply"]); self.assertEqual(out["reason"], "model_silent")
+        self.assertNotIn("no_reply", out); self.assertEqual(out["error"], "model_silent")
         self.assertEqual(len(self.fake.prompts), 2)
         self.assertIn("wx_reply", self.fake.prompts[1][1])
 
@@ -178,7 +179,7 @@ class GatewayTest(unittest.TestCase):
     def test_timeout_restarts_dsh(self):
         self.fake.timeout_next = True
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
-        self.assertEqual(out, {"no_reply": True, "reason": "timeout"})
+        self.assertEqual(out, {"error": "timeout", "reason": "timeout"})
         self.assertEqual(self.fake.stopped, 1)
         self.assertIsNone(self.gw.dsh)
         self.assertEqual(len(self.fake.prompts), 1)  # 超时后不再 nudge
@@ -244,8 +245,8 @@ class GatewayTest(unittest.TestCase):
     def test_turn_error_reported_not_masked(self):
         self.fake.error_next = True
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
-        # 应该返回 dsh_error，不是 model_silent
-        self.assertEqual(out, {"no_reply": True, "reason": "dsh_error"})
+        # 应该返回 dsh_error，不是 model_silent；而且是 error 不是 no_reply（额度耗尽/key 失效要能走故障转移）
+        self.assertEqual(out, {"error": "dsh_error", "reason": "dsh_error"})
         # 只发了一个 prompt（主提示），没有 nudge
         self.assertEqual(len(self.fake.prompts), 1)
         # 日志里应该包含 dsh_error
@@ -257,7 +258,7 @@ class GatewayTest(unittest.TestCase):
         # 首轮模型沉默、nudge 那轮 dsh 报错：也要报 dsh_error，不能伪装成 model_silent
         self.fake.error_at = 2
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
-        self.assertEqual(out, {"no_reply": True, "reason": "dsh_error"})
+        self.assertEqual(out, {"error": "dsh_error", "reason": "dsh_error"})
         self.assertEqual(len(self.fake.prompts), 2)
         log = self.gw.read_log(1)[0]
         self.assertEqual(log["dsh_error"], "id collision")

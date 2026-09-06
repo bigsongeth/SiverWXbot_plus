@@ -153,10 +153,12 @@ class Gateway:
                 restarted = True
             result = self.inflight.result
             if result is None:
-                if turn.error:
-                    result = {"no_reply": True, "reason": "dsh_error"}
-                else:
-                    result = {"no_reply": True, "reason": "timeout" if turn.timed_out else "model_silent"}
+                # 故障不许伪装成「不想说话」：模型没调 no_reply，是它压根没跑成。
+                # 报 error，机器人侧 dsh_brain 就会返回失败串走 model_fallback 换老接口顶上（CLAUDE.md 3.21）；
+                # 报 no_reply 则是静默失聋 —— 2026-09-06 14:11 songkey 额度耗尽 → dsh 403 → 这里 no_reply →
+                # 群里被 @ 也不吭声，机器人日志还打成"AI 判断无需接话"，从后台完全看不出是故障。
+                reason = "dsh_error" if turn.error else ("timeout" if turn.timed_out else "model_silent")
+                result = {"error": reason, "reason": reason}
             if result.get("bubbles"):
                 self.recent.add(conv, result["bubbles"])
             truncated = memory_guard.enforce(os.path.join(self.ws, "memory"), self.cfg["memory_max_bytes"])
