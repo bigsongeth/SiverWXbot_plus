@@ -80,7 +80,6 @@ netstat -ano | findstr LISTEN | findstr :100
 |------|--------|------------------------------|------|
 | `wechat_checkin` | 私聊「签到」发兑换码 | `wxbot_core.wx_send_ai` 前 ×1 | `test_wechat_checkin.py` |
 | `ncc_community` | 管理群转发 / 迎新 / 拉群 + 面板 | `message_handle_callback` ×3、`get_next_new_message` ×1 | `test_ncc_community.py` / `_engine` / `_batch` / `_panel` |
-| `ncc_kb` | 群/私聊接知识库（换接口+换人设） | 四个 getter `_get_{group,chat}_{api,prompt}` ×4 | `test_ncc_kb.py` |
 | `model_fallback` | 接口挂了自动换下一个 | `_get_group_api` / `_get_chat_api` ×2 | `test_model_fallback.py` |
 | `context_guard` | 治胡编：注日期+能力边界、洗历史 | `MemoryManager.get_messages` ×1、两个 `_get_*_prompt` ×2 | `test_context_guard.py` |
 | `reply_shape` | 分条回复形状 + 剥 Markdown | `_build_split_prompt` / `_parse_split_reply` ×2 | `test_reply_shape.py` |
@@ -88,7 +87,7 @@ netstat -ano | findstr LISTEN | findstr :100
 | `gh_trending_note` | 每日 GitHub 趋势笔记（跟在日报后面） | 定时任务注册处 ×1（紧邻 ai_news_note） | 插件内 `selftest.py` / `test_follow.py` |
 | `ui_watchdog` | 卡死/日志异常 → 整进程重启 | 主循环 `heartbeat()` / `disarm()`、`web_server` 消费标记 ×3 | `test_ui_watchdog.py` |
 | `listen_health` | 监听窗口丢失探针 + 自愈 | `MainWindowChat` 等 ×5（见 3.18） | `test_listen_health.py` / `test_main_window_chat.py` |
-| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/） | `_resolve_group_api` / `_resolve_chat_api` ×2，排在 ncc_kb 前（见 3.21） | `test_dsh_brain.py` |
+| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/） | `_resolve_group_api` / `_resolve_chat_api` ×2（见 3.21） | `test_dsh_brain.py` |
 
 另有不成插件的核心内改动：3.1 面板监听地址、3.10 时间戳清洗与接话闸门（`test_reply_gate.py`）、
 3.12 绕开系统代理的 `HTTP` 会话、3.14 `SEARCH_CHAT_TIMEOUT`。
@@ -373,7 +372,14 @@ if handled and checkin_reply:
 群聊里等 20 秒体验是有问题的。想提速优先动 rerank（OpenRouter 免费模型，占 6s，
 去掉或换本地重排最省事）和 LLM 选型，检索本身不是瓶颈。
 
-### 3.9 知识库开关插件 `plugins/ncc_kb/`（2026-07-06 加）★ 让群聊/私聊可选接入知识库
+### 3.9 知识库开关插件 `plugins/ncc_kb/`（2026-07-06 加，**2026-09-06 已删除**）
+大脑接管后它在生产上已无作用（`dsh_brain` 钩子排在前面、故障转移走 api_configs 备用链），用户拍板不留回滚路，
+插件目录、面板页 `/ncc_kb`、四处钩子、`test_ncc_kb.py` 一并删除。知识库现在只由大脑通过 mac-mini 的只读 `/retrieve` 端点访问
+（`brain/gateway/kb.py`），闸门/facts/日志那套仍在 mac-mini `~/ncc-kb/`（见 3.7）。要回到「机器人直连知识库」，
+去 git 历史里找 b2bbf26 之前的 `plugins/ncc_kb/`。下面是删除前的原文，供考古：
+
+<details><summary>原 3.9（已失效）</summary>
+
 不再靠 `config.json` 的 api_configs 索引挂知识库（面板保存 api_configs 会把它冲掉，踩过），改由本插件独占 KB 路由，自带端点，抗面板改动。
 - **原理**：`wxbot_core.py` 四个 getter（`_get_group_api`/`_get_chat_api`/`_get_group_prompt`/`_get_chat_prompt`）各加一段最小 hook，先问插件"这会话开知识库了吗"——开了返回 KB 接口实例 + `NCC肥肉` 人设；没开走上游原逻辑。复用上游整条 AI 链路（历史/分段/图片），只换"用哪个接口+人设"。合并上游后确认这 4 处 hook 还在。
 - **开=走 KB 端点+NCC肥肉人设；关=回落到该会话原本的 group_api_map/默认接口**（所以测试群已从 group_api_map 移除，靠插件路由；否则"关"会因残留 index 仍连 KB）。
@@ -388,6 +394,8 @@ if handled and checkin_reply:
   私聊全开后所有私聊人设都变成肥肉。不想要就把该私聊加进 `excluded_chats`。
 - **面板**：独立模板 `templates/ncc_kb.html` + `web_server.py` 三个新路由（`/ncc_kb`、`/ncc_kb/config`、`/ncc_kb/save`）+ dashboard.html 侧栏一行链接（都是新增，冲突面极小）。面板保存是"读全量 cfg 再改写"，不会抹掉它不认识的 `excluded_*`。
 - 单测：`PYTHONPATH=. python3 tests/test_ncc_kb.py`（12 个，纯 mock）。私聊在全局模式也能开（补齐上游 chat_api_map 只在白名单模式生效的空缺）。
+
+</details>
 
 ### 3.10 回复清洗与接话闸门（2026-07-08 加，改在 `wxbot_core.py`）
 两个小机制，合并上游后确认还在：
@@ -832,7 +840,7 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 ### 3.21 肥肉大脑接入插件 `plugins/dsh_brain/`（2026-09-06 加，最小版）★ 指定会话的 AI 回复整个交给大脑
 机器人不再挑接口和人设，把消息原样交给 `brain/` 的网关（`POST /reply`），大脑说什么发什么。
 
-- **hook 2 处**：`_resolve_group_api` / `_resolve_chat_api` 开头各一段，**排在 ncc_kb 前**（大脑自己会查知识库）。
+- **hook 2 处**：`_resolve_group_api` / `_resolve_chat_api` 开头各一段（大脑自己会查知识库；原 ncc_kb 钩子已于 09-06 删除）。
   返回的 `BrainAPI` 长得和四个接口类一样（`.chat(message, prompt=, history=)`），所以历史/分条/接话闸门/故障转移全复用：
   多条气泡用 `SPLIT_SEPARATOR` 拼、不接话返回 `[NO_REPLY]`、网关出错/超时返回 model_fallback 认的失败串 → 备用链换老接口顶上。
 - **超时 300 秒、不重试**：网关串行，一轮 8–115 秒还要排队；上游 OpenAIAPI 那套 30 秒 + 重试 2 次会把同一条消息发三遍，
@@ -841,7 +849,7 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 - 配置 `plugins/dsh_brain/data/config.json`（不进库）：`enabled` 总开关**默认关**，`gateway_url`、`timeout_sec`、
   `enabled_groups/chats`（支持 `*`）、`excluded_*`。改配置下一条消息生效；**改插件代码要整进程重启**。
   文件缺失不落盘（默认全关，合进 main 不改任何行为）。**生产现状（2026-09-06 起）：群/私聊都是 `*`，排除文件传输助手**——
-  也就是 ncc_kb、group_prompt_map、default_prompt 那套在生产上已被绕过，人设/知识库/各群风格都在 `brain/workspace/` 里改。
+  也就是 group_prompt_map、default_prompt 那套在生产上已被绕过（ncc_kb 插件已删），人设/知识库/各群风格都在 `brain/workspace/` 里改。
 - 网关不通/超时时插件返回 model_fallback 的失败串 → 自动退回老接口链，群里表现是"回到以前的肥肉"而不是没人应；
   排障先看 mac 上 `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl` 和 `launchctl print gui/501/com.bigsong.feirou-brain`。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
@@ -1074,7 +1082,6 @@ cd /Volumes/SiverWXbot_plus-main && python3 -m py_compile wxbot_core.py web_serv
 | Webhook 发送 | `webhook_send.py` |
 | 签到插件 | `plugins/wechat_checkin/` |
 | NCC 社群插件 | `plugins/ncc_community/`（面板 `/ncc_community` + `panel.py`，去 Notion 化见 3.6 与 `PANEL_SPEC.md`） |
-| 知识库开关插件 | `plugins/ncc_kb/` |
 | AI 日报插件 | `plugins/ai_news_note/`（面板 `/ai_news`） |
 | GitHub 趋势笔记插件 | `plugins/gh_trending_note/`（无面板页，配置手改 `data/settings.json`，见 3.20） |
 | 监听健康 / 自愈插件 | `plugins/listen_health/`（探针采样 `data/probe-*.jsonl`，见 3.18） |
