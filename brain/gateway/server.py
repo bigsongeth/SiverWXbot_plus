@@ -62,6 +62,8 @@ class Gateway:
         self.proposals = Proposals(workspace_dir)
         self.skill_index = context.load_skill_index(workspace_dir)
         self.primed = set()
+        self.session_gen = {}          # 会话名 -> 超时后换过几次会话号（进程不重建，只丢那一个会话）
+        self.consecutive_timeouts = 0  # 同一个 dsh 进程连续超时次数，到阈值才真重建
         self.started_at = time.time()
         self.turns = 0
 
@@ -93,16 +95,36 @@ class Gateway:
         self.primed.clear()   # 进程重来了，会话是否接续未知，保守地允许再预热一次
 
     def _session_id(self, conversation: str) -> str:
-        """返回复合会话 ID：对话名#epoch，防止 dsh 重启后的会话 ID 碰撞。"""
-        return f"{conversation}#{self.dsh_epoch}"
+        """复合会话 ID：对话名#进程纪元[#代]。纪元防 dsh 重启后的 ID 碰撞；代数在该会话超时后 +1，
+        让下一条消息落到全新会话上（旧会话里那一轮还在后台跑，不能往上叠）。"""
+        gen = self.session_gen.get(conversation, 0)
+        return f"{conversation}#{self.dsh_epoch}" + (f"#{gen}" if gen else "")
+
+    def prewarm(self) -> None:
+        """启动就把 dsh 拉起来，别等第一条消息才冷启动（起 node + 三个 MCP 服务 + 首轮无缓存，实测多等 60–90 秒）。"""
+        with self.lock:
+            try:
+                self._ensure_dsh()
+                print("[gateway] dsh prewarmed", flush=True)
+            except Exception as e:
+                print(f"[gateway] dsh prewarm failed: {type(e).__name__}: {e}", flush=True)
+
+    def _abandon_after_timeout(self, conversation: str) -> bool:
+        """一轮超时后的处理。sdk 运行时没有 session/cancel（见 dsh_client 注释），那一轮会在后台跑完，
+        迟到的工具回调靠 turn_id 拦。这里不杀进程（杀了要冷启动 + 全部会话重预热，实测 60–90 秒），
+        只给这个会话换代：下一条消息用新会话号、重灌它自己的历史，其它会话的上下文原样保住。
+        同一进程连续超时达到 restart_after_timeouts 次才真重建（防进程本身卡死后永远不换）。返回是否重建了。"""
+        self.session_gen[conversation] = self.session_gen.get(conversation, 0) + 1
+        self.primed.discard(conversation)
+        self.consecutive_timeouts += 1
+        if self.consecutive_timeouts >= int(self.cfg.get("restart_after_timeouts", 3)):
+            self._restart_dsh_after_timeout()
+            return True
+        return False
 
     def _restart_dsh_after_timeout(self) -> None:
-        """一轮超时后 dsh 仍在跑那一轮，迟到的工具回调会串到下一条消息上（turn_id 校验是第一道）。
-
-        本想只取消那一轮保住进程和预热，但 sdk 运行时没有 session/cancel（见 dsh_client 注释），
-        只能重建进程：下一条消息冷启动 + 重预热。回放第一轮里「超时→重建→重预热→更慢→再超时」
-        确有连锁，所以真正的解法是把 turn_timeout 放到模型实际延迟之上，别让它频繁触发。
-        """
+        """连续超时到阈值才走这条：重建进程，下一条消息冷启动 + 全部会话重预热。"""
+        self.consecutive_timeouts = 0
         if self.dsh is not None:
             try:
                 self.dsh.stop()
@@ -150,12 +172,13 @@ class Gateway:
             restarted = False
             t_restart_ms = 0
             if turn.timed_out:
-                # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上；
-                # turn_id 校验是第一道，重建进程是第二道保险。
+                # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上：turn_id 校验拦它，
+                # 这个会话换代，进程不动（连续超时到阈值才重建）。
                 t_r0 = time.time()
-                self._restart_dsh_after_timeout()
+                restarted = self._abandon_after_timeout(conv)
                 t_restart_ms = int((time.time() - t_r0) * 1000)
-                restarted = True
+            elif not turn.error:
+                self.consecutive_timeouts = 0
             result = self.inflight.result
             if result is None:
                 if turn.error:
@@ -175,6 +198,7 @@ class Gateway:
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
                        "t_prompt_ms": t_prompt_ms, "t_restart_ms": t_restart_ms,
+                       "session_gen": self.session_gen.get(conv, 0),
                        "ms": int((time.time() - t0) * 1000)}
             if turn.error:
                 log_rec["dsh_error"] = turn.error
@@ -319,4 +343,5 @@ def make_handler(gw: Gateway):
 def serve(gw: Gateway, bind: str, port: int) -> None:
     srv = ThreadingHTTPServer((bind, port), make_handler(gw))
     print(f"[gateway] listening on {bind}:{port}", flush=True)
+    threading.Thread(target=gw.prewarm, name="dsh-prewarm", daemon=True).start()
     srv.serve_forever()

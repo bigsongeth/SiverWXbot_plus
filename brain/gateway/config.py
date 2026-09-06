@@ -11,6 +11,7 @@ DEFAULTS = {
     "model": "songkey-auto",
     "turn_timeout_sec": 180,   # 09-06 用户拍板 3 分钟：超时几乎全来自搜索工具（小红书 20–40s/次），两次搜索 + 组织回复要给够
     "lock_timeout_sec": 200,   # 排队等锁的上限；机器人侧插件 timeout_sec 要 ≥ lock + turn（现在 420）
+    "restart_after_timeouts": 3,   # 同一个 dsh 进程连续超时几次才真重建（平时超时只给那个会话换代，进程常驻）
     "budget": {"base": 30, "factor": 2.5, "min": 40, "max_group": 150, "max_private": 220},
     "max_bubbles_group": 2,
     "max_bubbles_private": 3,

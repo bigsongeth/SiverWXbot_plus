@@ -175,14 +175,55 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(out["bubbles"], ["无标识"])
         self.assertIn({"tool": "wx_reply", "no_turn_id": True}, seen)
 
-    def test_timeout_restarts_dsh(self):
+    def test_timeout_keeps_dsh_and_rotates_session(self):
+        # 超时不杀进程：只给这个会话换代、丢掉它的预热；别的会话不受影响
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["J 先来"]})]
+        self.gw.handle_reply({"conversation": "J", "is_group": True, "sender": "J", "text": "哈喽"})
         self.fake.timeout_next = True
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out, {"no_reply": True, "reason": "timeout"})
+        self.assertEqual(self.fake.stopped, 0)
+        self.assertIs(self.gw.dsh, self.fake)
+        self.assertEqual(len(self.fake.prompts), 2)  # 超时后不再 nudge
+        log = self.gw.read_log(1)[0]
+        self.assertFalse(log["dsh_restarted_after_timeout"])
+        self.assertEqual(log["session_gen"], 1)
+        self.assertNotIn("K", self.gw.primed)
+        self.assertIn("J", self.gw.primed)
+        # K 的下一条用新会话号（带 #1），J 的会话号不变
+        self.fake.timeout_next = False
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["K 回来了"]})]
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "再来"})
+        self.assertTrue(self.fake.prompts[-1][0].endswith("#1"))
+        self.assertEqual(self.fake.prompts[1][0] + "#1", self.fake.prompts[-1][0])
+        self.assertEqual(self.gw._session_id("J"), self.fake.prompts[0][0])
+
+    def test_three_consecutive_timeouts_restart_dsh(self):
+        self.fake.timeout_next = True
+        for i in range(2):
+            self.gw.handle_reply({"conversation": f"C{i}", "is_group": True, "sender": "x", "text": "嗯"})
+            self.assertEqual(self.fake.stopped, 0)
+        out = self.gw.handle_reply({"conversation": "C2", "is_group": True, "sender": "x", "text": "嗯"})
+        self.assertEqual(out, {"no_reply": True, "reason": "timeout"})
         self.assertEqual(self.fake.stopped, 1)
         self.assertIsNone(self.gw.dsh)
-        self.assertEqual(len(self.fake.prompts), 1)  # 超时后不再 nudge
         self.assertTrue(self.gw.read_log(1)[0]["dsh_restarted_after_timeout"])
+        self.assertEqual(self.gw.consecutive_timeouts, 0)
+
+    def test_prewarm_starts_dsh_before_first_message(self):
+        ref = [None]
+        fakes = []
+
+        def factory():
+            f = FakeDsh(ref)
+            fakes.append(f)
+            return f
+        gw = Gateway(self.gw.cfg, self.gw.data, self.gw.ws, dsh_factory=factory)
+        ref[0] = gw
+        self.assertIsNone(gw.dsh)
+        gw.prewarm()
+        self.assertIs(gw.dsh, fakes[0])
+        self.assertTrue(gw.dsh.alive())
 
     def test_ensure_dsh_stops_old_client(self):
         ref = [None]
