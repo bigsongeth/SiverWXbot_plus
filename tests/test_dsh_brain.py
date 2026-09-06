@@ -88,6 +88,12 @@ class BrainApiTest(unittest.TestCase):
         dead = BrainAPI("g", True, "http://127.0.0.1:9", 1)
         self.assertEqual(dead.chat("a: 连不上"), API_ERROR_TEXT)  # 连接失败
 
+    def test_at_nickname_residue_stripped(self):
+        BrainAPI("g", True, self.url, 5).chat("松爸: （少艾特我）\u2005网络上有啥妙用吗")
+        self.assertEqual(_FakeGateway.seen[-1][1]["text"], "网络上有啥妙用吗")
+        BrainAPI("g", True, self.url, 5).chat("松爸: （这是正常括号）不带那个空格")
+        self.assertEqual(_FakeGateway.seen[-1][1]["text"], "（这是正常括号）不带那个空格")
+
     def test_image_marker_appended(self):
         BrainAPI("g", True, self.url, 5).chat("a: 看这个", image_path="/tmp/x.png")
         self.assertEqual(_FakeGateway.seen[-1][1]["text"], "看这个 [图片]")

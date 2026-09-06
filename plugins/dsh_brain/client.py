@@ -21,6 +21,9 @@ NO_REPLY_TOKEN = "[NO_REPLY]"            # = wxbot_core.NO_REPLY_TOKEN
 API_ERROR_TEXT = "API返回错误，请稍后再试"   # = plugins/model_fallback/chain.py API_ERROR_TEXT
 
 _SENDER = re.compile(r"^([^:：\n]{1,30})[:：]\s*")
+# 机器人只剥掉 AtMe（"@🐶肥肉"），群昵称若带后缀（"🐶肥肉（少艾特我）"），后缀连同微信 @ 后面那个 U+2005 会留在正文开头：
+# "（少艾特我）\u2005网络上有啥…"。模型会把括号里的话当指令读。只认「括号 + U+2005」这个组合，不误伤正常的括号开头。
+_AT_RESIDUE = re.compile(r"^[（(][^）)]{1,20}[）)]\u2005\s*")
 _log = logging.getLogger("dsh_brain")
 
 # 绕开系统代理：这台 Windows 的 IE 代理指向局域网某台机器（CLAUDE.md 3.12），Tailscale 地址进代理必挂
@@ -55,6 +58,7 @@ class BrainAPI:
             sender = sender or self.conversation
         else:
             sender = self.conversation
+        text = _AT_RESIDUE.sub("", text)
         if image_path or image_url:
             text = (text + " [图片]").strip()
         # 机器人的 memory_context_count 可能是 1000，网关预热只取最后 20 条，整包发纯属浪费
