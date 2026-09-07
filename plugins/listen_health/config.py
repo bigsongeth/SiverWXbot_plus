@@ -42,6 +42,10 @@ DEFAULTS = {
         #   ""       关闭复位
         "unstick": "click",
         "unstick_points": [[600, 900], [700, 600], [37, 700]],   # click 模式候选点（主窗口客户区坐标）
+        # 指针守卫（2026-09-08 钉死的根因）：真实指针压在微信窗口边框带（离任一条边 ≤ cursor_band 像素）上时，
+        # 假双击永远不被当双击。每次 AddListenChat 前检查一次，是就把指针挪进窗口内部（只移动不点击）。
+        "cursor_guard": True,
+        "cursor_band": 8,
     },
 }
 

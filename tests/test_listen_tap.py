@@ -37,7 +37,12 @@ class Base(unittest.TestCase):
         self.rows = []
         self.shots = []
         self._orig = {n: getattr(tap, n) for n in
-                      ("_record", "_screenshot", "_wx_top_windows", "_env_snapshot", "load")}
+                      ("_record", "_screenshot", "_wx_top_windows", "_env_snapshot", "load",
+                       "_cursor_pos", "_set_cursor_pos", "_point_owner_is_wechat")}
+        # 指针守卫默认按"指针在别的程序上"处理，不触发；要测守卫的用例自己改这三个桩
+        tap._cursor_pos = lambda: (1700, 500)
+        tap._point_owner_is_wechat = lambda x, y: False
+        tap._set_cursor_pos = lambda pt: None
         tap._record = lambda row: self.rows.append(row)
         tap._screenshot = lambda path: (self.shots.append(path), True)[1]
         tap._wx_top_windows = lambda: [{"cls": "Qt51514QWindowIcon", "t": "微信", "v": 1, "r": [0, 0, 1200, 1048]}]
@@ -284,6 +289,112 @@ class TestInstall(Base):
             wx.AddListenChat(nickname="x", callback=None)
         self.assertEqual(len(self.rows), 1)
         self.assertIsNone(self.rows[0]["shot"])   # screenshot=False
+
+
+
+
+MAIN = {"cls": "Qt51514QWindowIcon", "t": "微信", "v": 1, "r": [0, 0, 1500, 1048]}
+SUB = {"cls": "Qt51514QWindowIcon", "t": "🏜️AI 及其代理人联邦🐶", "v": 1, "r": [0, 0, 1500, 1048]}
+TRAY = {"cls": "Qt51514QWindowIcon", "t": "Weixin", "v": 0, "r": [872, 409, 1048, 608]}
+
+
+class TestCursorDanger(unittest.TestCase):
+    """2026-09-08 实测：指针在窗口顶边 +0/+2 双击必败，+10 就好；子窗口顶边同样有毒；窗口内部/Chrome/任务栏都安全。"""
+
+    def test_top_edge_of_main_is_danger(self):
+        self.assertIs(tap.cursor_danger((1098, 0), [MAIN, TRAY]), MAIN)
+        self.assertIs(tap.cursor_danger((1098, 2), [MAIN]), MAIN)
+        self.assertIs(tap.cursor_danger((300, 0), [MAIN]), MAIN)
+
+    def test_inside_window_is_safe(self):
+        for pt in ((1098, 10), (1098, 30), (700, 600), (608, 900)):
+            self.assertIsNone(tap.cursor_danger(pt, [MAIN]), pt)
+
+    def test_sub_window_on_top_uses_its_edge(self):
+        # 子窗口盖在主窗口上（同 rect），Z 序第一个说了算
+        self.assertIs(tap.cursor_danger((700, 2), [SUB, MAIN]), SUB)
+        self.assertIsNone(tap.cursor_danger((700, 600), [SUB, MAIN]))
+
+    def test_other_edges_are_conservatively_danger(self):
+        self.assertIs(tap.cursor_danger((0, 500), [MAIN]), MAIN)
+        self.assertIs(tap.cursor_danger((1499, 500), [MAIN]), MAIN)
+        self.assertIs(tap.cursor_danger((700, 1047), [MAIN]), MAIN)
+
+    def test_outside_all_windows_and_invisible_ignored(self):
+        self.assertIsNone(tap.cursor_danger((1700, 500), [MAIN, TRAY]))
+        self.assertIsNone(tap.cursor_danger((900, 410), [TRAY]))       # 不可见/小窗口不算
+        self.assertIsNone(tap.cursor_danger(None, [MAIN]))
+        self.assertIsNone(tap.cursor_danger((1, 1), []))
+
+    def test_band_is_configurable(self):
+        self.assertIsNone(tap.cursor_danger((1098, 10), [MAIN], band=8))
+        self.assertIs(tap.cursor_danger((1098, 10), [MAIN], band=12), MAIN)
+
+    def test_safe_park_point_inside_main_away_from_edges(self):
+        pt = tap.safe_park_point([SUB, MAIN, TRAY])
+        self.assertEqual(pt, (600, 890))
+        self.assertIsNone(tap.cursor_danger(pt, [SUB, MAIN]))
+        self.assertIsNone(tap.safe_park_point([TRAY]))
+        # 没有主窗口就用第一个大窗口
+        self.assertEqual(tap.safe_park_point([SUB]), (600, 890))
+
+
+class TestCursorGuardInWrapper(Base):
+    def setUp(self):
+        super().setUp()
+        self.moves = []
+        self.order = []
+        tap._wx_top_windows = lambda: [SUB, MAIN, TRAY]
+        tap._set_cursor_pos = lambda pt: (self.moves.append(pt), self.order.append("move"))
+        tap.load = lambda: {"tap": {"enabled": True, "screenshot": False, "keep_success": True, "unstick": ""}}
+
+    def _wx(self):
+        wx = FakeWx(inner=lambda: self.order.append("open"))
+        return wx
+
+    def test_moves_cursor_off_top_edge_before_opening(self):
+        tap._cursor_pos = lambda: (1098, 0)
+        tap._point_owner_is_wechat = lambda x, y: True
+        wx = self._wx()
+        tap.wrap_add_listen_chat(wx, {"cursor_guard": True})
+        self.assertTrue(wx.AddListenChat(nickname="共建杭州美食地图🐶", callback=None))
+        self.assertEqual(self.moves, [(600, 890)])
+        self.assertEqual(self.order, ["move", "open"])       # 先挪指针，再开窗
+        self.assertEqual(self.rows[-1]["cursor_guard"], {"from": [1098, 0], "to": [600, 890], "win": SUB["t"]})
+
+    def test_cursor_inside_window_untouched(self):
+        tap._cursor_pos = lambda: (700, 600)
+        tap._point_owner_is_wechat = lambda x, y: True
+        wx = self._wx()
+        tap.wrap_add_listen_chat(wx, {"cursor_guard": True})
+        wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.moves, [])
+        self.assertIsNone(self.rows[-1]["cursor_guard"])
+
+    def test_cursor_on_other_app_untouched_even_if_geometry_overlaps(self):
+        tap._cursor_pos = lambda: (1098, 0)
+        tap._point_owner_is_wechat = lambda x, y: False       # Chrome 盖在上面
+        wx = self._wx()
+        tap.wrap_add_listen_chat(wx, {"cursor_guard": True})
+        wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.moves, [])
+
+    def test_guard_can_be_disabled(self):
+        tap._cursor_pos = lambda: (1098, 0)
+        tap._point_owner_is_wechat = lambda x, y: True
+        wx = self._wx()
+        tap.wrap_add_listen_chat(wx, {"cursor_guard": False})
+        wx.AddListenChat(nickname="x", callback=None)
+        self.assertEqual(self.moves, [])
+
+    def test_guard_failure_never_blocks_open(self):
+        def boom():
+            raise RuntimeError("no win32")
+        tap._cursor_pos = boom
+        wx = self._wx()
+        tap.wrap_add_listen_chat(wx, {"cursor_guard": True})
+        self.assertTrue(wx.AddListenChat(nickname="x", callback=None))
+        self.assertEqual(self.order, ["open"])
 
 
 if __name__ == "__main__":

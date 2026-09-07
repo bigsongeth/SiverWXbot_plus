@@ -305,6 +305,35 @@ def _env_snapshot() -> dict:
     except Exception:
         pass
 
+    # 真实鼠标指针在哪、压在谁身上（2026-09-08 补）：09-08 00:27 那 24 次双击失败里，唯一没记的现场
+    # 就是它——而「真实单击能复位」的 09-06 诊断把指针留在了主窗口上，生产 unstick 却把指针放回原处。
+    # 指针是不是压在主窗口/某个子窗口上，很可能就是双击认不认的分水岭，先把它记下来。
+    try:
+        import ctypes as _ct
+        cx, cy = win32gui.GetCursorPos()
+        snap['cursor'] = [cx, cy]
+
+        class _PT(_ct.Structure):
+            _fields_ = [('x', _ct.c_long), ('y', _ct.c_long)]
+        u32 = _ct.windll.user32
+        u32.WindowFromPoint.argtypes = [_PT]
+        u32.WindowFromPoint.restype = _ct.c_void_p
+        h = u32.WindowFromPoint(_PT(cx, cy))
+        if h:
+            root = win32gui.GetAncestor(int(h), 2)
+            try:
+                _, cpid = win32process.GetWindowThreadProcessId(root)
+                cproc = psutil.Process(cpid).name()
+            except Exception:
+                cproc = None
+            snap['cursor_win'] = {'root': root, 'title': win32gui.GetWindowText(root),
+                                  'cls': win32gui.GetClassName(root), 'proc': cproc,
+                                  'is_main': int(root == snap.get('wx_main_hwnd'))}
+        else:
+            snap['cursor_win'] = None
+    except Exception:
+        pass
+
     # 下面三块是本轮新加的取证埋点，全部只读；任何一块挂掉都只是缺字段，不影响探针判定。
     try:
         snap['wx_windows'] = _wx_top_windows()

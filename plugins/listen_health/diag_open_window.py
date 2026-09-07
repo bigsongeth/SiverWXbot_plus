@@ -20,6 +20,12 @@ diag_open_window.py —— 把「AddListenChat 弹不出独立窗口（MoveWindo
 并发往不同子窗口发假点击，交错后 Qt 进程级鼠标状态卡住；一次真实鼠标单击可复位；
 `LISTENER_EXCUTOR_WORKERS=1` 可预防（挂 5 个监听 8/8）。灌水 WM_NULL / PostMessage / 时间戳那一层是弯路。
 
+★★ 2026-09-08 01:00 真·根因（本脚本 --cursor 做的 A/B，16 轮，想坏就坏想好就好）：
+  真实鼠标指针停在【任一微信顶层窗口的顶边几个像素】上（y=顶+0/+2 坏、+10 好；子窗口顶边同样坏），
+  假双击就永远不被当双击（DBLCLK 处理 0.03–0.05s）；指针在窗口内部 / 子窗口内部 / Chrome / 任务栏都正常。
+  RustDesk 会把远端指针留在屏幕顶边（09-08 00:46 实测 (1098,0)）。09-06 的"监听线程交错"结论很可能是被它混淆的
+  （那些实验期间有人连着 RustDesk 在动鼠标）。修法在 tap.guard_cursor：开窗前把边框带上的指针挪进窗口内部。
+
 本脚本能做的实验：
   --listen @文件     先像生产一样挂上一批监听再测（一行一个名字，UTF-8）——这是能复现故障的那一组
   --listen-workers N 改 WxParam.LISTENER_EXCUTOR_WORKERS（1 = 预防修法）
@@ -29,6 +35,7 @@ diag_open_window.py —— 把「AddListenChat 弹不出独立窗口（MoveWindo
   --post             wxautox 的 SendMessage 鼠标消息改 PostMessage（已证伪）
   --realclick        拦下假点击改真实鼠标双击（坏状态下也开不出）
   --load K / --resize WxH   更早的 A/B（已证伪）
+  --cursor X,Y       循环前把真实指针移到屏幕 X,Y（不点击）——2026-09-08 假说：指针压在主窗口/子窗口/别处，决定双击认不认
 
 跑法（会话 2）：payload 改成
       set PYTHONIOENCODING=utf-8
@@ -75,6 +82,14 @@ def w(line: str = "") -> None:
         print(s)
     except Exception:
         pass
+
+
+def _cursor_info():
+    try:
+        e = _env_snapshot() or {}
+        return f"{e.get('cursor')} -> {e.get('cursor_win')}"
+    except Exception as ex:
+        return repr(ex)
 
 
 def _main_hwnd():
@@ -313,6 +328,17 @@ def run(args) -> int:
             w(f"复位动作 {args.unstick} 异常: {e!r}")
         time.sleep(1)
 
+    if args.cursor:
+        # 只移动真实指针、不点击：验证「双击认不认，取决于指针压在哪个窗口上」这个假说
+        try:
+            cx, cy = [int(v) for v in args.cursor.split(",")]
+            import win32api
+            win32api.SetCursorPos((cx, cy))
+            time.sleep(0.5)
+            w(f"实验开关：真实指针移到屏幕 ({cx},{cy})，不点击；指针下窗口={_cursor_info()}")
+        except Exception as e:
+            w(f"--cursor 失败: {e!r}")
+
     if args.resize:
         _resize_main(args.resize)
     load_procs = _spawn_load(args.load) if args.load else []
@@ -378,6 +404,7 @@ def run(args) -> int:
                 "wx_before": _wx_titles(before), "wx_after": _wx_titles(after),
                 "main_rect": env.get("wx_main_rect"), "fg": env.get("fg_title"),
                 "rustdesk_conns": env.get("rustdesk_conns"), "calls": calls, "shot": shot,
+                "cursor": env.get("cursor"), "cursor_win": env.get("cursor_win"),
             }
             with open(OUT_JSONL, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -388,7 +415,8 @@ def run(args) -> int:
             dbl_cost = ""
             if len(mouse) >= 5 and mouse[4].get("msg") == "WM_LBUTTONDBLCLK":
                 dbl_cost = f" 双击处理耗时={mouse[4]['t'] - mouse[3]['t']:.2f}s"
-            w(f"[{i:02d}] {'OK ' if ok else 'BAD'} cost={cost}s cpu={cpu}% "
+            cw = env.get("cursor_win") or {}
+            w(f"[{i:02d}] {'OK ' if ok else 'BAD'} 指针={env.get('cursor')}@{cw.get('title')!s:.12}{'(主)' if cw.get('is_main') else ''} cost={cost}s cpu={cpu}% "
               f"窗口 {len(before or [])}->{len(after or [])} 底层调用 {len(calls)} 条（鼠标类 {len(mouse)}）{dbl_cost}"
               f"{'  ' + err if err else ''}")
             for c in mouse[:12]:
@@ -449,6 +477,7 @@ def main() -> int:
     ap.add_argument("--listen-interval", type=int, default=0, help="改 WxParam.LISTEN_INTERVAL（秒），0=不改")
     ap.add_argument("--unstick", default="", help="循环前做一次复位动作：esc / click / minmax / cancelmode / activate")
     ap.add_argument("--listen-workers", type=int, default=0, help="改 WxParam.LISTENER_EXCUTOR_WORKERS（监听线程数），0=不改")
+    ap.add_argument("--cursor", default="", help="循环前把真实鼠标指针移到屏幕坐标 X,Y（不点击），如 700,600 / 1700,500")
     return run(ap.parse_args())
 
 

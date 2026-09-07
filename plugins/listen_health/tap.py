@@ -11,6 +11,15 @@ tap.py —— 常驻在 bot 进程里的「开窗现场录像机」。
 `uiplug.pyd` 是编译的，但它在调用时才从 `win32gui` / `win32api` / `ctypes.windll.user32`
 取函数，所以把这些模块上的函数包一层就能看见它发了什么。
 
+★ 2026-09-08 01:00 真·根因（独立进程 A/B，16 轮，想坏就坏想好就好）：
+  **真实鼠标指针停在任何一个微信顶层窗口的顶边那几个像素上**（y=窗口顶+0/+2 坏，+10 就好；
+  子窗口顶边一样有毒），wxautox 的假双击就永远不被当双击（微信处理 DBLCLK 只花 0.03–0.05s，
+  正常 0.24s），单击照常生效。指针在窗口内部、在子窗口内部、在 Chrome/任务栏上都没事。
+  RustDesk 的远端指针经常被留在屏幕顶边（本机 09-08 00:46 实测停在 (1098,0)），于是"白天有人连过就坏、
+  重启第一个成功（走搜索菜单路径）其余全败、真实单击有时能救（指针被留在窗口里）有时不能
+  （生产 unstick 点完把指针放回顶边）"全对上了。09-06 那套"监听线程交错"的结论很可能是被这个混淆的。
+  修法就在 `guard_cursor`：每次 AddListenChat 前看一眼指针，压在微信窗口边框带上就挪进窗口内部，不点击。
+
 安全边界：
 - 包装函数只在 `AddListenChat` 执行期间往列表里 append，其余时间是纯透传，
   任何异常都吞掉，绝不改变原调用的返回值。
@@ -237,9 +246,9 @@ def unstick(mode: str, hwnd=None, points=None) -> str:
     """把微信从坏状态拉回来。返回一句人读的说明；失败抛异常。
 
     mode='click'：在主窗口客户区若干候选空白点里挑第一个"最上面确实是微信窗口"的点，
-                  用真实鼠标（mouse_event）单击一下，点完把光标放回原处。
-                  生产里主窗口上面通常叠着几个子窗口（同 rect），点到子窗口的空白处一样有效——
-                  卡住的是 Qt 进程级的鼠标状态，不分窗口。
+                  用真实鼠标（mouse_event）单击一下，**指针留在那里**。
+                  2026-09-08 复盘：它之所以"有时有效"，其实是把指针从窗口顶边挪进了窗口内部；
+                  现在 guard_cursor 在开窗前就做这件事，这里只是兜底。
     mode='minmax'：主窗口最小化再还原，不碰鼠标。
     """
     import win32api
@@ -257,11 +266,7 @@ def unstick(mode: str, hwnd=None, points=None) -> str:
     if mode == "click":
         # 候选点：聊天区下方空白 / 聊天区中部 / 左侧导航栏下方空白（客户区坐标）
         cands = points or [(600, 900), (700, 600), (37, 700)]
-        old = None
-        try:
-            old = win32api.GetCursorPos()
-        except Exception:
-            pass
+        # 点完【不再】把指针放回原处（2026-09-08）：原处多半就是屏幕顶边——09-08 00:27 12 次复位全废的原因。
         for cx, cy in cands:
             try:
                 sx, sy = win32gui.ClientToScreen(hwnd, (int(cx), int(cy)))
@@ -275,14 +280,101 @@ def unstick(mode: str, hwnd=None, points=None) -> str:
             time.sleep(0.05)
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
             time.sleep(0.3)
-            if old:
-                try:
-                    win32api.SetCursorPos(old)
-                except Exception:
-                    pass
-            return f"真实鼠标单击微信窗口空白处 ({sx},{sy})"
+            return f"真实鼠标单击微信窗口空白处 ({sx},{sy})，指针留在这里"
         raise RuntimeError("候选点上面都不是微信窗口，没点")
     raise ValueError(f"不认识的复位模式 {mode!r}")
+
+
+# ---------------------------------------------------------------------------
+# 指针守卫（2026-09-08 钉死的根因，见文件头）：AddListenChat 之前把压在微信窗口边框带上的真实指针挪开。
+# 只移动、不点击；指针在窗口内部 / 别的程序上一律不碰（人正在用鼠标时不打扰）。
+# ---------------------------------------------------------------------------
+CURSOR_BAND_DEFAULT = 8        # 离窗口任一条边 ≤ 8px 算边框带（实测顶边 +2 坏、+10 好；其余三边按同样宽度保守处理）
+_MAIN_TITLES = ("微信", "Weixin", "WeChat")
+_LAST_GUARD = [None]           # 最近一次守卫动作，供 _dump 写进记录
+
+
+def _cursor_pos():
+    import win32api
+    return tuple(win32api.GetCursorPos())
+
+
+def _set_cursor_pos(pt):
+    import win32api
+    win32api.SetCursorPos((int(pt[0]), int(pt[1])))
+
+
+def _big_visible_wx_windows(wins):
+    out = []
+    for w in wins or []:
+        r = w.get("r") or []
+        if w.get("cls") == "Qt51514QWindowIcon" and w.get("v") and len(r) == 4 \
+                and r[2] - r[0] >= 200 and r[3] - r[1] >= 200:
+            out.append(w)
+    return out
+
+
+def cursor_danger(cursor, wins, band: int = CURSOR_BAND_DEFAULT):
+    """真实指针是否压在某个可见微信顶层窗口的边框带上。返回命中的窗口 dict，安全返回 None。
+
+    wins 按 Z 序（EnumWindows 从上往下），取【第一个】包含该点的可见微信窗口来判——
+    它就是指针真正压着的那个（生产里主窗口和子窗口 rect 相同，上面的那个说了算）。纯函数，单测直接喂。
+    """
+    if not cursor or not wins:
+        return None
+    x, y = cursor
+    for w in _big_visible_wx_windows(wins):
+        l, t, r, b = w["r"]
+        if not (l <= x < r and t <= y < b):
+            continue
+        if (x - l) <= band or (r - 1 - x) <= band or (y - t) <= band or (b - 1 - y) <= band:
+            return w
+        return None
+    return None
+
+
+def safe_park_point(wins):
+    """挑一个"肯定安全"的落点：微信主窗口（找不到就任一大窗口）内部、离边 ≥ 40px 的聊天区。
+    实测 (700,600) / (608,900) 这类窗口内部点、哪怕上面盖着子窗口，双击都正常。"""
+    big = _big_visible_wx_windows(wins)
+    if not big:
+        return None
+    main = next((w for w in big if w.get("t") in _MAIN_TITLES), big[0])
+    l, t, r, b = main["r"]
+    w_, h_ = r - l, b - t
+    x = l + max(40, min(600, w_ // 2))
+    y = t + max(40, min(int(h_ * 0.85), h_ - 40))
+    return (x, y)
+
+
+def guard_cursor(tcfg: dict | None = None):
+    """AddListenChat 前调一次。压在边框带上就挪到安全点，返回 {'from','to','win'}；没动返回 None。
+    全程吞异常——它只是保险，绝不能把开窗流程炸掉。"""
+    _LAST_GUARD[0] = None
+    tcfg = tcfg or {}
+    if not tcfg.get("cursor_guard", True):
+        return None
+    try:
+        cur = _cursor_pos()
+        if not _point_owner_is_wechat(cur[0], cur[1]):     # 指针在别的程序上（Chrome/任务栏），安全
+            return None
+        wins = _wx_top_windows() or []
+        hit = cursor_danger(cur, wins, int(tcfg.get("cursor_band", CURSOR_BAND_DEFAULT)))
+        if not hit:
+            return None
+        to = safe_park_point(wins)
+        if not to:
+            return None
+        _set_cursor_pos(to)
+        time.sleep(0.15)
+        info = {"from": list(cur), "to": list(to), "win": hit.get("t")}
+        _LAST_GUARD[0] = info
+        log("WARNING", f"录像机：真实指针停在「{hit.get('t')}」边框带上 {list(cur)}，微信会吞掉双击，"
+                       f"已挪到窗口内部 {list(to)}（不点击）")
+        return info
+    except Exception as e:
+        log("WARNING", f"录像机：指针守卫失败（忽略）：{e!r}")
+        return None
 
 
 def wrap_add_listen_chat(wx, tcfg: dict | None = None):
@@ -308,6 +400,7 @@ def wrap_add_listen_chat(wx, tcfg: dict | None = None):
                 _POST_CLICKS[0] = bool(((load().get("tap") or {}).get("post_clicks", False)))
             except Exception:
                 pass
+            guard_cursor(tcfg)          # 根因修法：指针压在微信窗口边框带上就先挪开，见文件头
             CALLS.clear()
             _T0[0] = time.perf_counter()
             _ACTIVE[0] = True
@@ -397,6 +490,8 @@ def _dump(nickname, failed, err, cost, calls, before, want_shot, note=None):
         "fg": env.get("fg_title"), "fg_proc": env.get("fg_proc"),
         "main_rect": env.get("wx_main_rect"), "rustdesk_conns": env.get("rustdesk_conns"),
         "hit_test": env.get("hit_test"), "shot": shot, "note": note,
+        "cursor": env.get("cursor"), "cursor_win": env.get("cursor_win"),
+        "cursor_guard": _LAST_GUARD[0],
     }
     _record(row)
     if failed:
