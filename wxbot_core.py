@@ -244,6 +244,36 @@ LEADING_TIMESTAMP_RE = re.compile(
 )
 
 
+QUOTE_TEXT_MAX = 300   # 被引用原文拼进正文的上限，防止引用一篇长文把上下文撑爆
+
+
+def attach_quote_text(message, max_len: int = QUOTE_TEXT_MAX) -> None:
+    """把引用消息里「被引用人 + 原文」拼进 message.content，让 AI / 记忆 / 备用接口三条路都看得到。
+
+    2026-09-08 加：wxautox 把「你的话 引用 某人 的消息: 原文」拆成 content / quote_nickname / quote_content，
+    机器人以前只读 content，被引用的文字从没往下传过——用户引用一条老消息 @肥肉说「收录一下」，
+    大脑只看到「收录一下」四个字。图片引用那条路（'+引用的图片:' 标记）保持原样，文字标签插在标记前面。
+    幂等：同一条消息重复进来不会拼两遍。
+    """
+    if getattr(message, "type", "") != "quote":
+        return
+    quoted = str(getattr(message, "quote_content", "") or "").strip()
+    if not quoted:
+        return
+    if len(quoted) > max_len:
+        quoted = quoted[:max_len] + "…"
+    nick = str(getattr(message, "quote_nickname", "") or "").strip()
+    tag = f"（引用{(' ' + nick) if nick else ''}：{quoted}）"
+    content = str(getattr(message, "content", "") or "")
+    if tag in content:
+        return
+    if "+引用的图片:" in content:
+        head, tail = content.split("+引用的图片:", 1)
+        message.content = head + tag + "+引用的图片:" + tail
+    else:
+        message.content = content + tag
+
+
 def strip_leading_timestamp(text):
     """剥掉回复开头模仿历史消息格式的时间戳（可能连带多个）。"""
     if not text:
@@ -3530,6 +3560,7 @@ class WXBot:
         :param message: 消息对象
         :return:        发送结果
         """
+        attach_quote_text(message)   # 引用消息：把被引用人和原文拼进正文（见函数注释）
         log(message=f"处理 {chat.who} 窗口 {message.sender} 消息：{message.content}")
         result = True  # 默认返回成功（WxResponse 类型）
 

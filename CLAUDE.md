@@ -417,6 +417,11 @@ if handled and checkin_reply:
   改的是 `_build_history_messages`，别再去 `chat()` 的循环里找。**
 - **接话闸门**：人设 prompt 里约定"判断无需接话时只输出 `[NO_REPLY]`"，`wx_send_ai`（私聊）和群聊回复路径在发送前调 `apply_no_reply_gate()` 静默跳过、日志留痕。**prompt 层 opt-in**——只有 prompt 提到该标记的人设（目前 `AI极客.md`、`NCC肥肉.md` 的「接话判断」节）会触发，其他人设不受影响。标记混着正文时只发正文。
 - 单测：`python tests/test_reply_gate.py`（13 个，纯函数不碰微信；mac 上 `-m unittest tests.xxx` 会被 anaconda 的 tests 包遮蔽，直接跑文件即可）。
+- **引用消息带原文（2026-09-08 加）**：模块级 `attach_quote_text()`，在 `process_message` 入口把 wxautox 拆出来的
+  `quote_nickname` / `quote_content` 拼进 `message.content`（形如「收一下（引用 小A：原文）」，原文截 300 字），
+  大脑 / 记忆 / 备用接口三条路一起看到；`'+引用的图片:'` 标记保持在末尾。以前机器人只读 `content`，被引用的文字从没往下传过。
+  副作用：引用着发「签到」这类精确匹配指令会匹配不上（正文多了括号），可接受。单测 `tests/test_quote_attach.py`（7 个，ast 摘函数）。
+  **合并上游后确认 `process_message` 开头那一行调用还在。**
 
 ### 3.8 远程重启与会话 2 执行器（血泪 2.0，2026-07-05）
 **微信客户端进程绝对不能杀/退出**——登录必须人在屏幕点击，SSH/计划任务都替代不了。微信本地也监听 1000x 端口，**所以永远不要按端口杀进程**（2026-07-05 凌晨按端口杀把微信杀下线了）。
