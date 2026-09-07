@@ -196,6 +196,16 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(out["bubbles"], ["无标识"])
         self.assertIn({"tool": "wx_reply", "no_turn_id": True}, seen)
 
+    def test_retry_attempt_adds_hint(self):
+        """机器人侧重试（attempt>1）那轮，消息末尾带「少调工具」提示；首轮没有。"""
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["好"]})] * 2
+        self.gw.handle_reply({"conversation": "肥肉测试1🐶", "is_group": True, "sender": "松爸", "text": "收一下"})
+        self.assertNotIn("系统提示", self.fake.prompts[0][1])
+        self.gw.handle_reply({"conversation": "肥肉测试1🐶", "is_group": True, "sender": "松爸", "text": "收一下", "attempt": 2})
+        self.assertIn("第 2 次尝试", self.fake.prompts[1][1])
+        self.assertIn("同一个工具报错 2 次就停", self.fake.prompts[1][1])
+        self.assertEqual(self.gw.read_log(1)[0]["attempt"], 2)
+
     def test_timeout_restarts_dsh(self):
         self.fake.timeout_next = True
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})

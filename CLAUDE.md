@@ -230,6 +230,17 @@ if handled and checkin_reply:
   而 `wxresponse_ok` 连 `None` 都判成功，等于几乎不设防。备注不可逆，登记表一旦记错
   就再也对不上微信——复核不过就不 mark，留给批量指令重来。`apply_remark` 和
   `batch._apply_one` 两条路径都接了这两道，batch 的回读在同一把锁里做。
+- ★★ **给群打上🐶之后，`config/config.json` 里的群名必须同步改成带🐶的（2026-09-06 美食群断了 1 小时）**：
+  wxautox 找会话是拿【显示名】精确匹配，打完备注显示名就变成「群名🐶」。已开着的监听窗口不受影响，
+  所以打完当天一直正常；**下次重启**按旧名在会话列表里找不到 → 走搜索框搜 5 秒超时 → 4 次全败被跳过，
+  此后该群消息只被全局监听捞到，日志里就是一串「私聊全局监听收到群聊消息，跳过」。
+  要同步改的地方：`group` / `group_api_map` / `group_prompt_map`（另外三个🐶群配置里本来就带🐶）、
+  `brain/workspace/skills/index.json`（精确匹配，两个名字都列上再 `deploy.sh --remote`）、
+  记忆目录 `memory/<wxid>/<群名🐶>/` 想保历史就把旧文件复制过去。
+  不重启的接法：管理员私聊发 `/添加群 群名🐶`（`handle_add_group` 会现场 `AddListenChat`）。
+  ★ **直接改完 `config.json` 后，面板页面必须先点「加载配置」（就是刷新页面）再碰任何按钮**：
+  「保存配置」「启动机器人」「重启载入新配置」都会先把浏览器表单里的【页面加载时的旧配置】整份写回文件。
+  09-06 18:02–18:29 用户在没刷新的旧页面上点了 6 次，我改的群名被盖回去 6 次，看日志才发现文件 mtime 正好等于「配置文件保存成功」。
 - ⚠️ **打错的备注只能人工清**：`SetGroupRemark` 对已有备注是【追加】、空串也清不掉。
   在微信里手动清空后，把登记表该群的 `remark_applied` 复位再重打。
 - ⚠️ `remark_applied=True` 有两个来源：本地真打成功过，**或 Notion 标题带🐶**
@@ -891,8 +902,13 @@ Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直�
 - ★ **历史每轮都带（2026-09-06 用户拍板，别改回只首轮预热）**：插件每次传最近 60 条，网关首轮预热、之后每轮带「上次之后没看过的」
   （按 fingerprint 判，含小程序卡片/位置/链接，渲染成 `[大众点评卡片] …` / `[位置] …`）。美食群靠这个把群友发的点评/美团卡片收进地图，
   美食 MCP 补了 `remove_place` 走「先收后删」。注意 `group_reply_at=true` 时不 @ 的卡片仍不进大脑，只有下一次 @ 时才作为历史被看到。
-- 网关不通/超时时插件返回 model_fallback 的失败串 → 自动退回老接口链，群里表现是"回到以前的肥肉"而不是没人应；
-  排障先看 mac 上 `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl` 和 `launchctl print gui/501/com.bigsong.feirou-brain`。
+- ★ **失败不切备用接口，再起一轮（2026-09-07 用户拍板）**：大脑一轮超时/出错/网关不可达，插件隔 `retry_delay_sec`(3s)
+  再 POST 一轮（payload 带 `attempt`，网关在重试那轮给大脑加「少调工具、同一工具报错 2 次就停」的系统提示），
+  最多 `max_attempts`(2) 轮；都失败回 `exhausted_reply` 那句固定话（原样发出去），**不再返回失败串、不走 model_fallback**。
+  `exhausted_reply` 留空才退回老行为（切备用接口）。主循环串行，每轮最长 `timeout_sec`，别把 `max_attempts` 设大。
+  起因：09-07 22:42 高德握手超时，大脑换词重试 6 次撞 180s 轮次超时 → 切 DeepSeek 老肥肉答非所问。
+  排障先看 mac-mini `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl`（每行有 `attempt` / `dsh_tools` / `reasoning`）
+  和 `launchctl print gui/501/com.bigsong.feirou-brain`；工具报错再去 hkbohai `journalctl -u hzfood.service`。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
 - 单测：`PYTHONPATH=. python3 tests/test_dsh_brain.py`（本地假网关，不连微信不连大脑）。
 

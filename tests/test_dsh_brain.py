@@ -24,7 +24,9 @@ class _FakeGateway(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n).decode("utf-8"))
         _FakeGateway.seen.append((self.path, body))
         text = body.get("text", "")
-        if "BUSY" in text:
+        if "FLAKY" in text and body.get("attempt", 1) < 2:
+            out, code = {"error": "timeout", "reason": "timeout"}, 200   # 第一轮超时、第二轮成功
+        elif "BUSY" in text:
             out, code = {"error": "busy"}, 503
         elif "ERR" in text:
             out, code = {"error": "dsh init failed"}, 200
@@ -88,6 +90,38 @@ class BrainApiTest(unittest.TestCase):
         dead = BrainAPI("g", True, "http://127.0.0.1:9", 1)
         self.assertEqual(dead.chat("a: 连不上"), API_ERROR_TEXT)  # 连接失败
 
+    def test_retry_new_turn_after_failure(self):
+        """第一轮超时 → 隔一下再起一轮，第二轮成功；payload 带 attempt 让网关知道这是重试。"""
+        api = BrainAPI("肥肉测试1🐶", True, self.url, timeout_sec=5, max_attempts=2, retry_delay_sec=0)
+        self.assertEqual(api.chat("松爸: FLAKY 收一下"), "第一条" + SPLIT_SEPARATOR + "第二条")
+        attempts = [b.get("attempt") for _, b in _FakeGateway.seen]
+        self.assertEqual(attempts, [1, 2])
+
+    def test_exhausted_returns_fixed_reply_not_fallback(self):
+        """2026-09-07 用户拍板：重试耗尽回固定话，不返回失败串（那会触发 model_fallback 切 DeepSeek）。"""
+        api = BrainAPI("肥肉测试1🐶", True, self.url, timeout_sec=5, max_attempts=2, retry_delay_sec=0,
+                       exhausted_reply="🐶 卡住了")
+        self.assertEqual(api.chat("松爸: ERR"), "🐶 卡住了")
+        self.assertEqual(len(_FakeGateway.seen), 2)
+        dead = BrainAPI("x", False, "http://127.0.0.1:1", timeout_sec=1, max_attempts=2, retry_delay_sec=0,
+                        exhausted_reply="🐶 卡住了")
+        self.assertEqual(dead.chat("连不上"), "🐶 卡住了")   # 网关整个不可达也照样不切备用
+
+    def test_exhausted_reply_empty_keeps_fallback(self):
+        api = BrainAPI("肥肉测试1🐶", True, self.url, timeout_sec=5, max_attempts=2, retry_delay_sec=0, exhausted_reply="")
+        self.assertEqual(api.chat("松爸: ERR"), API_ERROR_TEXT)
+        self.assertEqual(len(_FakeGateway.seen), 2)
+
+    def test_max_attempts_one_means_no_retry(self):
+        api = BrainAPI("肥肉测试1🐶", True, self.url, timeout_sec=5, max_attempts=1, exhausted_reply="🐶 卡住了")
+        self.assertEqual(api.chat("松爸: FLAKY"), "🐶 卡住了")
+        self.assertEqual(len(_FakeGateway.seen), 1)
+
+    def test_no_reply_counts_as_success_no_retry(self):
+        api = BrainAPI("肥肉测试1🐶", True, self.url, timeout_sec=5, max_attempts=3, retry_delay_sec=0)
+        self.assertEqual(api.chat("松爸: NOREPLY"), NO_REPLY_TOKEN)
+        self.assertEqual(len(_FakeGateway.seen), 1)
+
     def test_image_marker_appended(self):
         BrainAPI("g", True, self.url, 5).chat("a: 看这个", image_path="/tmp/x.png")
         self.assertEqual(_FakeGateway.seen[-1][1]["text"], "看这个 [图片]")
@@ -125,6 +159,8 @@ class RoutingTest(unittest.TestCase):
         g = dsh_brain.brain_api_for("肥肉测试1🐶", True)
         self.assertIsInstance(g, BrainAPI)
         self.assertEqual((g.conversation, g.is_group, g.timeout_sec), ("肥肉测试1🐶", True, 7.0))
+        self.assertEqual((g.max_attempts, g.retry_delay_sec), (2, 3.0))      # DEFAULT_CONFIG 的重试项透传
+        self.assertTrue(g.exhausted_reply)                                   # 默认回固定话，不切备用
         self.assertIs(dsh_brain.brain_api_for(" 肥肉测试1🐶 ", True), g)   # 同会话缓存
         self.assertIsNone(dsh_brain.brain_api_for("别的群", True))
         self.assertIsInstance(dsh_brain.brain_api_for("随便谁", False), BrainAPI)

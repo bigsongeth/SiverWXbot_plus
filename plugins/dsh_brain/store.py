@@ -24,6 +24,12 @@ DEFAULT_CONFIG = {
     "enabled_chats": [],
     "excluded_groups": [],
     "excluded_chats": [],
+    # 大脑一轮失败（超时/出错/网关不可达）后再起几轮。2026-09-07 用户拍板：别切备用接口，失败就起新的一轮。
+    # 每轮最长 timeout_sec，主循环是串行的，这段时间所有会话都在等，所以别设太大。
+    "max_attempts": 2,
+    "retry_delay_sec": 3,
+    # 重试也耗尽时回这句（原样发出去）。留空 = 退回老行为：交给 model_fallback 切备用接口。
+    "exhausted_reply": "🐶 脑子刚才卡住了，这条没处理成，过会儿再 @ 我一次",
 }
 
 _cache = None
@@ -61,6 +67,8 @@ def save(cfg: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(tmp, CONFIG_PATH)
+        for k, v in DEFAULT_CONFIG.items():   # 与 load() 同样补默认值，别让 save 之后的缓存缺键
+            cfg.setdefault(k, copy.deepcopy(v))
         _cache = cfg
         try:
             _cache_mtime = os.path.getmtime(CONFIG_PATH)

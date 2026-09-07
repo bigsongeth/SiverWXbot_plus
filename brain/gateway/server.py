@@ -122,6 +122,10 @@ class Gateway:
         text = str(payload.get("text", ""))
         if not conv:
             return {"error": "conversation 必填"}
+        try:
+            attempt = max(1, int(payload.get("attempt") or 1))
+        except (TypeError, ValueError):
+            attempt = 1
         if not text.strip() or text.strip() in ("[动画表情]", "[图片]", "[视频]", "[文件]", "[链接]"):
             # 空输入不进大脑：09-05 hzfood 日志里一条空消息让 dsh 把网关源码写成了"开发汇报"
             return {"no_reply": True, "reason": "empty"}
@@ -144,8 +148,14 @@ class Gateway:
                 label = context.DELTA_LABEL
             skills = context.match_skills(self.skill_index, conv, is_group)
             self.inflight = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
-            msg = _stamp_turn_id(context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
-                                                            skills, prime, prime_label=label), self.inflight.turn_id)
+            body = context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
+                                              skills, prime, prime_label=label)
+            if attempt > 1:
+                # 机器人侧 dsh_brain 失败后再起的一轮（2026-09-07）：上一轮多半是工具报错/超时耗光了时间，
+                # 这轮要它收着点，别把同一套工具再跑一遍。
+                body += (f"\n[系统提示：这条消息上一轮处理超时或出错，这是第 {attempt} 次尝试。"
+                         "少调工具：同一个工具报错 2 次就停，用已有信息直接回复，回不了就说清楚哪步卡住]")
+            msg = _stamp_turn_id(body, self.inflight.turn_id)
             session_id = self._session_id(conv)
             turn = self.dsh.prompt(session_id, msg, self.cfg["turn_timeout_sec"])
             reasoning = turn.reasoning
@@ -182,7 +192,7 @@ class Gateway:
                        "sender": sender, "text": text, "budget": self.inflight.budget, "skills": skills,
                        "turn_id": self.inflight.turn_id, "session_id": session_id,
                        "primed": first_time and prime is not None, "history_new": 0 if first_time else len(prime or []),
-                       "result": result, "attempts": self.inflight.attempts,
+                       "result": result, "attempts": self.inflight.attempts, "attempt": attempt,
                        "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
                        "ms": int((time.time() - t0) * 1000)}

@@ -38,9 +38,13 @@ def brain_api_for(who, is_group: bool):
     if not brain_enabled(who, is_group):
         return None
     cfg = store.load()
-    key = (bool(is_group), _norm(who), cfg.get("gateway_url"), cfg.get("timeout_sec"))
+    key = (bool(is_group), _norm(who), cfg.get("gateway_url"), cfg.get("timeout_sec"),
+           cfg.get("max_attempts"), cfg.get("retry_delay_sec"), cfg.get("exhausted_reply"))
     api = _api_cache.get(key)
     if api is None:
-        api = BrainAPI(_norm(who), bool(is_group), str(cfg.get("gateway_url") or ""), float(cfg.get("timeout_sec") or 300))
+        api = BrainAPI(_norm(who), bool(is_group), str(cfg.get("gateway_url") or ""), float(cfg.get("timeout_sec") or 300),
+                       max_attempts=int(cfg.get("max_attempts") or 1),
+                       retry_delay_sec=float(cfg.get("retry_delay_sec") or 0),
+                       exhausted_reply=str(cfg.get("exhausted_reply") or ""))
         _api_cache[key] = api
     return api
