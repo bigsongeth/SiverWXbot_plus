@@ -1119,6 +1119,7 @@ credential helper；一旦写过就当它已泄露，去 GitHub 吊销重发。
 - 注释和 UI 文字保持中文，遵循 dashboard 现代简约风格。
 - 改 `config/config.json` 结构时，确保前端能处理默认值缺失，别让页面渲染崩。
 - 新功能优先做成插件 / 最小 hook，别往 `wxbot_core.py` 里塞大逻辑。
+- 改底层微信操作前先翻 `docs/wxauto-api-reference.md`：本框架本身就是套在 wxautox4 上的，很多能力（引用回复、@、sender_info、消息级 forward/download、朋友圈等）原生就有，优先直接调库，别在框架里重造。文档和本机装的版本有 30 多处不一致，以那份文件的 ⚠️ 标注为准。
 - 改完先本地 `py_compile` + 单测，再提交。
 - 涉及重启才生效的改动，先跟用户说。
 
@@ -1195,4 +1196,5 @@ cd /Volumes/SiverWXbot_plus-main && python3 -m py_compile wxbot_core.py web_serv
 | 日志 | `panel_logs/`、`wxauto_logs/` |
 | 肥肉大脑 | `brain/`（网关 :8500，运行数据 `~/feirou-brain-data`，见 `brain/README.md`）+ 机器人侧 `plugins/dsh_brain/`（3.21） |
 | 测试 | `tests/`（mac 上直接跑文件，见 5.5） |
+| wxauto / wxautox4 API 参考 | `docs/wxauto-api-reference.md`（官方文档 5 个 class 页 + 本机 41.1.1.post1 inspect 交叉核对，⚠️ 差异清单在第 11 节；**改任何碰微信 UI 的底层代码前先查它**，很多事能直接用 wxauto 原生方法做，不必绕本框架） |
 | 行尾 / 忽略规则 | `.gitattributes`、`.gitignore`（见第 5 节） |
