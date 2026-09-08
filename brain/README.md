@@ -125,6 +125,81 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 - 形状闸门三项（超预算/重复开头/收尾套话）两轮几乎全 0，老链路那侧几乎每条都超预算、带"需要我…吗"。
 - 模型选择是用户的决定（拍板的是 `songkey-auto`），这里只记数据；配置默认值没改。
 
+## 搜索通道与三级兜底（2026-09-09 重做）
+
+大脑的联网能力全靠 `mcp/grok_search/`（两个工具：`web_search`→`grok-chat-fast` 管国外、
+`cn_search`→`dots-chat` 管国内）。**`grok-chat-fast` 这条通道很不稳，实测失败率 27%**
+（我自己连打 26 次挂 7 次），所以现在是 **grok 打 2 次 → 还不行换 Exa** 的三级兜底。
+
+### 病根在上游，我们只控第一跳
+
+链路是 **我们 → songkey(key.bigsong.site) → DGB 公益站 freeapi.dgbmc.top(也是 new-api) → grok.com 逆向服务**。
+`grok-chat-fast` 在 songkey 上**只有渠道 20 一家，零冗余**，`RetryTimes=5` 无处可切。
+上游会间歇性 stall 250–300 秒，而 new-api 那一层**不设超时、一路等**，实测单笔请求能跑到 4 分 52 秒
+（nginx `proxy_read_timeout 300s` 是那个 300 的来源）。近 14 天用户侧失败率 14.6%（36 次挂死）。
+
+失败有三种形态，**第二种最阴**：
+1. 非流式撞 300s 读超时 → 504；
+2. 流式逃过读超时 → **HTTP 200 + 一个内容帧都没有的空 SSE，`stream_status:ok`、还照常扣费**，
+   new-api 记成成功（`type=2`），按状态码统计永远看不见它；
+3. 上游直接断连（SSL EOF）。
+
+★ **所以判成败只能看"收到的内容字符数 > 0"，别信 HTTP 状态码。** `server.js` 里
+`if (!content) throw` 那句是刻意的，别当成多余的防御删掉。
+
+### ⚠️ 不要改成流式（试过，是死路）
+
+一度以为"挂死只发生在非流式"，复跑推翻了：流式 8 次也挂 2 次（25%），首字节 42–55 秒也不快。
+上一轮那个结论是**量具坏了** —— 流式挂死被记成成功，且 14 天里流式样本只有 25 次（0/25 推不出任何东西）。
+改流式唯一的收益是首字节提前约 2 倍，而我们是 MCP 一次性取全文再交给大脑，**首字节提前对大脑零价值**，
+换来的却是"失败从显性 504 变成隐性 200 空回复"。不划算。
+
+### 三个必须一起算的超时（改任何一个都要重算另外两个）
+
+| 位置 | 值 | 说明 |
+|---|---|---|
+| `mcp/grok_search/server.js` `SONGKEY_TIMEOUT_MS` | 60s | 单次 grok/dots 调用。实测正常返回 12–55 秒 |
+| 同上 `SONGKEY_ATTEMPTS` | 2 | 打两次才换 Exa。上游是间歇性 stall，成功与挂死交替出现，重打一次命中率不低 |
+| `mcp/grok_search/exa.js` `EXA_TIMEOUT_MS` | 20s | 实测 `/answer` p90 3.8 秒，20 秒纯属天花板 |
+| **`gateway/profile.py` `toolCallTimeoutMs`** | **165s** | ★★ dsh 对一次 MCP 工具调用的上限，**必须 > 60×2+20** |
+| `<data>/config.json` `turn_timeout_sec` | 240s | 网关一轮的上限 |
+| `plugins/dsh_brain` `timeout_sec` | 420s | 机器人侧，必须 > 网关的 240 |
+
+★★ **`toolCallTimeoutMs` 原来是 120000，比 MCP 内部预算还短**，于是 dsh 会在兜底跑完之前
+就把工具调用掐掉、报 `MCP error -32001: Request timed out`，**Exa 永远轮不上**。
+上线当天端到端跑出来才发现（日志里那次是精确的 `+120.0s`）。
+**看到 -32001 就是撞了这个数，不是 songkey 的错。**
+
+### Exa 兜底：只在事实型问题上顶得住
+
+`exa.js` 自带 key 轮换，读 `~/.dsh/exa-keys.json`（102 把，与 mac 那份 exa-pool 共用同一份清单）。
+
+- **端点**：不带网址走 `/answer`（p50 2.3s、$0.005，实测 26/26 成功）；query 里检出网址走
+  `/contents` + `livecrawl:'always'`（`/answer` 读不了指定网页，实测只会翻出几周前的旧快照）。
+- ⚠️ **X（推特）顶不上，硬顶不上**：Exa 索引里没有 x.com（`category:"tweet"` 被官方下架报 400、
+  `includeDomains:["x.com"]` 返回 0 条、直接读推文 URL 是 403）。它给的是**媒体转述的 X**，
+  实测还会拿账号主页链接去挂靠引语，看着像一手其实无法核实。所以走 Exa 时文本开头会插一句
+  **降级提示**告诉大脑"别当成一手社群舆论"——**那句话别删**。
+- ★ **key 池 102 把里 74 把是废的**（64 个 402 等下月 1 号回血、10 个被拒）。所以 `exa.js` 必须
+  排掉已知坏 key 再试：不排的话随机抽几把有 16% 概率全是坏的，兜底直接失效（首次自测连踩两次）。
+  先验来自只读 `~/.dsh/exa-pool-state.json`（dsh 插件探的，我们不写它），自己踩到的记进
+  `~/.dsh/exa-fallback-park.json`。可用数掉到个位数时要补 key。
+- ★★ **`exa.js` 里取家目录必须用 `os.userInfo().homedir`，不能用 `os.homedir()`**：后者读 `$HOME`，
+  而 `run.py` 把 dsh 的 HOME 指到了 `~/feirou-brain-data`，用 `os.homedir()` 会去
+  `~/feirou-brain-data/.dsh/` 找 key，**永远找不到、兜底 100% 静默失效**。同样上线当天才发现。
+- 量级：按 27 把可用 key 算约 1,800 次/天，兜底每天触发 100 次也只花 $0.5。
+
+### 超时之后不再杀会话（`restart_after_timeouts: 3`）
+
+原先这个值等效为 1，一轮超时就杀掉整个 dsh 进程重建，下一轮换新 session、重新灌历史（日志里 `primed:true`），
+白花几十秒冷启动。`verify/same_session_overlap.py` 实测：**超时那轮的残留不会污染发出去的回复**
+（回复取自 `inf.result`，也就是 wx_reply 回调；迟到的那次带着自己的 turn_id，走 `STALE_TURN` 被拒），
+所以调大到 3 是安全的。
+
+代价记清楚：**超时之后那一轮的日志字段 `draft` 和 `dsh_tools` 会混入上一轮的残留**
+（`dsh_client.prompt` 开头只清"此刻队列里有的"事件，上一轮正在路上的 `turn/end` 会被下一轮吸收）。
+排障时别把这两个字段当本轮事实。要根治得给 `prompt` 按 turn 过滤事件。
+
 ## 已知限制（期 1）
 
 - 全局串行：同一时刻只处理一条消息，一条慢（最长 120 秒超时 + nudge）会拖住后面的。
@@ -135,9 +210,11 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
   dsh 会扫 `~/.agents/skills`，宿主上几十个与肥肉无关的技能曾出现在它的目录里；现在 `run.py` 把 dsh 的 `HOME`
   指到数据目录、`$DSH_HOME/skills` 软链到工作区 `skills/`（dsh 不扫工作区里的 `skills/`），实测目录里只剩
   hz-food-map / ncc-community。硬约束 ②（只看自己的工作区）真正兜底仍要等容器化。
-- **sdk 运行时只有 initialize / session/prompt / shutdown 三个方法，没有取消轮次的手段**（09-05 实测
-  `session/cancel` / `session/control` 都回 unknown method）。所以一轮超时只能重建整个进程：冷启动 + 重预热，
-  且后台那一轮还在烧模型。超时阈值必须放在模型真实延迟之上，否则会连锁（回放第一轮一条私聊 15 轮打掉 11 轮）。
+- **sdk 运行时只有 initialize / session/prompt / shutdown 三个方法，没有取消轮次的手段**（09-05 实测、
+  09-08 复核，`session/cancel` / `session/control` 都回 unknown method）。所以判超时那一刻，那一轮还在后台
+  烧模型，我们叫不停它。超时阈值必须放在模型真实延迟之上，否则会连锁（回放第一轮一条私聊 15 轮打掉 11 轮）。
+  ~~一轮超时只能重建整个进程~~ —— 2026-09-09 起改成连续 3 轮超时才重建，个别轮次超时不再杀会话、
+  不再冷启动重预热，依据见上面「超时之后不再杀会话」。
 - `songkey-auto` 当前（09-05）落到 `grok-4.6`：一句「你好」也先烧 700 多个推理 token、24 秒起步，且不回传推理内容
   （日志里 reasoning 为空是它的行为，不是收集漏了）。`deepseek-v4-flash` 同题 6 秒并回传推理。模型由用户定，
   这里只记事实；回放第二轮做了两者的 A/B。

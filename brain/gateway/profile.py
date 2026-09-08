@@ -22,7 +22,11 @@ _GROK_BLOCK = """    - id: mcp-grok
           - __SERVER_JS__
         env:
           SONGKEY_API_KEY: __KEY__
-        toolCallTimeoutMs: 120000
+        # 165 秒：要装得下 grok_search 内部的三段兜底（60s + 60s + Exa 20s）再留点余量。
+        # ★ 原来是 120000，比内部预算还短，于是 dsh 会在兜底跑完之前就把工具调用掐掉，
+        # 报 `MCP error -32001: Request timed out` —— 表现是 Exa 永远轮不上（2026-09-09 实测）。
+        # 改这个数之前先算一遍：它必须 > grok 单次超时 × SONGKEY_ATTEMPTS + Exa 超时。
+        toolCallTimeoutMs: 165000
         failOnStartupError: false
 """
 

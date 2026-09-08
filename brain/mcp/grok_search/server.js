@@ -20,11 +20,21 @@
  * 零依赖：手写 JSON-RPC over stdio，不装任何 npm 包。
  */
 
+// 兜底搜索。只 require 模块、不读 key 文件（exa.js 里是懒加载），所以 key 清单不在位时
+// 这个 MCP 照样起得来，只有真需要兜底那一刻才报错。
+const exa = require('./exa.js');
+
 const BASE_URL = process.env.SONGKEY_BASE_URL || 'https://key.bigsong.site/v1';
 const API_KEY = process.env.SONGKEY_API_KEY || '';
 const MODEL = process.env.SONGKEY_SEARCH_MODEL || 'grok-chat-fast';
 const CN_MODEL = process.env.SONGKEY_CN_SEARCH_MODEL || 'dots-chat';
-const TIMEOUT_MS = Number(process.env.SONGKEY_TIMEOUT_MS || 120000);
+// 60 秒：实测正常返回落在 12–55 秒（非流式 p50 约 29s），60 秒之后基本就是上游 stall 了。
+// 从 120 秒下调是因为大脑一轮总预算有限，一次卡死吃掉 120 秒的话这一轮必死（2026-09-08）。
+const TIMEOUT_MS = Number(process.env.SONGKEY_TIMEOUT_MS || 60000);
+// songkey 通道失败后再打一次（同一模型），两次都失败才换 Exa。上游是间歇性 stall，
+// 实测成功与挂死交替出现，重打一次的命中率不低。
+const SONGKEY_ATTEMPTS = Number(process.env.SONGKEY_ATTEMPTS || 2);
+const EXA_FALLBACK = process.env.EXA_FALLBACK !== '0';
 
 const PROTOCOL_VERSION = '2024-11-05';
 
@@ -130,7 +140,7 @@ function fail(id, code, message) {
   send({ jsonrpc: '2.0', id, error: { code, message } });
 }
 
-async function search(query, model, systemPrompt) {
+async function callSongkey(query, model, systemPrompt) {
   if (!API_KEY) {
     throw new Error('缺少 API key：请设置环境变量 SONGKEY_API_KEY');
   }
@@ -183,6 +193,45 @@ async function search(query, model, systemPrompt) {
   }
 }
 
+/**
+ * 三级兜底：songkey 打两次 → 还不行换 Exa。
+ *
+ * 起因（2026-09-08 排查，证据在 CLAUDE.md 3.22）：`grok-chat-fast` 在 songkey 上只有一个
+ * 渠道，上游间歇性 stall，实测 27% 的失败率。以前一次失败就把错误原样交给大脑，大脑只能
+ * 自己再搜一次——那要多烧一整轮模型推理，而轮次预算是有限的，通常直接把这一轮拖死。
+ *
+ * 返回 { text, source }：source 是 'songkey' 或 'exa'。走了 Exa 一定要在文本里说清楚，
+ * 否则大脑会把网页索引的结果当成 X（推特）上的一手舆论——那正是 grok 的独家价值所在，
+ * Exa 顶不上。让它知道降级了，它才会在回答里把话说软。
+ */
+async function searchWithFallback(query, route, toolName) {
+  const errs = [];
+  for (let i = 0; i < Math.max(1, SONGKEY_ATTEMPTS); i++) {
+    try {
+      return { text: await callSongkey(query, route.model, route.system), source: 'songkey' };
+    } catch (err) {
+      errs.push(`第 ${i + 1} 次(${route.model}): ${err.message}`);
+    }
+  }
+  if (!EXA_FALLBACK) {
+    throw new Error(errs.join('；'));
+  }
+  let exaText;
+  try {
+    exaText = await exa.answer(query);
+  } catch (err) {
+    throw new Error(`${errs.join('；')}；Exa 兜底也失败: ${err.message}`);
+  }
+  const missing = toolName === 'web_search'
+    ? '本次结果来自网页索引，X（推特）上的讨论很可能没覆盖到'
+    : '本次结果来自网页索引，小红书站内笔记没覆盖到';
+  return {
+    text: `【降级提示】${route.model} 连续 ${SONGKEY_ATTEMPTS} 次失败，改用备用搜索 Exa。`
+      + `${missing}，回答时请说明信息来源有限、别把它当成一手社群舆论。\n\n${exaText}`,
+    source: 'exa',
+  };
+}
+
 async function handle(msg) {
   const { id, method, params } = msg;
 
@@ -214,7 +263,7 @@ async function handle(msg) {
         });
       }
       try {
-        const text = await search(query, route.model, route.system);
+        const { text } = await searchWithFallback(query, route, name);
         return ok(id, { content: [{ type: 'text', text }] });
       } catch (err) {
         // 失败必须显式报错，不能静默返回空——否则主 agent 会拿幻觉当结果

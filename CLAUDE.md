@@ -87,7 +87,7 @@ netstat -ano | findstr LISTEN | findstr :100
 | `gh_trending_note` | 每日 GitHub 趋势笔记（跟在日报后面） | 定时任务注册处 ×1（紧邻 ai_news_note） | 插件内 `selftest.py` / `test_follow.py` |
 | `ui_watchdog` | 卡死/日志异常 → 整进程重启 | 主循环 `heartbeat()` / `disarm()`、`web_server` 消费标记 ×3 | `test_ui_watchdog.py` |
 | `listen_health` | 监听窗口丢失探针 + 自愈 | `MainWindowChat` 等 ×5（见 3.18） | `test_listen_health.py` / `test_main_window_chat.py` |
-| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/） | `_resolve_group_api` / `_resolve_chat_api` ×2（见 3.21） | `test_dsh_brain.py` |
+| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/）+ 并发回复 | `_resolve_group_api` / `_resolve_chat_api` ×2、`process_message` 开头 ×1（见 3.21） | `test_dsh_brain.py` / `_dispatch` |
 
 另有不成插件的核心内改动：3.1 面板监听地址、3.10 时间戳清洗与接话闸门（`test_reply_gate.py`）、
 3.12 绕开系统代理的 `HTTP` 会话、3.14 `SEARCH_CHAT_TIMEOUT`。
@@ -954,8 +954,55 @@ Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直�
   起因：09-07 22:42 高德握手超时，大脑换词重试 6 次撞 180s 轮次超时 → 切 DeepSeek 老肥肉答非所问。
   排障先看 mac-mini `~/feirou-brain-data/log/replies-YYYYMMDD.jsonl`（每行有 `attempt` / `dsh_tools` / `reasoning`）
   和 `launchctl print gui/501/com.bigsong.feirou-brain`；工具报错再去 hkbohai `journalctl -u hzfood.service`。
+- ★ **回复慢/超时，先怀疑搜索工具，不是模型（2026-09-09）**：`grok-chat-fast` 那条通道实测 27% 会挂死
+  （上游 DGB 公益站单渠道零冗余、间歇 stall 250–300 秒）。现在 `brain/mcp/grok_search/` 是「grok 打 2 次
+  → 换 Exa」的三级兜底，整套超时怎么算、为什么不能改流式、Exa 在 X 舆论上顶不上、
+  以及两个上线当天才发现的坑（`toolCallTimeoutMs` 比内部预算还短导致 Exa 永远轮不上；
+  `os.homedir()` 撞上 `run.py` 改过的 HOME 导致找不到 key）——**全在 `brain/README.md`
+  「搜索通道与三级兜底」那一节，改任何一个超时前先读它**。
+  另：超时之后那一轮的 `draft` / `dsh_tools` 两个日志字段会混入上一轮的残留，排障别当本轮事实。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
 - 单测：`PYTHONPATH=. python3 tests/test_dsh_brain.py`（本地假网关，不连微信不连大脑）。
+
+#### ★ 并发回复（2026-09-08 加，`plugins/dsh_brain/dispatch.py` + 网关多槽）
+
+**病根**：监听线程只有一个（`LISTENER_EXCUTOR_WORKERS=1`），`process_message` 里
+`api.chat()` 是阻塞的 —— 问大脑一轮中位 57 秒、p90 177 秒，这段时间**别的群一条消息都读不到**。
+活标本：09-06 13:16:43 收到消息 → DusAPI 504 重试链 → 13:21:58 才回复，中间 5 分钟机器人全聋
+（日志里那 5 分钟一条消息都没有，不是没人说话）。
+
+**先验了 dsh 能不能同时跑多个 session**（`brain/verify/concurrent_sessions.py`，用生产 patch/workspace，
+`FEIROU_GW` 指向脚本自起的 stub）：**能**。决定性证据是工具调用时间线——并发组
+`B开工→A开工→B收尾→A收尾` 交错，串行组不交错；零串台，`wx_reply` 的 turn_id 零漏带。
+★ 复跑时**别把 `FEIROU_GW` 指向生产网关**：`tool_call` 对不带 turn_id 的 `wx_reply` 是放行的，
+生产此刻若正在处理真消息，测试的话会被当成回复发进真实微信群。
+
+**两侧改造**（设计与已知残留全在 `docs/superpowers/specs/2026-09-08-concurrency-design.md`）：
+- 网关：`inflight` 单槽 → 按 turn_id 多槽；全局锁 → 信号量 + per-conversation 锁
+  （同一会话仍串行保序）；超时不再立刻杀 dsh 进程（并发下会误杀别人在飞的轮次）。
+- 机器人：`dispatch.py` 每会话一队列 + 至多一个 worker，全局 `max_workers` 封顶。
+  ★★ **worker 里回调的是 `process_message` 本身**（线程标记防二次派发），
+  所以关键词回复/图片/历史/分条/接话闸门/故障转移一行没重写 ——
+  **别改成在 dispatch 里重新实现一遍发送逻辑**，那些分支是一堆线上事故换来的。
+
+**用户 2026-09-08 拍板「并发回复」，不做「群内串行、跨群并发」** —— 群里多人同时 @ 就是并发处理、
+谁先好谁先发。别在后续会话里重新提议那个更保守的方案。
+
+**开关**（都在 `plugins/dsh_brain/data/config.json` 与网关 `config.json`）：
+`async_reply` 默认 **False**（合进 main 不改任何行为）；`max_workers` 应与网关 `max_concurrent`(3) 一致；
+出事回滚 = `async_reply: false` + 网关 `max_concurrent: 1`。
+- ⚠️ **微信发送侧永远不会真并行**：`wxautox4/utils/lock.py` 的 `ui_transaction` 是进程内 RLock +
+  会话级命名互斥体，`SendMsg`/`quote`/`ChatInfo`/`SendFiles` 都被它包着（`__wrapped__` 实测为 True）。
+  并发发送是安全的、会排队，收益全在「等大脑那 8–115 秒可以重叠」。
+  **它默认 30 秒拿不到锁就抛 TimeoutError** —— ncc 群发长时间占 UI 时会开始抛。
+- ⚠️ **跨会话发送不需要切群**：`AddListenChat` 给每个会话开的是独立子窗口，`chat.SendMsg()` 直接打进去
+  （`who`/`exact` 在子窗口上无效），不碰主窗口、不用 `ChatWith`。
+- **引用（`msg.quote`）保留**：它有保质期（09-06 那次隔了 5 分 15 秒就报「消息对象已失效」），
+  但失效自动降级成 `SendMsg(at=)`，消息不丢；而且**并发缩短排队、引用风险是下降的**。
+- ★ **没测的**：多 session 同时写 `workspace/memory/` 的竞争（`memory_guard` 加了锁，
+  但 dsh 自己的 write/edit 工具没有互斥）；并发只验过 2 路，生产默认给的是 3。
+- 单测：`PYTHONPATH=. python3 tests/test_dsh_brain_dispatch.py`（12 个）、
+  `tests/test_brain_server.py`（30 个，含 7 个并发专项，用 Event 精确控时序、不靠 sleep）。
 
 ### 3.20 GitHub 趋势笔记插件 `plugins/gh_trending_note/`（未在本文档记录过，2026-08-15 补）
 
