@@ -50,10 +50,12 @@ class Inflight:
     conversation: str
     is_group: bool
     budget: int
+    budget_why: dict = field(default_factory=dict)   # 预算判成了哪个格子，进日志用来回看判得准不准
     turn_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     attempts: int = 0
     result: Optional[dict] = None          # {"bubbles": [...]} 或 {"no_reply": True, "reason": ...}
     tool_log: List[dict] = field(default_factory=list)
+    rejects: List[str] = field(default_factory=list)   # 每次退回的原因；没有它就分不清重跑是超预算还是撞重复
 
 
 class Gateway:
@@ -201,7 +203,10 @@ class Gateway:
                                            count=self.cfg["history_delta_max"]) or None
                 label = context.DELTA_LABEL
             skills = context.match_skills(self.skill_index, conv, is_group)
-            inf = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
+            # 预算按「办事/闲聊 × 想不想深入」两维算，两维都从对方的消息里取（raw_hist 在上面已就绪），
+            # 模型不参与判定 —— 模型自评长度会系统性漂向长档。见 shape.budget_detail 与本次设计文档。
+            _budget, _why = shape.budget_detail(text, is_group, self.cfg, raw_hist, sender)
+            inf = Inflight(conv, is_group, _budget, _why)
             with self._inflight_guard:
                 self.inflight[inf.turn_id] = inf
             body = context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
@@ -248,10 +253,10 @@ class Gateway:
             dsh_tools = [str(((ev.get("data") or {}).get("name")) or ((ev.get("data") or {}).get("tool")) or "?")
                          for ev in turn.events if ev.get("type") == "tool/call"]   # 含 MCP 工具（hzfood/grok），排障用
             log_rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
-                       "sender": sender, "text": text, "budget": inf.budget, "skills": skills,
+                       "sender": sender, "text": text, "budget": inf.budget, "budget_why": inf.budget_why, "skills": skills,
                        "turn_id": inf.turn_id, "session_id": session_id,
                        "primed": first_time and prime is not None, "history_new": 0 if first_time else len(prime or []),
-                       "result": result, "attempts": inf.attempts, "attempt": attempt,
+                       "result": result, "attempts": inf.attempts, "rejects": inf.rejects, "attempt": attempt,
                        "tools": inf.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
                        "ms": int((time.time() - t0) * 1000)}
@@ -325,6 +330,7 @@ class Gateway:
             accepted, err = validate_reply(args.get("bubbles") or [], inf.is_group, inf.budget,
                                            self.recent.recent_for(inf.conversation), inf.attempts, self.cfg)
             if err:
+                inf.rejects.append(err[:120])
                 return {"ok": False, "text": err}
             inf.result = {"bubbles": accepted}
             return {"ok": True, "text": f"已发送 {len(accepted)} 条。本轮到此为止，不要再调用 wx_reply。"}
