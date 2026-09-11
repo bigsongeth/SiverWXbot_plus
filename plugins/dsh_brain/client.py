@@ -66,9 +66,18 @@ class BrainAPI:
         self.max_attempts = max(1, int(max_attempts or 1))
         self.retry_delay_sec = max(0.0, float(retry_delay_sec or 0))
         self.exhausted_reply = str(exhausted_reply or "").strip()
-        # model_fallback 按 (base_url, model, key 前 8 位) 去重，给它能认的属性
+        # model_fallback 按 (base_url, DS_NOW_MOD, key 前 8 位) 认接口身份（chain.api_identity），
+        # 给它能认的属性。
+        # ★★ DS_NOW_MOD 必须带上会话名，别改回固定串（2026-09-09 查出的生产事故）：
+        # 这三个属性原来对所有会话都是同一个值，于是 model_fallback.wrap() 的 _wrap_cache
+        # （key = (id(bot), api_identity(api))）把**所有会话的 BrainAPI 当成同一个接口**，
+        # 命中缓存后只更新 _session_name（那只是日志字段），真正被调用的还是第一个会话的实例。
+        # 后果：机器人每次重启后，第一个用大脑的会话会「劫持」之后所有会话 —— 群消息被当私聊、
+        # 挂到别人的 conversation 上，记忆/人设/技能匹配/气泡上限全用错。
+        # 实证（网关 replies 日志）：09-08 晚上所有群消息都记成私聊「青猫_🐕」；
+        # 09-07 14:22 机器人重启后又全部锁定到「📈🐶」。从 dsh_brain 上线（09-06）就存在。
         self.base_url = self.gateway_url
-        self.DS_NOW_MOD = "feirou-brain"
+        self.DS_NOW_MOD = "feirou-brain:%s:%s" % ("群" if is_group else "私", self.conversation)
         self.api_key = ""
 
     def chat(self, message, model=None, stream=False, prompt=None, history=None,

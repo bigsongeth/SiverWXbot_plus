@@ -182,5 +182,66 @@ class RoutingTest(unittest.TestCase):
         self.assertIsNone(dsh_brain.brain_api_for("A", True))
 
 
+
+class BrainApiIdentityTest(unittest.TestCase):
+    """★ 回归：不同会话的 BrainAPI 必须是不同的「接口身份」。
+
+    2026-09-09 生产事故：BrainAPI 的 base_url / DS_NOW_MOD / api_key 对所有会话都一样，
+    而 model_fallback.wrap() 按 (id(bot), api_identity(api)) 缓存 FallbackAPI —— 命中缓存时
+    只更新 _session_name（日志字段），真正被调用的还是**第一个会话**的 BrainAPI 实例。
+    于是机器人每次重启后，第一个用大脑的会话会劫持之后所有会话：群消息被当私聊、挂到别人的
+    conversation 上，记忆/人设/技能匹配/气泡上限全用错。网关日志实证：09-08 晚上所有群消息
+    都记成私聊「青猫_🐕」，09-07 14:22 重启后又全锁定到「📈🐶」。
+    """
+
+    def _api(self, conv, is_group):
+        return BrainAPI(conv, is_group, "http://127.0.0.1:8500")
+
+    def test_identity_differs_per_conversation(self):
+        from plugins.model_fallback.chain import api_identity
+        a = api_identity(self._api("群A", True))
+        b = api_identity(self._api("群B", True))
+        c = api_identity(self._api("松爸", False))
+        self.assertNotEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertNotEqual(b, c)
+
+    def test_identity_same_for_same_conversation(self):
+        """同一会话仍要认成同一个接口，否则 model_fallback 的链上去重会失效。"""
+        from plugins.model_fallback.chain import api_identity
+        self.assertEqual(api_identity(self._api("群A", True)), api_identity(self._api("群A", True)))
+
+    def test_group_and_private_with_same_name_differ(self):
+        """同名的群和私聊也必须分开（微信里群名和好友昵称可以一样）。"""
+        from plugins.model_fallback.chain import api_identity
+        self.assertNotEqual(api_identity(self._api("肥肉", True)), api_identity(self._api("肥肉", False)))
+
+    def test_wrap_does_not_reuse_across_conversations(self):
+        """★ 端到端：连续 wrap 两个会话，第二个拿到的必须包着自己的 BrainAPI。"""
+        import plugins.model_fallback as mf
+
+        class FakeCfg:
+            config = {"fallback_switch": True, "fallback_chain": [1],
+                      "api_configs": [{}, {"api_sdk": "x", "base_url": "u", "model": "m", "api_key": "k"}]}
+
+        class FakeBot:
+            def __init__(self):
+                self.config = FakeCfg()
+
+            def _init_api_by_index(self, idx):
+                return object()
+
+        mf.reset_cache() if hasattr(mf, "reset_cache") else mf._wrap_cache.clear()
+        bot = FakeBot()
+        g = self._api("肥肉测试1🐶", True)
+        p = self._api("松爸", False)
+        wrapped_g = mf.wrap(bot, g, "肥肉测试1🐶")
+        wrapped_p = mf.wrap(bot, p, "松爸")
+        self.assertIs(getattr(wrapped_g, "_primary", wrapped_g), g)
+        self.assertIs(getattr(wrapped_p, "_primary", wrapped_p), p,
+                      "私聊拿到的还是群的 BrainAPI —— 会话劫持又回来了")
+        mf._wrap_cache.clear()
+
+
 if __name__ == "__main__":
     unittest.main()
