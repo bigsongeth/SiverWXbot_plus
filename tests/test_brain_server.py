@@ -46,6 +46,13 @@ class FakeDsh:
         return TurnResult(reasoning="想了一下", text="草稿：不会被发出去", events=[{"type": "turn/end"}])
 
 
+def only(gw):
+    """取唯一在飞的那一轮。inflight 2026-09-08 起是 {turn_id: Inflight}（并发改造）。"""
+    vals = list(gw.inflight.values())
+    assert len(vals) == 1, "期望恰好一轮在飞，实际 %d" % len(vals)
+    return vals[0]
+
+
 class GatewayTest(unittest.TestCase):
     def setUp(self):
         self.data = tempfile.mkdtemp()
@@ -165,13 +172,13 @@ class GatewayTest(unittest.TestCase):
         ids = []
 
         def first(gw):
-            ids.append(gw.inflight.turn_id)
-            gw.tool_call("wx_reply", {"bubbles": ["第一轮"], "turn_id": gw.inflight.turn_id})
+            ids.append(only(gw).turn_id)
+            gw.tool_call("wx_reply", {"bubbles": ["第一轮"], "turn_id": only(gw).turn_id})
 
         def second(gw):
             r = gw.tool_call("wx_reply", {"bubbles": ["串话"], "turn_id": ids[0]})
             assert r["ok"] is False, r
-            r2 = gw.tool_call("wx_reply", {"bubbles": ["正确"], "turn_id": gw.inflight.turn_id})
+            r2 = gw.tool_call("wx_reply", {"bubbles": ["正确"], "turn_id": only(gw).turn_id})
             assert r2["ok"], r2
         self.fake.script = [first, second]
         self.gw.handle_reply({"conversation": "A", "is_group": False, "sender": "A", "text": "在吗"})
@@ -181,8 +188,8 @@ class GatewayTest(unittest.TestCase):
 
     def test_prefix_line_carries_turn_id(self):
         ids = []
-        self.fake.script = [lambda gw: (ids.append(gw.inflight.turn_id),
-                                        gw.tool_call("wx_reply", {"bubbles": ["在"], "turn_id": gw.inflight.turn_id}))]
+        self.fake.script = [lambda gw: (ids.append(only(gw).turn_id),
+                                        gw.tool_call("wx_reply", {"bubbles": ["在"], "turn_id": only(gw).turn_id}))]
         self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "在吗"})
         first_line = self.fake.prompts[0][1].split("\n")[0]
         self.assertIn("| 轮次:" + ids[0] + "]", first_line)
@@ -191,7 +198,7 @@ class GatewayTest(unittest.TestCase):
     def test_missing_turn_id_accepted_but_logged(self):
         seen = []
         self.fake.script = [lambda gw: (gw.tool_call("wx_reply", {"bubbles": ["无标识"]}),
-                                        seen.extend(gw.inflight.tool_log))]
+                                        seen.extend(only(gw).tool_log))]
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out["bubbles"], ["无标识"])
         self.assertIn({"tool": "wx_reply", "no_turn_id": True}, seen)
@@ -206,14 +213,39 @@ class GatewayTest(unittest.TestCase):
         self.assertIn("同一个工具报错 2 次就停", self.fake.prompts[1][1])
         self.assertEqual(self.gw.read_log(1)[0]["attempt"], 2)
 
-    def test_timeout_restarts_dsh(self):
+    def test_single_timeout_keeps_dsh_alive(self):
+        """并发改造后：一次超时不再杀进程（会误杀别人在飞的轮次），迟到回调靠 turn_id 挡。"""
         self.fake.timeout_next = True
         out = self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(out, {"error": "timeout", "reason": "timeout"})
+        self.assertEqual(self.fake.stopped, 0)
+        self.assertIsNotNone(self.gw.dsh)
+        self.assertEqual(len(self.fake.prompts), 1)  # 超时后不再 nudge
+        self.assertFalse(self.gw.read_log(1)[0]["dsh_restarted_after_timeout"])
+
+    def test_consecutive_timeouts_restart_dsh(self):
+        """连续 restart_after_timeouts(默认3) 轮超时才重建：不是个别轮次的事了。"""
+        self.fake.timeout_next = True
+        for _ in range(2):
+            self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+            self.assertEqual(self.fake.stopped, 0)
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
         self.assertEqual(self.fake.stopped, 1)
         self.assertIsNone(self.gw.dsh)
-        self.assertEqual(len(self.fake.prompts), 1)  # 超时后不再 nudge
         self.assertTrue(self.gw.read_log(1)[0]["dsh_restarted_after_timeout"])
+
+    def test_success_resets_timeout_streak(self):
+        """中间成功一轮，连续超时计数清零 —— 否则零星超时攒够 3 次也会误重建。"""
+        self.fake.timeout_next = True
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.fake.timeout_next = False
+        self.fake.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": ["好"]})]
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(self.gw._timeout_streak, 0)
+        self.fake.timeout_next = True
+        self.gw.handle_reply({"conversation": "K", "is_group": True, "sender": "K", "text": "嗯"})
+        self.assertEqual(self.fake.stopped, 0)   # 重新数，还没到 3
 
     def test_ensure_dsh_stops_old_client(self):
         ref = [None]
@@ -222,7 +254,7 @@ class GatewayTest(unittest.TestCase):
         def factory():
             f = FakeDsh(ref)
             n = len(fakes)   # 两次文案不同，避免撞上同会话的最近回复去重
-            f.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": [f"第{n}个进程在答"], "turn_id": gw.inflight.turn_id})]
+            f.script = [lambda gw: gw.tool_call("wx_reply", {"bubbles": [f"第{n}个进程在答"], "turn_id": only(gw).turn_id})]
             fakes.append(f)
             return f
         gw = Gateway(DEFAULTS, self.data, self.ws, dsh_factory=factory)
@@ -292,6 +324,214 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(len(self.fake.prompts), 2)
         log = self.gw.read_log(1)[0]
         self.assertEqual(log["dsh_error"], "id collision")
+
+
+# ============================================================
+# 并发（2026-09-08 改造）：同一会话串行、不同会话并行
+# 设计见 docs/superpowers/specs/2026-09-08-concurrency-design.md
+# ============================================================
+import re          # noqa: E402
+import threading   # noqa: E402
+import time        # noqa: E402
+
+TURN_RE = re.compile(r"轮次:([0-9a-f]+)\]")
+
+
+class BlockingDsh:
+    """prompt 会卡在那儿等测试放行 —— 用来把两轮「按住」在同时在飞的状态上。
+
+    真实 dsh 一轮要几十秒，单测不能靠 sleep 去撞时序；这里用 Event 精确控制
+    「进入了 prompt」和「允许返回」两个时刻，跑得快而且不会偶发。
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entered = {}          # conv -> Event（该会话进了 prompt）
+        self.release = {}          # conv -> Event（放它返回）
+        self.prompts = []
+        self.reply_in_prompt = True   # 在 prompt 里替模型调 wx_reply
+        self.omit_turn_id = set()     # 这些会话调 wx_reply 时故意不带 turn_id
+        self.timeout_convs = set()    # 这些会话直接超时
+        self.tool_results = {}        # conv -> 该会话那次 wx_reply 的返回（按会话分开，别互相覆盖）
+        self.gw = None
+        self._alive = True
+        self.stopped = 0
+
+    def _ev(self, d, conv):
+        with self.lock:
+            if conv not in d:
+                d[conv] = threading.Event()
+            return d[conv]
+
+    def entered_ev(self, conv):
+        return self._ev(self.entered, conv)
+
+    def release_ev(self, conv):
+        return self._ev(self.release, conv)
+
+    def start(self):
+        self._alive = True
+
+    def initialize(self, cwd, provider, model):
+        return {}
+
+    def alive(self):
+        return self._alive
+
+    def stop(self):
+        self._alive = False
+        with self.lock:
+            self.stopped += 1
+
+    def prompt(self, session_id, text, timeout_sec):
+        conv = session_id.split("#")[0]
+        with self.lock:
+            self.prompts.append((session_id, text))
+        self.entered_ev(conv).set()
+        self.release_ev(conv).wait(timeout=5)
+        if conv in self.timeout_convs:
+            return TurnResult(reasoning="卡住了", timed_out=True)
+        if self.reply_in_prompt:
+            m = TURN_RE.search(text)
+            args = {"bubbles": ["来自" + conv]}
+            if m and conv not in self.omit_turn_id:
+                args["turn_id"] = m.group(1)
+            self.tool_results[conv] = self.gw.tool_call("wx_reply", args)
+        return TurnResult(reasoning="想了一下", events=[{"type": "turn/end"}])
+
+
+class ConcurrentGatewayTest(unittest.TestCase):
+    def setUp(self):
+        self.data = tempfile.mkdtemp()
+        self.ws = os.path.join(self.data, "workspace")
+        os.makedirs(os.path.join(self.ws, "knowledge"))
+        os.makedirs(os.path.join(self.ws, "memory", "people"))
+        with open(os.path.join(self.ws, "knowledge", "shared.md"), "w", encoding="utf-8") as f:
+            f.write("# 共享知识\n")
+        os.makedirs(os.path.join(self.ws, "skills"))
+        with open(os.path.join(self.ws, "skills", "index.json"), "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        self.dsh = BlockingDsh()
+
+    def _gw(self, **over):
+        cfg = dict(DEFAULTS)
+        cfg.update(over)
+        gw = Gateway(cfg, self.data, self.ws, dsh_factory=lambda: self.dsh)
+        self.dsh.gw = gw
+        return gw
+
+    def _fire(self, gw, conv, out, **extra):
+        payload = {"conversation": conv, "is_group": True, "sender": "松爸", "text": "在吗"}
+        payload.update(extra)
+        th = threading.Thread(target=lambda: out.update({conv: gw.handle_reply(payload)}))
+        th.start()
+        return th
+
+    def test_two_conversations_run_concurrently(self):
+        """两个会话能同时在飞 —— 这是整个改造的目的。"""
+        gw = self._gw()
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        t2 = self._fire(gw, "群B", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3), "群A 没进 prompt")
+        self.assertTrue(self.dsh.entered_ev("群B").wait(3), "群B 没进 prompt")
+        self.assertEqual(len(gw.inflight), 2)      # ★ 两轮同时在飞
+        self.dsh.release_ev("群A").set()
+        self.dsh.release_ev("群B").set()
+        t1.join(5); t2.join(5)
+        self.assertEqual(out["群A"]["bubbles"], ["来自群A"])
+        self.assertEqual(out["群B"]["bubbles"], ["来自群B"])   # ★ 没串台
+        self.assertEqual(len(gw.inflight), 0)
+
+    def test_same_conversation_serialized(self):
+        """同一会话仍严格串行：保序，且 primed/seen 状态不打架。"""
+        gw = self._gw()
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3))
+        t2 = threading.Thread(target=lambda: out.setdefault("第二条", gw.handle_reply(
+            {"conversation": "群A", "is_group": True, "sender": "松爸", "text": "再问一句"})))
+        t2.start()
+        time.sleep(0.2)
+        self.assertEqual(len(gw.inflight), 1)      # ★ 第二条被会话锁挡在外面
+        self.dsh.release_ev("群A").set()
+        t1.join(5); t2.join(5)
+        # 两条都处理了，只是排队（条数不写死：第二条内容重复会触发 validate 去重 → 多一轮 nudge）
+        texts = [t for _, t in self.dsh.prompts]
+        self.assertTrue(any("在吗" in t for t in texts), texts)
+        self.assertTrue(any("再问一句" in t for t in texts), texts)
+
+    def test_over_max_concurrent_returns_busy(self):
+        """名额满了返回 busy（HTTP 503），机器人侧照旧重试。"""
+        gw = self._gw(max_concurrent=1, lock_timeout_sec=0.3)
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3))
+        self.assertEqual(gw.handle_reply({"conversation": "群B", "is_group": True,
+                                          "sender": "松爸", "text": "在吗"}), {"error": "busy"})
+        self.dsh.release_ev("群A").set()
+        t1.join(5)
+
+    def test_max_concurrent_one_is_old_serial_behaviour(self):
+        """max_concurrent=1 = 退回改造前的全局串行，这是出事时的回滚开关。"""
+        gw = self._gw(max_concurrent=1)
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3))
+        t2 = self._fire(gw, "群B", out)
+        time.sleep(0.2)
+        self.assertEqual(len(gw.inflight), 1)      # 群B 拿不到名额，等着
+        self.dsh.release_ev("群A").set()
+        self.dsh.release_ev("群B").set()
+        t1.join(5); t2.join(5)
+
+    def test_missing_turn_id_rejected_when_multiple_inflight(self):
+        """★ 并发串台的正门：在飞 ≥2 轮时，不带 turn_id 的收尾调用必须拒。"""
+        gw = self._gw()
+        self.dsh.omit_turn_id = {"群A"}
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        t2 = self._fire(gw, "群B", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3))
+        self.assertTrue(self.dsh.entered_ev("群B").wait(3))
+        self.assertEqual(len(gw.inflight), 2)
+        self.dsh.release_ev("群A").set()
+        t1.join(5)
+        self.dsh.release_ev("群B").set()
+        t2.join(5)
+        # 群A 没带 turn_id 又赶上多轮在飞 → 被拒 → 它这轮没有 result
+        self.assertIn("无法确定它属于哪一条", self.dsh.tool_results["群A"]["text"])
+        self.assertFalse(self.dsh.tool_results["群A"]["ok"])
+        self.assertEqual(out["群B"]["bubbles"], ["来自群B"])   # 群B 不受影响
+
+    def test_stale_turn_id_cannot_hit_another_inflight(self):
+        """拿一个不存在的 turn_id 打过来，不能落到别人的槽里。"""
+        gw = self._gw()
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3))
+        r = gw.tool_call("wx_reply", {"bubbles": ["串话"], "turn_id": "deadbeef"})
+        self.assertFalse(r["ok"])
+        self.dsh.release_ev("群A").set()
+        t1.join(5)
+        self.assertEqual(out["群A"]["bubbles"], ["来自群A"])
+
+    def test_timeout_does_not_kill_other_inflight(self):
+        """★ 一个会话超时，不能把别人正在跑的轮次连坐杀掉。"""
+        gw = self._gw(restart_after_timeouts=1)   # 一超时就够格重建，但别人在飞就得让路
+        self.dsh.timeout_convs = {"群A"}
+        out = {}
+        t1 = self._fire(gw, "群A", out)
+        t2 = self._fire(gw, "群B", out)
+        self.assertTrue(self.dsh.entered_ev("群A").wait(3))
+        self.assertTrue(self.dsh.entered_ev("群B").wait(3))
+        self.dsh.release_ev("群A").set()
+        t1.join(5)
+        self.assertEqual(self.dsh.stopped, 0)      # ★ 群B 还在飞，没杀进程
+        self.assertTrue(gw.dsh.alive())
+        self.dsh.release_ev("群B").set()
+        t2.join(5)
+        self.assertEqual(out["群B"]["bubbles"], ["来自群B"])   # 群B 正常收尾
 
 
 if __name__ == "__main__":

@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """大脑网关：一次 /reply = 一轮 dsh 对话；模型只能通过工具回调说话。
 
-并发模型（期 1 刻意简单）：全局一把锁，同一时刻只处理一条消息。原因是 MCP 工具回调
-不带会话标识，网关靠"当前在飞的那条请求"来归属工具调用。测试群流量小，够用；
-以后要并发就给 wx_reply 加 conversation 参数并按在飞集合归属。
+并发模型（2026-09-08 起，设计见 docs/superpowers/specs/2026-09-08-concurrency-design.md）：
+**同一会话串行、不同会话并行**，总并发由 cfg["max_concurrent"] 封顶（默认 3）。
+工具回调按消息里盖的 turn_id 归属到 self.inflight[turn_id]；没带 turn_id 时只有在飞恰好
+一轮才回落到它，在飞 ≥2 轮一律拒绝（并发下无法归属，放行就是串台的正门）。
+dsh 一个进程跑多个 session 已实测可行（brain/verify/concurrent_sessions.py，
+两轮干活区间重叠 6.8 秒、零串台、turn_id 零漏带）。
+把 max_concurrent 设成 1 即退回改造前的全局串行行为。
 """
 from __future__ import annotations
 import json
@@ -13,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from . import context, kb, memory_guard, shape
@@ -27,6 +31,9 @@ NUDGE = ("【网关提示】刚才你写在正文里的内容没有发给对方�
          "要说话就调用 wx_reply，把要说的话精简后放进 bubbles；确实不该接话才调用 no_reply。"
          "本提示不是对方发的消息，不要回复它、不要向对方复述它。")
 STALE_TURN = "这个调用属于已经结束的上一轮，已忽略。"
+# 并发下同时有多轮在飞，调用又没带 turn_id —— 无从归属，只能让模型重来一次（带上 turn_id）
+AMBIGUOUS_TURN = ("这个调用没带 turn_id，而现在同时有多条消息在处理，无法确定它属于哪一条，已忽略。"
+                  "请重新调用一次，并带上你这轮消息开头 [ … | 轮次:xxx] 里的那个 turn_id。")
 TURN_TOOLS = ("wx_reply", "no_reply", "propose_shared_knowledge")
 
 
@@ -55,8 +62,15 @@ class Gateway:
         self.dsh_factory = dsh_factory
         self.dsh = None
         self.dsh_epoch = ""
-        self.lock = threading.Lock()
-        self.inflight: Optional[Inflight] = None
+        # 同一会话一把锁（保序 + primed/seen/recent 状态不打架），总并发由信号量封顶。
+        # max_concurrent=1 时等价于改造前的全局串行。
+        self._conv_locks: Dict[str, threading.Lock] = {}
+        self._conv_locks_guard = threading.Lock()   # 建锁本身要互斥，否则同名会话可能各拿到一把
+        self._slots = threading.BoundedSemaphore(max(1, int(cfg.get("max_concurrent") or 1)))
+        self._dsh_guard = threading.RLock()         # 建/重建 dsh 进程要互斥
+        self.inflight: Dict[str, Inflight] = {}     # turn_id -> Inflight（在飞的轮次）
+        self._inflight_guard = threading.RLock()
+        self._timeout_streak = 0                    # 连续超时轮数，攒够了才重建 dsh
         self.recent = RecentReplies(os.path.join(data_dir, "log", "recent.json"),
                                     cfg["recent_global"], cfg["recent_per_conversation"])
         self.proposals = Proposals(workspace_dir)
@@ -68,8 +82,22 @@ class Gateway:
         self.started_at = time.time()
         self.turns = 0
 
+    # ---- 会话锁 ----
+    def _conv_lock(self, conv: str) -> threading.Lock:
+        with self._conv_locks_guard:
+            if conv not in self._conv_locks:
+                self._conv_locks[conv] = threading.Lock()
+            return self._conv_locks[conv]
+
     # ---- dsh 生命周期 ----
     def _ensure_dsh(self):
+        if self.dsh is not None and self.dsh.alive():
+            return
+        with self._dsh_guard:
+            self._ensure_dsh_locked()
+
+    def _ensure_dsh_locked(self):
+        # 并发下多个线程会同时发现 dsh 为 None，抢进来的第一个建好之后，后面的直接用
         if self.dsh is not None and self.dsh.alive():
             return
         if self.dsh is not None:
@@ -100,19 +128,36 @@ class Gateway:
         """返回复合会话 ID：对话名#epoch，防止 dsh 重启后的会话 ID 碰撞。"""
         return f"{conversation}#{self.dsh_epoch}"
 
-    def _restart_dsh_after_timeout(self) -> None:
-        """一轮超时后 dsh 仍在跑那一轮，迟到的工具回调会串到下一条消息上（turn_id 校验是第一道）。
+    def _restart_dsh_after_timeout(self) -> bool:
+        """一轮超时后的处置。返回「是否真的重建了进程」。
 
-        本想只取消那一轮保住进程和预热，但 sdk 运行时没有 session/cancel（见 dsh_client 注释），
-        只能重建进程：下一条消息冷启动 + 重预热。回放第一轮里「超时→重建→重预热→更慢→再超时」
-        确有连锁，所以真正的解法是把 turn_timeout 放到模型实际延迟之上，别让它频繁触发。
+        改造前（串行时代）是一超时就 stop 整个 dsh：那一轮还在后台跑，迟到的工具回调会串到
+        下一条消息上，turn_id 校验是第一道、重建进程是第二道保险。sdk 至今没有 session/cancel
+        （2026-09-05 实测，09-08 复核仍然没有），所以「只取消那一轮」做不到。
+
+        并发之后这么干是错的：**一个会话超时会把别人正在跑的轮次一起杀掉**。改成——
+        - 超时的那一轮从在飞集合里摘掉（handle_reply 的 finally 做），迟到回调自然被 STALE_TURN 拒；
+        - 只有 dsh 进程真死了，或连续 restart_after_timeouts 轮超时（说明不是个别轮次的事），才重建；
+        - 重建时若还有别的轮次在飞，让它们跑完/超时，这次不动手（下一次超时再判）。
         """
-        if self.dsh is not None:
-            try:
-                self.dsh.stop()
-            except Exception:
-                pass
-        self.dsh = None
+        with self._dsh_guard:
+            dead = self.dsh is None or not self.dsh.alive()
+            streak_hit = self._timeout_streak >= max(1, int(self.cfg.get("restart_after_timeouts") or 1))
+            if not dead and not streak_hit:
+                return False
+            with self._inflight_guard:
+                others = len(self.inflight)
+            if not dead and others > 1:
+                # 别人还在飞，杀进程会连坐；等下一次超时再说（streak 不清零，下次照样命中）
+                return False
+            if self.dsh is not None:
+                try:
+                    self.dsh.stop()
+                except Exception:
+                    pass
+            self.dsh = None
+            self._timeout_streak = 0
+            return True
 
     # ---- 主流程 ----
     def handle_reply(self, payload: dict) -> dict:
@@ -129,9 +174,18 @@ class Gateway:
         if not text.strip() or text.strip() in ("[动画表情]", "[图片]", "[视频]", "[文件]", "[链接]"):
             # 空输入不进大脑：09-05 hzfood 日志里一条空消息让 dsh 把网关源码写成了"开发汇报"
             return {"no_reply": True, "reason": "empty"}
-        if not self.lock.acquire(timeout=self.cfg["lock_timeout_sec"]):
+        # 两道闸：先抢一个并发名额（总量封顶），再拿这个会话自己的锁（同一会话严格串行、保序）。
+        # 顺序不能反 —— 先拿会话锁再等名额的话，同一会话排队的请求会把名额攥在手里空等。
+        wait = float(self.cfg["lock_timeout_sec"])
+        deadline = time.time() + wait
+        if not self._slots.acquire(timeout=wait):
+            return {"error": "busy"}
+        clock = self._conv_lock(conv)
+        if not clock.acquire(timeout=max(0.0, deadline - time.time())):
+            self._slots.release()
             return {"error": "busy"}
         t0 = time.time()
+        inf = None
         try:
             try:
                 self._ensure_dsh()
@@ -147,7 +201,9 @@ class Gateway:
                                            count=self.cfg["history_delta_max"]) or None
                 label = context.DELTA_LABEL
             skills = context.match_skills(self.skill_index, conv, is_group)
-            self.inflight = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
+            inf = Inflight(conv, is_group, shape.budget(text, is_group, self.cfg))
+            with self._inflight_guard:
+                self.inflight[inf.turn_id] = inf
             body = context.build_user_message(conv, is_group, sender, text, time.strftime("%Y-%m-%d %H:%M"),
                                               skills, prime, prime_label=label)
             if attempt > 1:
@@ -155,26 +211,29 @@ class Gateway:
                 # 这轮要它收着点，别把同一套工具再跑一遍。
                 body += (f"\n[系统提示：这条消息上一轮处理超时或出错，这是第 {attempt} 次尝试。"
                          "少调工具：同一个工具报错 2 次就停，用已有信息直接回复，回不了就说清楚哪步卡住]")
-            msg = _stamp_turn_id(body, self.inflight.turn_id)
+            msg = _stamp_turn_id(body, inf.turn_id)
             session_id = self._session_id(conv)
             turn = self.dsh.prompt(session_id, msg, self.cfg["turn_timeout_sec"])
             reasoning = turn.reasoning
-            if self.inflight.result is None and not turn.timed_out and not turn.error:
+            if inf.result is None and not turn.timed_out and not turn.error:
                 turn2 = self.dsh.prompt(session_id, NUDGE, self.cfg["turn_timeout_sec"])
                 reasoning += "\n---nudge---\n" + turn2.reasoning
                 turn.timed_out = turn2.timed_out
                 turn.error = turn.error or turn2.error   # nudge 那轮的 dsh 错误同样如实上报
             restarted = False
             if turn.timed_out:
-                # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到下一条消息上；
-                # turn_id 校验是第一道，重建进程是第二道保险。
-                self._restart_dsh_after_timeout()
-                restarted = True
+                # 超时的那一轮 dsh 还在后台跑，迟到的 wx_reply 会串到别的消息上；
+                # 第一道防线是 turn_id（finally 里把本轮摘掉，迟到回调就找不到归属了），
+                # 重建进程只在「进程真死」或「连续超时」时才做，否则并发下会误杀别人在飞的轮次。
+                self._timeout_streak += 1
+                restarted = self._restart_dsh_after_timeout()
+            else:
+                self._timeout_streak = 0
             if not turn.error and not turn.timed_out:
                 # 模型真的看到了这轮的消息才记作"已看过"；dsh 报错/超时的那轮下次要再带一遍
                 self.primed.add(conv)
                 self._mark_seen(conv, raw_hist)
-            result = self.inflight.result
+            result = inf.result
             if result is None:
                 # 故障不许伪装成「不想说话」：模型没调 no_reply，是它压根没跑成。
                 # 报 error，机器人侧 dsh_brain 就会返回失败串走 model_fallback 换老接口顶上（CLAUDE.md 3.21）；
@@ -189,11 +248,11 @@ class Gateway:
             dsh_tools = [str(((ev.get("data") or {}).get("name")) or ((ev.get("data") or {}).get("tool")) or "?")
                          for ev in turn.events if ev.get("type") == "tool/call"]   # 含 MCP 工具（hzfood/grok），排障用
             log_rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "conversation": conv, "is_group": is_group,
-                       "sender": sender, "text": text, "budget": self.inflight.budget, "skills": skills,
-                       "turn_id": self.inflight.turn_id, "session_id": session_id,
+                       "sender": sender, "text": text, "budget": inf.budget, "skills": skills,
+                       "turn_id": inf.turn_id, "session_id": session_id,
                        "primed": first_time and prime is not None, "history_new": 0 if first_time else len(prime or []),
-                       "result": result, "attempts": self.inflight.attempts, "attempt": attempt,
-                       "tools": self.inflight.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
+                       "result": result, "attempts": inf.attempts, "attempt": attempt,
+                       "tools": inf.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
                        "ms": int((time.time() - t0) * 1000)}
             if turn.error:
@@ -201,8 +260,11 @@ class Gateway:
             self._log(log_rec)
             return result
         finally:
-            self.inflight = None
-            self.lock.release()
+            if inf is not None:
+                with self._inflight_guard:
+                    self.inflight.pop(inf.turn_id, None)
+            clock.release()
+            self._slots.release()
 
     def _mark_seen(self, conv: str, items: list) -> None:
         """这次传来的历史（含被过滤掉的）全部记作已看过：比预热更早的旧消息以后也不该再冒出来。"""
@@ -225,24 +287,38 @@ class Gateway:
         return compat.to_completion(res, model)
 
     # ---- 工具回调（MCP 哑桥打过来的）----
+    def _resolve_inflight(self, name: str, args: dict):
+        """把一次工具回调归属到某一轮。返回 (Inflight|None, 拒绝原因|None)。
+
+        规则（并发下的串台防线，见 SPEC §2.2）：
+        - 带了 turn_id：必须精确命中在飞的某一轮，否则拒（上一轮超时后 dsh 迟到的回调走这里）。
+        - 没带 turn_id：只有在飞恰好一轮时才回落到它（兼容单轮场景与老调用方）；
+          在飞 ≥2 轮时无从归属，一律拒 —— 放行就是并发串台的正门。
+        """
+        tid = args.get("turn_id")
+        with self._inflight_guard:
+            if tid is not None:
+                inf = self.inflight.get(str(tid))
+                return (inf, None) if inf is not None else (None, STALE_TURN)
+            if not self.inflight:
+                return None, "当前没有在处理的消息，这个调用被忽略。"
+            if len(self.inflight) > 1:
+                return None, AMBIGUOUS_TURN
+            only = next(iter(self.inflight.values()))
+        only.tool_log.append({"tool": name, "no_turn_id": True})
+        return only, None
+
     def tool_call(self, name: str, args: dict) -> dict:
+        inf, reject = self._resolve_inflight(name, args)
         if name == "kb_search":
+            # 检索本身不依赖归属：归属不上也照查，只是这一笔记不进 tool_log
             txt = kb.search(self.cfg["kb_url"], str(args.get("query", "")), self.cfg["kb_timeout_sec"])
-            inf = self.inflight   # 只读一次：检索期间在飞的请求可能已经换人
             if inf is not None:
                 inf.tool_log.append({"tool": name, "query": args.get("query", ""),
                                      "ok": not txt.startswith("检索不可用"), "chars": len(txt)})
             return {"ok": True, "text": txt}
-        inf = self.inflight
         if inf is None:
-            return {"ok": False, "text": "当前没有在处理的消息，这个调用被忽略。"}
-        if name in TURN_TOOLS:
-            tid = args.get("turn_id")
-            if tid is not None and str(tid) != inf.turn_id:
-                # 上一轮超时后 dsh 迟到的回调：绝不能算到当前这条消息头上
-                return {"ok": False, "text": STALE_TURN}
-            if tid is None:
-                inf.tool_log.append({"tool": name, "no_turn_id": True})
+            return {"ok": False, "text": reject}
         inf.tool_log.append({"tool": name, "args": args})
         if name == "wx_reply":
             inf.attempts += 1
@@ -281,7 +357,9 @@ class Gateway:
     def state(self) -> dict:
         return {"ok": True, "dsh_alive": bool(self.dsh and self.dsh.alive()), "model": self.cfg["model"],
                 "turns": self.turns, "uptime_sec": int(time.time() - self.started_at),
-                "pending_proposals": len(self.proposals.list("pending")), "busy": self.inflight is not None}
+                "pending_proposals": len(self.proposals.list("pending")),
+                "inflight": len(self.inflight), "max_concurrent": int(self.cfg.get("max_concurrent") or 1),
+                "busy": len(self.inflight) >= int(self.cfg.get("max_concurrent") or 1)}
 
 
 # ---- HTTP ----

@@ -979,11 +979,16 @@ class MemoryManager:
         self.wx_id     = wx_id
         self.base_path = base_path  # 根目录：{base_dir}/memory/
         self._locks    = {}         # chat_name -> threading.Lock()
+        self._locks_guard = threading.Lock()   # 建锁本身要互斥，见 _get_lock
 
     def _get_lock(self, chat_name):
-        if chat_name not in self._locks:
-            self._locks[chat_name] = threading.Lock()
-        return self._locks[chat_name]
+        # 2026-09-08：原来是裸的 check-then-set —— 两个线程同时给同一个【新】会话建锁时，
+        # 后建的会覆盖先建的，两边各拿到一把不同的锁，等于这一刻没有互斥，记忆文件可能被写坏。
+        # 并发回复（dsh_brain.dispatch）之后线程数上去了，这个窗口必须堵上。
+        with self._locks_guard:
+            if chat_name not in self._locks:
+                self._locks[chat_name] = threading.Lock()
+            return self._locks[chat_name]
 
     @classmethod
     def _is_windows_reserved_name(cls, name):
@@ -3561,6 +3566,19 @@ class WXBot:
         :return:        发送结果
         """
         attach_quote_text(message)   # 引用消息：把被引用人和原文拼进正文（见函数注释）
+
+        # dsh_brain plugin hook：并发回复（2026-09-08）。命中大脑、且开了 async_reply 的会话，
+        # 把整条消息的处理挪到 worker 线程 —— 监听线程只有一个（LISTENER_EXCUTOR_WORKERS=1），
+        # 同步等大脑那 8~115 秒期间别的群一条消息都读不到。worker 里回调的还是本函数
+        # （dispatch 用线程标记防止再次派发），所以下面的逻辑一行不改。
+        # 关掉 async_reply 即刻退回同步行为。详见 plugins/dsh_brain/dispatch.py。
+        try:
+            from plugins.dsh_brain import dispatch as _brain_dispatch
+            if _brain_dispatch.maybe_dispatch(self, chat, message):
+                return True
+        except Exception as _bd_err:
+            log(level="ERROR", message=f"dsh_brain 异步派发出错，改为同步处理：{_bd_err}")
+
         log(message=f"处理 {chat.who} 窗口 {message.sender} 消息：{message.content}")
         result = True  # 默认返回成功（WxResponse 类型）
 

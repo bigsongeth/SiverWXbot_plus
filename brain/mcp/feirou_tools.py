@@ -42,7 +42,10 @@ TOOLS = [
          "turn_id": TURN_ID}, "required": ["text", "source"]}},
     {"name": "kb_search",
      "description": "检索 NCC 社区知识库（公众号文章 + 固定事实清单）。问据点、活动、报名、主理人、社区历史时先查再答。",
-     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+     # turn_id 2026-09-08 补：网关并发多会话后，工具回调要靠它归属到具体哪一轮。
+     # kb_search 归属不上也照查（只是这一笔记不进 tool_log），但带上排障时能对上号。
+     "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "turn_id": TURN_ID},
+                     "required": ["query"]}},
 ]
 NAMES = {t["name"] for t in TOOLS}
 

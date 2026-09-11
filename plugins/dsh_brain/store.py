@@ -30,6 +30,15 @@ DEFAULT_CONFIG = {
     "retry_delay_sec": 3,
     # 重试也耗尽时回这句（原样发出去）。留空 = 退回老行为：交给 model_fallback 切备用接口。
     "exhausted_reply": "🐶 脑子刚才卡住了，这条没处理成，过会儿再 @ 我一次",
+    # ---- 并发回复（2026-09-08，见 dispatch.py 与 docs/superpowers/specs/2026-09-08-concurrency-design.md）----
+    # 总开关，默认关：合进 main 不改任何行为。开了之后，命中大脑的会话不再占着监听线程等回复，
+    # 整条消息的处理挪到 worker 线程，别的群立刻能被读到。关掉即刻退回同步行为。
+    "async_reply": False,
+    # 同时最多处理几个会话。**应与网关 max_concurrent 一致**：这边开得比网关大，多出来的请求
+    # 只会堆在网关的信号量上排队（拿不到就是 busy），白占 worker。
+    "max_workers": 3,
+    # 单会话待处理上限，超了丢最旧的（群聊刷屏时回最新的那条更有意义，见 dispatch.submit）。
+    "queue_max_per_conv": 5,
 }
 
 _cache = None

@@ -11,6 +11,13 @@ DEFAULTS = {
     "model": "songkey-auto",
     "turn_timeout_sec": 120,   # songkey-auto 目前落到 grok-4.6，一句话也要先烧 700 个推理 token（24s 起步）
     "lock_timeout_sec": 250,   # 主 prompt + nudge 各 120s 的最坏情况
+    # 同时最多处理几条消息（不同会话之间；同一会话永远串行保序）。设 1 = 退回 2026-09-08 之前的
+    # 全局串行行为。往上调之前想清楚 songkey 配额和这台机器的内存，美食群那种要串一堆 MCP 工具
+    # 的轮次尤其吃资源。设计见 docs/superpowers/specs/2026-09-08-concurrency-design.md
+    "max_concurrent": 3,
+    # 连续多少轮超时才重建 dsh 进程。并发下不能一超时就杀进程（会误杀别人在飞的轮次），
+    # 迟到回调靠 turn_id 挡住即可；进程真死了则不受这个计数约束，立刻重建。
+    "restart_after_timeouts": 3,
     "budget": {"base": 30, "factor": 2.5, "min": 40, "max_group": 150, "max_private": 220},
     "max_bubbles_group": 2,
     "max_bubbles_private": 3,
