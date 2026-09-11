@@ -3,6 +3,22 @@ import os
 import sys
 import threading
 
+# --- stdout/stderr 编码兜底（别删，见 CLAUDE.md 3.14）-------------------
+# wxautox4 41.x 会打印登录昵称（本机是「🐶肥肉」）。Windows 下 stdout 一旦被
+# 重定向到文件就默认 GBK，编不了 emoji 直接抛 UnicodeEncodeError，被
+# init_wx_listeners 的 except 接住，只剩一句「初始化微信监听器失败，请检查微信
+# 是否启动登录正确」——完全指错方向，微信其实好好登着。
+# 启动脚本里的 PYTHONIOENCODING=utf-8 只护得住走那个脚本的入口（2026-09-02
+# 就是被 C:\Users\Admin\run_wxbot_panel.bat 这个漏网脚本坑的），所以在进程内
+# 再兜一道：logger 被 web_server / wxbot_core / manual_start_bot 三个入口都在
+# 早期 import，放这里能覆盖全部启动方式。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        # 打包成 exe 或 stdout 被替换成非 TextIOWrapper 时没有 reconfigure，忽略
+        pass
+
 def _base_dir():
     """运行时基础目录：打包后为 exe 所在目录，开发时为当前目录"""
     if hasattr(sys, '_MEIPASS'):
