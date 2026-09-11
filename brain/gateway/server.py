@@ -24,6 +24,7 @@ from . import context, kb, memory_guard, shape
 from .proposals import Proposals
 from .replies import RecentReplies
 from .validate import validate_reply
+from . import reply_links
 
 # 回放 A/B 里 grok-4.6 会把回复写在正文里、然后把这条追问本身当成"系统提示不该回"而调 no_reply，
 # 所以措辞要点明"正文没发出去"，抬头也别用方括号（用户消息首行就是方括号，弱模型分不清）。
@@ -220,9 +221,11 @@ class Gateway:
             session_id = self._session_id(conv)
             turn = self.dsh.prompt(session_id, msg, self.cfg["turn_timeout_sec"])
             reasoning = turn.reasoning
+            events = list(turn.events)
             if inf.result is None and not turn.timed_out and not turn.error:
                 turn2 = self.dsh.prompt(session_id, NUDGE, self.cfg["turn_timeout_sec"])
                 reasoning += "\n---nudge---\n" + turn2.reasoning
+                events += list(turn2.events)
                 turn.timed_out = turn2.timed_out
                 turn.error = turn.error or turn2.error   # nudge 那轮的 dsh 错误同样如实上报
             restarted = False
@@ -246,8 +249,14 @@ class Gateway:
                 # 群里被 @ 也不吭声，机器人日志还打成"AI 判断无需接话"，从后台完全看不出是故障。
                 reason = "dsh_error" if turn.error else ("timeout" if turn.timed_out else "model_silent")
                 result = {"error": reason, "reason": reason}
+            links_added = []
             if result.get("bubbles"):
-                self.recent.add(conv, result["bubbles"])
+                self.recent.add(conv, result["bubbles"])   # recent 只记模型自己的话，固定结尾不参与反重复
+                # 收录后的「高德里打开」短链、收录/推荐的「查看全部」结尾：模型会漏，这里用代码补（reply_links.py）
+                bubbles, links_added = reply_links.ensure_links(result["bubbles"], events, skills,
+                                                                self.cfg.get("skill_links") or {})
+                if links_added:
+                    result = {**result, "bubbles": bubbles}
             truncated = memory_guard.enforce(os.path.join(self.ws, "memory"), self.cfg["memory_max_bytes"])
             self.turns += 1
             dsh_tools = [str(((ev.get("data") or {}).get("name")) or ((ev.get("data") or {}).get("tool")) or "?")
@@ -259,6 +268,7 @@ class Gateway:
                        "result": result, "attempts": inf.attempts, "rejects": inf.rejects, "attempt": attempt,
                        "tools": inf.tool_log, "reasoning": reasoning[:2000], "draft": turn.text[:1000],
                        "memory_truncated": truncated, "dsh_restarted_after_timeout": restarted, "dsh_tools": dsh_tools,
+                       "links_added": links_added,
                        "ms": int((time.time() - t0) * 1000)}
             if turn.error:
                 log_rec["dsh_error"] = turn.error

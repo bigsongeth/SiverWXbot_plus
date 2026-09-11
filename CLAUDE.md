@@ -961,6 +961,11 @@ Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直�
   `os.homedir()` 撞上 `run.py` 改过的 HOME 导致找不到 key）——**全在 `brain/README.md`
   「搜索通道与三级兜底」那一节，改任何一个超时前先读它**。
   另：超时之后那一轮的 `draft` / `dsh_tools` 两个日志字段会混入上一轮的残留，排障别当本轮事实。
+- ★ **回复里必须有的固定链接由网关代码补，不靠模型（2026-09-11）**：美食群收录后的「高德里打开」短链、收录/推荐结尾的
+  「查看全部小众点评：https://surl.amap.com/4bvd5QZ4HY」，由 `brain/gateway/reply_links.py` 在一轮结束、回复交给机器人前补上
+  （从 dsh 的 `tool/result` 事件里取工具返回；按 URL 判重；只追加到最后一条气泡；recent 只记模型原话）。规则在网关 config 的
+  `skill_links` 里按技能名配。起因：工具每次都返回短链、技能也写了要带，09-11 20:03 那条收录回复照样漏了。
+  同日美食技能第 3 类放宽：**夸一家具体的店就收**，不再要求「加进地图」字眼（之前「X 很好吃」全被挡回去要链接）。
 - 网关那头要先跑起来：`brain/README.md`「跑起来」，期 1 在 mac 上 `bind` 要改成 Tailscale 地址、模型建议 `deepseek-v4-flash`。
 - 单测：`PYTHONPATH=. python3 tests/test_dsh_brain.py`（本地假网关，不连微信不连大脑）。
 

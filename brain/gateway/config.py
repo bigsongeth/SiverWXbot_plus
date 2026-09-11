@@ -34,6 +34,17 @@ DEFAULTS = {
         "base": 30, "factor": 2.5,  # legacy 模式用
     },
     "fullwidth_punct": True,      # 把中文语境里的半角标点转成全角
+    # 回复里必须有的固定链接，按技能配置，由网关在交给机器人之前补（模型会漏，2026-09-11 美食群实例）。
+    # link_tools：这些工具的返回里若有「高德里打开：<短链>」而回复没带，就补上；
+    # footer_tools：本轮调过其中任一个，就在最后一条气泡末尾补 footer（按 URL 判重，模型写了就不补）。
+    "skill_links": {
+        "hz-food-map": {
+            "link_tools": ["recommend_place", "recommend_from_link", "recommend_batch"],
+            "footer_tools": ["recommend_place", "recommend_from_link", "suggest", "recommend_batch"],
+            "max_links": 3,   # 一轮收录超过这么多家就不逐家贴短链（批量报店时太刷屏），只留结尾「查看全部」
+            "footer": "查看全部小众点评：https://surl.amap.com/4bvd5QZ4HY",
+        },
+    },
     "max_bubbles_group": 2,
     "max_bubbles_private": 3,
     "recent_global": 50,
