@@ -434,6 +434,37 @@ if handled and checkin_reply:
 ### 3.11 AI 日报插件 `plugins/ai_news_note/`（2026-07-05 加，2026-07-30 才补进版本库）
 每天定时把日报渲染成微信**收藏笔记**再转发到群，走的是笔记而不是长文本消息。
 
+★★ **2026-09-12 微信把「笔记」改成了主窗口内嵌侧边栏，当天日报连败 10 次**：
+点「新建笔记」之后不再弹独立窗口，而是在主窗口右侧展开一块内嵌扩展面板
+（`mmui::ExtensionMultitabView`）。老代码认编辑器的三条判据**一条都不成立**：
+① 它不在桌面顶层 —— `auto.GetRootControl().GetChildren()` 枚举不到，连 win32 的
+`EnumWindows` 也看不见，只能在主窗口的 UIA 树里找；② 宿主窗口标题是「微信」而不是
+「笔记」，"笔记"这个名字落到了里面的 `DocumentControl` 上；③ hwnd 不再是"每次新建一个"
+（同一天实测到 36570558 和 13304500 两个值，既会复用也会变），所以"只认点击前不存在的
+新窗口"这条防自锁判据彻底失效。表现是每次都报**「笔记编辑器未打开」** —— 而实际上笔记
+每次都正常开出来了，**这句错误信息指错了方向**，别再顺着"没打开"去查微信/焦点/UI 卡死。
+- 微信本体没升级（4.1.9.35，进程都没重启过）、`RadiumWMPF` 插件目录也没动过，
+  **多半是服务端下发的新交互，哪天可能又变回去** —— 所以 `_find_note_editor()`
+  新老两种形态都认：先找顶层那个标题叫「笔记」的独立窗口，找不到再在主窗口里找内嵌面板。
+  **别把老那条删掉。**
+- 其余环节一行没改就能用：落点仍按 `DocumentControl` 的实时 rect 取中心、Ctrl+A/Ctrl+V
+  粘贴、回读校验、`PostMessage(WM_CLOSE)` 关闭即存入收藏、收藏列表按标题找格子。
+  端到端实跑验证过（09-12 12:37 AI 日报、12:42 GitHub 趋势各成功发出一次）。
+- ★ **新形态下"防自锁"必须换判据**：hwnd 会复用，没法再靠"是不是新窗口"。改成
+  **粘贴前先 Ctrl+A/Ctrl+C 回读、正文必须是空的**（先往剪贴板放哨兵串，原样回来=正文为空）。
+  读回非空说明面板里停着一条**已有的旧笔记**，而下一步就是 Ctrl+A 全选再 Ctrl+V ——
+  那会把人家的真笔记整个覆盖掉、且不可逆，所以一律中止。
+- `_close_all_editors()` 也要连内嵌面板一起关（`_find_note_panel_hwnd()`）：
+  它不在顶层窗口清单里，老代码那两轮完全够不着，残留下来下次就会被粘进去。
+- 单测 `PYTHONPATH=. python3 tests/test_ai_news_editor.py`（17 个，纯 mock）。
+  实机复核用 `plugins/ai_news_note/diag_note_flow.py`（会话 2 跑、**跑之前先停机器人线程**，
+  走一遍建笔记→粘贴→关闭→查收藏，日志里会打出 `形态=window/panel`）。
+- ★ **排查这类"UI 形态变了"的问题，别在窗口枚举上绕**：当时 `EnumWindows` 和 UIA 顶层
+  都看不到那个窗口，光靠句柄属性（`GetParent`/`GA_ROOT`/style 位）越查越矛盾。
+  **直接截屏看一眼**（`win32ui` BitBlt，`auto.GetRootControl().ToBitmap()` 在本机的
+  uiautomation 上是坏的、报 `NoneType has no attribute BitmapFromWindow`），
+  再 dump 主窗口 UIA 树里落在那块区域的控件，两分钟就定位了。
+
 - 数据源：mac-mini 每天推 `C:\Users\Admin\ai_news\latest.json`，超过 `MAX_AGE_HOURS`(20h) 不发，避免发隔夜数据。
 - `sender.py` 是主链路，`render.py` 渲染笔记 HTML（**微信笔记只认 `background-color`，不认文字 `color` / `<mark>`**），
   `sensitive.py` 发送前过滤敏感词。

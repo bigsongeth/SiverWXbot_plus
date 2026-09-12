@@ -365,6 +365,70 @@ def _list_editors():
     return out
 
 
+# 2026-09-12：微信把「新建笔记」从独立顶层窗口改成了贴在主窗口右侧的内嵌扩展面板
+# （mmui::ExtensionMultitabView）。当天日报连败 10 次、报的全是"笔记编辑器未打开"，
+# 而实际上笔记每次都正常开出来了 —— 只是三条老判据一条都不成立了：
+#   ① 它不在桌面顶层：auto.GetRootControl().GetChildren() 枚举不到它，
+#      连 win32 的 EnumWindows 也看不到，只能在主窗口的 UIA 树里找；
+#   ② 宿主窗口标题是「微信」而不是「笔记」，"笔记"这个名字落到了里面的 DocumentControl 上；
+#   ③ hwnd 不再是"每次新建一个"：同一天实测到 36570558 和 13304500 两个值 ——
+#      既会跨多次调用复用、也会变，所以"只认点击前不存在的新窗口"这条防自锁判据
+#      在新形态下彻底失效（别退回去改成"认某个固定 hwnd"，它也不固定）。
+# 微信本体没升级（4.1.9.35，进程都没重启过），插件目录也没动，多半是服务端下发的
+# 新交互 —— 哪天可能又变回去，所以下面新老两种形态都认，别把老那条删掉。
+NOTE_DOC_NAME = "笔记"
+# 往剪贴板里放的哨兵：Ctrl+A/Ctrl+C 之后它要是原样还在，说明正文里什么都没选到
+_EMPTY_SENTINEL = "___NOTE_EMPTY_CHK___"
+
+
+def _find_note_editor(wx, before=()):
+    """找笔记编辑器，新老形态都认。返回 (host, doc, hwnd, mode)。
+
+    mode='window'：老形态，桌面顶层那个标题叫「笔记」的独立窗口；
+    mode='panel' ：新形态，贴在主窗口右侧的内嵌面板；
+    mode=''      ：没找到，此时 hwnd=0。
+
+    老形态继续沿用"只认点击前不存在的窗口"（防 2026-08-01 那次旧窗口自锁）；
+    新形态 hwnd 复用没法这么判，改用"粘贴前正文必须是空的"兜底，
+    见 _create_note_from_clipboard 里的 _EMPTY_SENTINEL 那段。
+    """
+    try:
+        tops = list(auto.GetRootControl().GetChildren())
+    except Exception:
+        tops = []
+    for wd in tops:
+        try:
+            if (wd.ClassName == "Chrome_WidgetWin_0"
+                    and (wd.Name or "") == NOTE_DOC_NAME
+                    and wd.NativeWindowHandle not in before):
+                doc = _find_in(wd, lambda c: c.ControlTypeName == "DocumentControl")
+                return wd, doc, wd.NativeWindowHandle, "window"
+        except Exception:
+            pass
+    if wx is None:
+        return None, None, 0, ""
+    host = _find_in(wx, lambda c: (c.ClassName == "Chrome_WidgetWin_0"
+                                   and c.ControlTypeName == "PaneControl"
+                                   and c.NativeWindowHandle))
+    if host:
+        doc = _find_in(host, lambda c: (c.ControlTypeName == "DocumentControl"
+                                        and (c.Name or "") == NOTE_DOC_NAME))
+        # 宿主在了但正文还没出来 = 面板还没就绪。这时候返回"找到了"，
+        # 调用方就会往一个半成品里粘贴，白白耗掉三次重试。
+        if doc:
+            return host, doc, host.NativeWindowHandle, "panel"
+    return None, None, 0, ""
+
+
+def _find_note_panel_hwnd():
+    """当前开着的内嵌笔记面板的宿主 hwnd，没有就 0。给 _close_all_editors 用。"""
+    wx = _top("mmui::MainWindow")
+    if not wx:
+        return 0
+    _, _, hwnd, mode = _find_note_editor(wx)
+    return hwnd if mode == "panel" else 0
+
+
 def _close_all_editors():
     """关掉遗留的笔记编辑器窗口，并确认真的关干净了。返回 (ok, msg)。
 
@@ -393,6 +457,23 @@ def _close_all_editors():
     if left:
         return False, (f"有 {len(left)} 个笔记编辑器窗口关不掉（多半弹了未保存确认框），"
                        f"再往下走会粘进旧窗口，已中止。去桌面上手动关掉它们")
+
+    # 新形态（2026-09-12 起）：笔记是主窗口里的内嵌面板，压根不在顶层窗口清单里，
+    # 上面那两轮完全够不着它。残留的面板照样要清掉 —— 不清的话，后面
+    # _find_note_editor 找到的就是"上一次留下的那块面板"，而它里面很可能停着
+    # 一条已有的笔记，接着 Ctrl+A + Ctrl+V 就把人家覆盖了。
+    ph = _find_note_panel_hwnd()
+    if ph:
+        log(f"发现残留的内嵌笔记面板 hwnd={_hw(ph)}，先关掉")
+        try:
+            win32gui.PostMessage(ph, win32con.WM_CLOSE, 0, 0)
+        except Exception as e:
+            log(f"关内嵌笔记面板出错：{e}")
+        time.sleep(2.0)
+        ph = _find_note_panel_hwnd()
+        if ph:
+            return False, (f"内嵌笔记面板关不掉（hwnd={_hw(ph)}），"
+                           f"再往下走会粘进它里面，已中止")
     return True, ""
 
 
@@ -513,17 +594,11 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
     if not _click(cell, hwnd, "新建笔记"):
         return False, "新建笔记入口被别的窗口挡住，点不到"
 
-    note = None
+    note = doc = None
+    nh, mode = 0, ""
     for _ in range(16):          # 最多等 8 秒，编辑器冷启动有时候慢
         time.sleep(0.5)
-        for wd in list(auto.GetRootControl().GetChildren()):
-            try:
-                if (wd.ClassName == "Chrome_WidgetWin_0" and (wd.Name or "") == "笔记"
-                        and wd.NativeWindowHandle not in before):
-                    note = wd
-                    break
-            except Exception:
-                pass
+        note, doc, nh, mode = _find_note_editor(wx, before)
         if note:
             break
     if not note:
@@ -531,8 +606,10 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
             return False, "笔记编辑器没新开出来（只剩点击前就存在的旧窗口），已中止"
         return False, "笔记编辑器未打开"
     r = note.BoundingRectangle
-    nh = note.NativeWindowHandle
-    _raise_hwnd(nh, "笔记编辑器")
+    # 新形态（内嵌面板）点开后本来就是前台，对它做 HWND_TOPMOST 反而可能
+    # 把它从主窗口里"拔"出来浮在外面，没必要，所以只在它不在前台时才去抢。
+    if not (mode == "panel" and _hw(win32gui.GetForegroundWindow()) == _hw(nh)):
+        _raise_hwnd(nh, "笔记编辑器")
     if _hw(win32gui.GetForegroundWindow()) != _hw(nh):
         # 键盘走前台焦点：编辑器不在前台，Ctrl+V 会粘到别的窗口去，
         # 结果存出一条空笔记（或干脆不存），后面还会误发历史笔记。
@@ -557,14 +634,35 @@ def _create_note_from_clipboard(cf_bytes, plain, expect):
     # 2026-08-01 实测（编辑器 701x641）：正文顶部往下 60px 处点不进去（那是标题行，
     # 不可编辑，Ctrl+V 落空），89px 开始才行 —— 而老代码的 r.top+130 正好落在 89px，
     # 离失效边界只剩 29px。窗口被拖动或微信记住新尺寸就会翻车，跟屏幕分辨率是否固定无关。
-    doc = _find_in(note, lambda c: c.ControlTypeName == "DocumentControl")
+    if doc is None:
+        doc = _find_in(note, lambda c: c.ControlTypeName == "DocumentControl")
     if doc:
         db = doc.BoundingRectangle
         cx, cy = (db.left + db.right) // 2, (db.top + db.bottom) // 2
-        log(f"笔记编辑器 hwnd={nh} rect={r} 正文={db} 落点=({cx},{cy})")
+        log(f"笔记编辑器 形态={mode} hwnd={nh} rect={r} 正文={db} 落点=({cx},{cy})")
     else:
         cx, cy = (r.left + r.right) // 2, r.top + 130
         log(f"笔记编辑器 hwnd={nh} rect={r} 找不到正文控件，回落老坐标 ({cx},{cy})")
+    # 新形态下 hwnd 是复用的，"只认点击前不存在的新窗口"这条防自锁判据失效了。
+    # 换成更本质的一条：刚新建出来的笔记，正文必须是空的。如果读回有内容，
+    # 说明面板里停着的是一条**已有的旧笔记**（比如人刚点开过 9 月 11 日那条），
+    # 而下面第一件事就是 Ctrl+A 全选再 Ctrl+V —— 那会把人家的真笔记整个覆盖掉，
+    # 且不可逆。读不到剪贴板（None）按空处理：那只是没读着，不是证据。
+    if mode == "panel":
+        auto.Click(cx, cy)
+        time.sleep(1.2)
+        _clip_text(_EMPTY_SENTINEL)
+        time.sleep(0.3)
+        auto.SendKeys("{Ctrl}a", waitTime=0.1); time.sleep(0.3)
+        auto.SendKeys("{Ctrl}c", waitTime=0.1); time.sleep(1.0)
+        pre = _clip_read()
+        if pre is not None and str(pre) != _EMPTY_SENTINEL:
+            log(f"新建出来的笔记正文不是空的（读回 {str(pre)[:40]!r}），"
+                f"面板里多半停着一条旧笔记，中止以免覆盖它")
+            win32gui.PostMessage(nh, win32con.WM_CLOSE, 0, 0)
+            time.sleep(2.0)
+            return False, "笔记面板里不是一条新笔记（正文非空），怕覆盖已有笔记，已中止"
+
     ok_paste = False
     for attempt in range(1, 4):
         _clip_html(cf_bytes, plain)
