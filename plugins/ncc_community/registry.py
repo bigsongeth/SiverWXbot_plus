@@ -419,6 +419,37 @@ def mark_remark_applied(name: str, remark: str) -> None:
             save(data)
 
 
+def record_tag_attempt(name: str, error: str) -> int:
+    """自动打标失败一次：tag_attempts +1，记下最后一次错误和时间。返回累计次数。
+    去重靠这个落盘字段而不是进程内存（重启不再翻车，见提案 §3.1 第 4 条）。群不在表里返回 0。"""
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if not g:
+            return 0
+        g["tag_attempts"] = int(g.get("tag_attempts") or 0) + 1
+        g["tag_last_error"] = str(error or "")[:300]
+        g["tag_last_at"] = datetime.now().isoformat(timespec="seconds")
+        save(data)
+        return g["tag_attempts"]
+
+
+def note_tag_notice(name: str, kind: str) -> bool:
+    """自动打标「需人工」类提醒的落盘去重：同一个群、同一种情况只提醒一次。
+    返回 True 表示这次是新情况（该发提醒），False 表示已经提醒过。群不在表里返回 False。"""
+    with _LOCK:
+        data = load()
+        g = data["groups"].get(name)
+        if not g:
+            return False
+        if str(g.get("tag_notice") or "") == str(kind):
+            return False
+        g["tag_notice"] = str(kind)
+        g["tag_notice_at"] = datetime.now().isoformat(timespec="seconds")
+        save(data)
+        return True
+
+
 def mark_unreachable(name_or_target: str):
     """把一个"转发无结果/找不到"的群在本地标记为不可达（被踢/解散/改名）：
     allow_forward=False + status="unreachable"，后续转发自动跳过它。

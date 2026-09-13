@@ -189,7 +189,7 @@ class EngineTest(unittest.TestCase):
         forward.GATHER_SETTLE = 0    # 测试里不等 UI
         forward.CHATINFO_SETTLE = 0  # 同上：重读窗口名不用真等
         forward.SEARCH_RETRY_GAP = 0  # 空结果重搜的间隔，测试里不真等
-        discovery._SEEN.clear()
+        discovery._reset_runtime_state()
         self.bot = FakeBot()
         self.admin = FakeChat(ADMIN)
 
@@ -594,10 +594,23 @@ class EngineTest(unittest.TestCase):
         self.assertEqual(self.bot.wx.remarks.get("大理A群"), "大理A群🐶")  # 没有被追加
 
     # ---------- discovery ----------
+    # 2026-09-13 群🐶自动打标（方案 A）后，friend 回调这条路【只登记 + 飞书】，绝不在监听线程里
+    # ChatWith / 打备注（09-11 老友记们就是这么切歪的）；打备注由全局监听 hook 或
+    # 「修备注 <群名>」后台任务做。细的用例在 tests/test_ncc_tagging.py。
+
+    def _mock_webhook(self):
+        from unittest import mock
+        sent = []
+        patcher = mock.patch("webhook_send.send_message",
+                             side_effect=lambda t, c: (sent.append((t, c)) or (True, "ok")))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return sent
 
     def test_discovery_new_group(self):
         seed_registry()
         store.save({"admin_group": ADMIN})
+        sent = self._mock_webhook()
         # 去 Notion 化后不再往 Notion 推待归类行：本地 add_pending 就够了，
         # 面板「待归类」页直接能看到并归类。这里守住"绝不再打 Notion"。
         pushed = {}
@@ -611,16 +624,20 @@ class EngineTest(unittest.TestCase):
         data = registry.load()
         self.assertIn("野生新群", data["groups"])
         self.assertEqual(data["groups"]["野生新群"]["status"], "pending")
-        self.assertTrue(data["groups"]["野生新群"]["remark_applied"])   # 自动打了备注
+        self.assertFalse(data["groups"]["野生新群"]["remark_applied"])   # 监听线程不打备注
+        self.assertEqual(self.bot.wx.chatted, [])                          # 绝不切主窗口
+        self.assertEqual(self.bot.wx.remarks, {})
         self.assertFalse(pushed, "发现新群不该再写 Notion")
-        # 管理群收到提醒，且指向面板
-        alerts = [m for _, m in self.bot.wx.sent if "发现新群" in (m or "")]
-        self.assertTrue(alerts)
-        self.assertIn("/ncc_community", alerts[-1])
+        # 提醒走飞书、不发管理群，且指向面板
+        self.assertEqual([m for _, m in self.bot.wx.sent if "发现新群" in (m or "")], [])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("野生新群", sent[0][0])
+        self.assertIn("/ncc_community", sent[0][1])
 
     def test_discovery_known_group_no_repush(self):
         seed_registry()
         store.save({"admin_group": ADMIN})
+        sent = self._mock_webhook()
         pushed = []
         orig = notion_sync.push_discovery
         notion_sync.push_discovery = lambda name: pushed.append(name)
@@ -629,10 +646,13 @@ class EngineTest(unittest.TestCase):
         finally:
             notion_sync.push_discovery = orig
         self.assertEqual(pushed, [])  # 已登记群不重复推送
+        self.assertEqual(sent, [])    # 「已登记但没🐶」的即时提醒已改成每日汇总
+        self.assertTrue(registry.load()["groups"]["大理A群"]["last_seen"])
 
     def test_discovery_ignores_admin_and_private(self):
         seed_registry()
         store.save({"admin_group": ADMIN})
+        sent = self._mock_webhook()
         orig = notion_sync.push_discovery
         notion_sync.push_discovery = lambda name: (_ for _ in ()).throw(AssertionError("不该推送"))
         try:
@@ -642,6 +662,7 @@ class EngineTest(unittest.TestCase):
             notion_sync.push_discovery = orig
         data = registry.load()
         self.assertNotIn("私聊对象", data["groups"])
+        self.assertEqual(sent, [])
 
     # ---------- notion 解析 ----------
 

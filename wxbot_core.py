@@ -5173,6 +5173,16 @@ class WXBot:
                 log(message=f'{chat} 为黑名单用户，跳过处理')
                 return
 
+            # ncc_community plugin hook: 全局监听读到群消息 → 见群打🐶（逻辑在
+            # plugins/ncc_community/discovery.py，默认观察模式只记日志）。此刻主窗口正停在该群上，
+            # 不用 ChatWith。不改下面上游那句「跳过」的逻辑，群消息照旧不进 AI 流程。
+            if chat_type == 'group':
+                try:
+                    from plugins.ncc_community.discovery import handle_global_group as _ncc_global_group
+                    _ncc_global_group(self, chat, messages_new, msgs)
+                except Exception as _ncc_err:
+                    log(level="ERROR", message=f"ncc_community plugin error: {_ncc_err}")
+
             if msgs:
                 for msg in msgs:
                     if msg.type == 'image':

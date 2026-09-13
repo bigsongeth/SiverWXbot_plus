@@ -46,6 +46,20 @@ DEFAULT_CONFIG = {
         # 每人每个关键词每天最多触发次数
         "daily_limit": 3,
     },
+    # 群🐶自动打标（2026-09-13，方案 A，见 docs/superpowers/specs/2026-09-13-group-tagging-proposal.md §7）。
+    # 每次调用都重读，改了立即生效，不用重启。文件里缺这一段时按这里的默认值跑。
+    "discovery": {
+        # 全局监听读到群消息时自动打🐶。False = 观察模式：只记 [tagging-observe] 日志，
+        # 不打备注、不写登记表。
+        "auto_tag_global": False,
+        # 已在 config.group 独立监听的群也自动打（打完插件同步 config.json 三处 + 复制记忆目录）。
+        # 关着时这类群只登记 + 飞书提醒人工走「修备注 <群名>」。
+        "auto_tag_listened": False,
+        # 每天一次把「登记了但没🐶」的群汇总到飞书的时间（HH:MM）
+        "digest_time": "09:00",
+        # 同一个群自动打标最多试几次（复核不过算一次），到数后飞书叫人、不再自动试
+        "max_attempts": 3,
+    },
 }
 
 _cache = None

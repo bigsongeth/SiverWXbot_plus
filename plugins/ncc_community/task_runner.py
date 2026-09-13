@@ -63,6 +63,13 @@ def register(bot, schedule) -> None:
     # 主循环只在有定时任务开关打开时才 run_pending，这个标志让它把我们也算上
     bot._ncc_task_runner_enabled = True
     log("INFO", f"后台任务触发器已挂载：写 {REQUEST_PATH} 即执行")
+    # 群🐶日报（登记了但没打上标签的群，每天一次汇总到飞书）顺带挂在这里，
+    # 不在 wxbot_core 再加一处 hook（冲突面最小）。失败不影响触发器本身。
+    try:
+        from . import discovery
+        discovery.register_digest(bot, schedule)
+    except Exception as e:
+        log("ERROR", f"群🐶日报注册失败：{e}")
 
 
 def _read_request():

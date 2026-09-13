@@ -1053,6 +1053,7 @@ SEARCH_EMPTY_RETRIES = 2   # 主窗口搜索返回 0 项时，重搜几次（微
 SEARCH_RETRY_GAP = 0.8     # 两次重搜之间等多久
 CHATINFO_SETTLE = 0.6      # ChatWith 之后等窗口结算的时间（秒）
 CHATINFO_TRIES = 3         # 读回的名字对不上时最多重读几次
+REMARK_SETTLE = 1.0        # SetGroupRemark 之后等窗口标题刷成新备注再回读（秒），单测置 0
 
 
 def _read_chat_name(wx, want: str) -> str:
@@ -2103,12 +2104,18 @@ def _fix_remarks(bot, chat, scope) -> bool:
     改不了的只有一种：备注是追加出来的垃圾（形如「A🐶B🐶」）。SetGroupRemark 对已有
     备注是追加、空串也清不掉，硬打只会越接越长，这类只报出来让人工清。
 
-    用法：修备注 预览（只看不改）/ 修备注 全部（真打）。"""
+    用法：修备注 预览（只看不改）/ 修备注 全部（真打）/ 修备注 <群名>（只打这一个，见 _fix_one_remark）。"""
     wx = getattr(bot, "wx", None)
+    # ★ strip 必须在判 dry 之前：正则 `\s*(.+)` 理论上已吃掉前导空白，但尾随空白仍会漏进来，
+    #   「修备注 预览 」若判不出 dry 就会掉进 _fix_one_remark 去切一个叫「预览」的群
+    scope = (scope or "").strip()
     dry = scope in ("预览", "看看", "dry")
-    if not dry and scope not in ("全部", "所有", "all"):
-        reply(chat, "用法：「修备注 预览」先看一遍要改什么，确认后发「修备注 全部」真打。")
+    if not scope:
+        reply(chat, "用法：「修备注 预览」先看一遍要改什么，确认后发「修备注 全部」真打；"
+                    "或「修备注 <群名>」只打这一个群。")
         return True
+    if not dry and scope not in ("全部", "所有", "all"):
+        return _fix_one_remark(bot, chat, scope)
 
     reply(chat, "开始扫描微信里的所有群（要滑一遍会话列表），稍等…")
     try:
@@ -2179,6 +2186,65 @@ def _fix_remarks(bot, chat, scope) -> bool:
     return True
 
 
+def _fix_one_remark(bot, chat, name) -> bool:
+    """「修备注 <群名>」：只给这一个群打「群名🐶」（2026-09-13 加，群🐶自动打标 §7.2）。
+
+    给谁用：独立监听的群（config.group 里的）在 friend 回调里被发现没🐶时，discovery
+    不能在监听线程里切主窗口，就往 task_runner 排这一条，由 bot 后台线程持闸门来做；
+    人也可以在管理群直接发。带空格的群名原样传（正则 `^修备注\\s*(.+)$` 整段捕获）。
+
+    流程照「检查群组」8-14 之后那套：_switched（接返回值）→ _read_chat_name（等结算 + 重读）
+    → audit.plan_remark 定该怎么办 → _do_set_remark（严格确认显示名 + 打 + 回读）→
+    tagsync.post_tag（登记表 + 监听中的群同步 config.json + 飞书）。管理群绝不打。"""
+    wx = getattr(bot, "wx", None)
+    want = audit.strip_dog(name)
+    if not want:
+        reply(chat, "用法：修备注 <群名>")
+        return True
+    if want in _admin_group_names(store.load()):
+        reply(chat, f"「{want}」是管理群，不打备注（打了指令入口就关了）。")
+        return True
+    known = set(registry.load().get("groups", {}))
+    overrides = (store.load().get("remark_overrides") or {})
+
+    with MAIN_WINDOW_LOCK:
+        if not _switched(wx, want, exact=False):
+            reply(chat, f"切到「{want}」失败（搜不到会话），没动备注。")
+            return True
+        real = _read_chat_name(wx, want)
+        if not real:
+            reply(chat, f"切到「{want}」后读不到窗口名，没动备注。")
+            return True
+        if audit.strip_dog(real) != want:
+            reply(chat, f"切到的是「{real}」，不是「{want}」，没动备注。")
+            return True
+        verdict, detail = audit.plan_remark(real, known, overrides)
+        ok, why = (False, "")
+        if verdict == audit.FIX_APPLY:
+            ok, why = _do_set_remark(wx, real, detail)
+
+    if verdict == audit.FIX_OK:
+        reply(chat, f"「{real}」已经打过🐶，不用动。")
+        return True
+    if verdict != audit.FIX_APPLY:
+        reply(chat, f"「{real}」没打：{detail}")
+        return True
+    if not ok:
+        registry.add_pending(real)
+        n = registry.record_tag_attempt(real, why)
+        reply(chat, f"给「{real}」打备注失败（第 {n} 次）：{why}")
+        return True
+    from . import tagsync
+    r = tagsync.post_tag(bot, real, detail, source="listened")
+    tail = ""
+    if r.get("listened"):
+        tail = ("；config.json 已同步（group 换新名，两个 map 加新键）" if r.get("config_synced")
+                else "；⚠️ config.json 没同步成功，请人工改三处")
+        tail += "，记忆目录" + ("已复制" if r.get("memory_copied") else "未复制")
+    reply(chat, f"已给「{real}」打上备注「{detail}」{tail}。飞书里有详情和后续要人做的两件事。")
+    return True
+
+
 def _do_set_remark(wx, real_name, want_remark) -> tuple[bool, str]:
     """打一个备注并回读复核。调用方须持有 MAIN_WINDOW_LOCK，且窗口已停在该群上。"""
     from . import remark as remark_mod
@@ -2192,7 +2258,7 @@ def _do_set_remark(wx, real_name, want_remark) -> tuple[bool, str]:
         return False, str(e)
     if not remark_mod.wxresponse_ok(r):
         return False, f"SetGroupRemark 返回 {r!r}"
-    time.sleep(1.0)            # 等窗口标题刷成新备注，不然回读到的还是旧显示名
+    time.sleep(REMARK_SETTLE)  # 等窗口标题刷成新备注，不然回读到的还是旧显示名
     ok2, why2 = remark_mod.verify_remark(wx, real_name, want_remark)
     if not ok2:
         log("WARNING", f"修备注复核不过 {real_name}: {why2}")

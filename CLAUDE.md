@@ -79,7 +79,7 @@ netstat -ano | findstr LISTEN | findstr :100
 | 插件 | 干什么 | hook 位置（合并上游后逐个确认） | 单测 |
 |------|--------|------------------------------|------|
 | `wechat_checkin` | 私聊「签到」发兑换码 | `wxbot_core.wx_send_ai` 前 ×1 | `test_wechat_checkin.py` |
-| `ncc_community` | 管理群转发 / 迎新 / 拉群 + 面板 | `message_handle_callback` ×3、`get_next_new_message` ×1 | `test_ncc_community.py` / `_engine` / `_batch` / `_panel` |
+| `ncc_community` | 管理群转发 / 迎新 / 拉群 / 见群打🐶 + 面板 | `message_handle_callback` ×3、`get_next_new_message` ×2（拉群关键词、见群打🐶） | `test_ncc_community.py` / `_engine` / `_batch` / `_panel` / `_tagging` |
 | `model_fallback` | 接口挂了自动换下一个 | `_get_group_api` / `_get_chat_api` ×2 | `test_model_fallback.py` |
 | `context_guard` | 治胡编：注日期+能力边界、洗历史 | `MemoryManager.get_messages` ×1、两个 `_get_*_prompt` ×2 | `test_context_guard.py` |
 | `reply_shape` | 分条回复形状 + 剥 Markdown | `_build_split_prompt` / `_parse_split_reply` ×2 | `test_reply_shape.py` |
@@ -303,9 +303,39 @@ if handled and checkin_reply:
   注册处 + 主循环 `run_pending` 的条件，共 2 处。
   ⚠️ mac 侧走 SMB 读 `task_result.txt` **有读缓存**，看到的可能是上一轮的旧内容，
   拿结果一律 `ssh win-shukong` 从 Windows 侧读。
+- ★★ **「见群打🐶」（2026-09-13 方案 A，提案 `docs/superpowers/specs/2026-09-13-group-tagging-proposal.md`）**：
+  在此之前「发现新群」这条路**根本碰不到真正的新群** —— 没写进 `config.group` 的群没有子窗口，
+  它的消息在主循环里被上游一句「私聊全局监听收到群聊消息，跳过」扔掉，`discovery` 永远看不到。
+  09-11「老友记们」是活标本：人先 `/添加群`，15 秒后群里 @ 一句才"发现"，当场打备注还失败了
+  （从**监听线程**去 `ChatWith` 主窗口，切歪读成 `chat_type=friend`）。
+  - **hook 变成 5 处**：原来的 3+1 之外，`get_next_new_message` 黑名单过滤之后、`if msgs:` 之前
+    多了一处 `if chat_type == 'group': handle_global_group(...)`（约 5176 行）。合并上游后连它一起确认。
+  - **两条入口分工，别再混**：① `discovery.handle_global_group` 跑在**主循环线程**，此刻主窗口正停在该群上
+    → **不 ChatWith**，直接 `confirm_group_window`（显示名严格相等）→ `SetGroupRemark` → 回读复核，持
+    `MAIN_WINDOW_LOCK` 约 2–3 秒；② `discovery.handle_discovery`（独立监听群的 friend 回调）
+    **绝不碰主窗口**，要打就往 `data/task_request.txt` 写一行「修备注 <群名>」交给 task_runner 的后台线程。
+  - **配置段 `discovery`（插件 `data/config.json`，默认值在 `store.DEFAULT_CONFIG`）**：
+    `auto_tag_global` / `auto_tag_listened`（都默认 **False = 观察模式**，只打
+    `[tagging-observe] 群=… attr=… 有remark键=… 判定=… 模式=观察` 日志，不打备注不写登记表）、
+    `digest_time`（默认 09:00）、`max_attempts`（3）。**改开关下一条消息即生效、不用重启；改插件代码要整进程重启。**
+  - **`tagsync.post_tag` 是打标后的唯一收尾**（全局监听打的、「修备注 <群名>」打的都走它）：
+    登记表 `mark_remark_applied` → 若群在 `config.group` 里就同步 `config/config.json`
+    （文件里 `group` 旧名换新名、两个 map **旧键保留 + 新键加上**；先备份 `config.json.bak-<日期>`；
+    **内存里 `group` 是追加新名、保留旧名**，因为运行中子窗口的 `chat.who` 是旧名还是新名没实测过，两个都认才不漏消息）
+    → 复制 `memory/<wxid>/<旧名>/` 成 `<新名>/`（不删旧）→ 飞书。
+    `brain/workspace/skills/index.json` 插件**不动**，靠飞书文案提醒人去改（那边是精确匹配，两个名字都要列）。
+  - ⚠️ **「修备注 全部」这条老路径没接 `post_tag`**（106 个群会刷 106 条飞书），所以用「全部」打到
+    监听中的群**不会**同步 config.json。要打监听中的群，一律用新指令「修备注 <群名>」。
+  - 通知**一律走飞书 webhook**、不发管理群（用户 09-13 拍板）；「已登记但没🐶」不再即时提醒，
+    改成每天 `digest_time` 一次汇总（`data/discovery_state.json` 记日期）。去重靠登记表新字段
+    `tag_attempts / tag_last_error / tag_last_at / tag_notice`（落盘，**重启不再重发** —— 老的 `_SEEN` 是进程内存，
+    9 月重启 10 次就刷了 10 条）。
+  - 未命名群（显示名是「松爸、王伟」这种成员名拼接）**不登记不打**，改名后按新群处理（用户拍板 Q1=a）；
+    管理群（`forward._admin_group_names`）绝不打。
 - 单测（纯 mock 不碰微信，mac 上直接跑文件）：`tests/test_ncc_community.py`（97 个）、
-  `tests/test_ncc_engine.py`（46 个）、`tests/test_ncc_batch.py`（14 个）、
-  **`tests/test_ncc_panel.py`（38 个，面板 CRUD / 状态 / 操作 / 迁移脚本，2026-08-05 加）**。
+  `tests/test_ncc_engine.py`（51 个）、`tests/test_ncc_batch.py`（14 个）、
+  **`tests/test_ncc_panel.py`（45 个，面板 CRUD / 状态 / 操作 / 迁移脚本，2026-08-05 加）**、
+  **`tests/test_ncc_tagging.py`（41 个，见群打🐶 / tagsync / 日报，2026-09-13 加）**。
 
 ### 3.7 AI 问答知识库（mac-mini，2026-07-05 加）
 知识库栈在 `mac-mini:~/ncc-kb/`（Qdrant + rag_proxy，launchd 常驻），469 篇公众号文章 2175 块，
@@ -713,6 +743,12 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
 
 - **原理**：`FallbackAPI` 包装器，对外暴露与四个 API 类一致的 `.chat()` 签名，内部按顺序试。
   历史/人设/分段/图片/接话闸门全走上游原链路，只换"这次用哪个接口"。
+- ★ **图片消息是盲区（2026-09-13 踩到）**：私聊/群聊开了「图片识别」时，图片走
+  `_init_api_by_index(chat_image_recognition_api)` **直连**，既不经大脑（dsh_brain）也不经本插件的备用链。
+  索引 2 原配 `gpt-5.5`，松 Key 上早已没渠道（`No available channel`），黄俊发张海报重试 5 次后静默无回复。
+  现改成 `gemma-4-31b-it`（用真实海报测过，24s 答对；grok-4.6 也行但 28s）。**换模型前先拿真图测**，
+  别只看模型列表；面板改 api_configs 后要重启机器人线程。config 目录在 mac 侧 Claude 没写权限，
+  改配置走面板接口 `POST /`(登录) → `/load_config` → `/save_config`（部分字段合并）→ `/stop_bot` `/start_bot`。
 - **hook 2 处**，在 `wxbot_core.py` 的 `_get_group_api` / `_get_chat_api`：原逻辑（含 ncc_kb hook）
   整体挪进 `_resolve_group_api` / `_resolve_chat_api`，入口函数只剩一行 `_with_fallback(...)`。
   这么拆是为了让上游改接口选择逻辑时，冲突落在函数体内部、diff 上下文一致，merge 能自动过。
