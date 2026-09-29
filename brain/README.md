@@ -5,8 +5,9 @@
 设计文档：`docs/superpowers/specs/2026-09-05-dsh-brain-design.md`；本期（期 1）计划：
 `docs/superpowers/plans/2026-09-05-dsh-brain-phase1.md`。用户拍板的硬约束见设计文档 §2，改代码前先读。
 
-容器化（期 2）还没做；网关目前由这台 mac 的 launchd `com.bigsong.feirou-brain` 常驻
-（`~/Personal/feirou-brain/run_gateway.sh`，绑 100.127.39.63:8500，模型 deepseek-v4-flash，数据目录 `~/feirou-brain-data`）。
+容器化（期 2）还没做；网关 2026-09-06 13:30 起由 **mac-mini** 的 launchd `com.bigsong.feirou-brain` 常驻
+（`~/feirou-brain/run_gateway.sh`，绑 100.71.182.5:8500，数据目录 `~/feirou-brain-data`，改代码后 `sh ~/Personal/feirou-brain/deploy.sh --remote`）。
+**模型 2026-09-30 起是 `step-5-preview`**（之前是 deepseek-v4-flash，换的原因和怎么换见下文「换模型」）。
 机器人侧插件 `plugins/dsh_brain/`（CLAUDE.md 3.21）**2026-09-06 起全量接管**：所有群聊与私聊（除文件传输助手）的 AI 回复
 都交给网关；网关不通时自动退回老接口链。各群原来的人设变成风格技能：`ai-geek-cold` 挂「🏜️AI 及其代理人联邦」，
 `crypto-cynic` 备用（目前没有币圈群在监听），其余群和私聊用 PERSONA 本体（融合版肥肉）。
@@ -199,6 +200,30 @@ curl -s -X POST http://127.0.0.1:8500/reply -H 'Content-Type: application/json' 
 代价记清楚：**超时之后那一轮的日志字段 `draft` 和 `dsh_tools` 会混入上一轮的残留**
 （`dsh_client.prompt` 开头只清"此刻队列里有的"事件，上一轮正在路上的 `turn/end` 会被下一轮吸收）。
 排障时别把这两个字段当本轮事实。要根治得给 `prompt` 按 turn 过滤事件。
+
+## 换模型（2026-09-30 从 deepseek-v4-flash 换到 step-5-preview）
+
+**起因**：9-28 起群里频繁出「脑子刚才卡住了」（9-28 22 轮坏 9 轮，9-29 中午 6 轮全坏）。
+病根在松 Key 渠道，不在大脑：`deepseek-v4-flash` 主供渠道 wong2 上游一直 524，每次调用先干等约 125 秒才失败，
+再落到兜底渠道「42api 免费组」。后者一来慢（单次 130–250 秒），二来**把工具调用当正文吐出来**
+（草稿里是 `<｜｜DSML｜｜ invoke name="skill">` 文本，dsh 不认，判 `model_silent`）。一轮要调好几次模型，必撞 240 秒超时。
+排查顺序：`log/replies-*.jsonl` 看 `result.error` 和 `draft` 里有没有 DSML → hkbohai 的 `one-api.db` 按
+`token_name='爱泼斯坦'`（大脑用的 key）查 `channel_id` / `use_time` / 错误正文。
+
+**选型**（9-29 实测，带工具调用、约 8k token 上下文）：step-5-preview 3–7 秒、工具参数正确；
+glm-5.3-flash 20–35 秒，太慢；songkey-auto 当时被路由到 step-3.7-flash、能用，但它指向谁会随路由器变，
+wong2 一恢复就会切回 grok-4.6（回放里不守「只能通过工具说话」）。所以大脑**固定具体模型、不走 songkey-auto**。
+换上后 3 轮冒烟 20 / 21 / 8 秒，11 次模型调用全在 stepfun 渠道、每次 1–8 秒。
+⚠️ 风险：step-5-preview 只有 stepfun 一家在供，账号有 **每分钟 50 万 token** 上限（9-28 一个用户一天撞了 1700 次 429），
+大脑每次调用 1–3 万 token 输入，群里一热闹可能撞限。撞了就先换备选 `step-3.7-flash`（同样只有 stepfun 和 kilo 两家在供）。
+
+**怎么换（两处都要改，缺一不可）**：
+1. `~/feirou-brain-data/config.json` 的 `model`（`/health` 显示的就是它，**但它不代表实际在用的模型**）；
+2. `~/feirou-brain-data/dsh-home/settings.yaml` —— `profile.prepare_dsh_home` **只在文件不存在时写一次**
+   （刻意的，保护人手改动），所以光改 config.json 不会刷新它。没人手改过就直接删掉，重启时按模板重新生成；
+   新模型还得先出现在 `profile/settings.yaml.tmpl` 的 `models` 清单里。
+改完 `deploy.sh --remote`（会 kickstart），然后打 3 条冒烟、到 hkbohai 查 `model_name` 确认真的换了。
+回滚：两个文件都有 `.bak-20260930`，盖回去再 kickstart。
 
 ## 已知限制（期 1）
 
