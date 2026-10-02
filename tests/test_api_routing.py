@@ -114,5 +114,28 @@ class TestCallApiWithFallback(unittest.TestCase):
         self.assertEqual(backup.calls, 0)
 
 
+class TestBackupPathFailureText(unittest.TestCase):
+    """OpenAIAPI 的直连兜底失败时必须交回固定失败串。
+
+    2026-10-03 查出：_try_responses_api 失败时返回「备用接口请求失败: 500」「备用接口调用异常: …」
+    这类自定义文字。model_fallback 的 is_failure 和上游 _call_api_with_fallback 都只认固定串，
+    于是报错文字被当成正常回复发给了用户（记忆文件里查到 3 条，私聊和测试群都有），
+    既不切备用也不走 api_error_reply。"""
+
+    def test_string_returns_are_failure_constant(self):
+        cls = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == 'OpenAIAPI')
+        fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '_try_responses_api')
+        bad = []
+        for r in ast.walk(fn):
+            if not isinstance(r, ast.Return) or r.value is None:
+                continue
+            v = r.value
+            if isinstance(v, ast.JoinedStr):
+                bad.append(r.lineno)
+            elif isinstance(v, ast.Constant) and isinstance(v.value, str) and v.value != API_ERROR_REPLY:
+                bad.append(r.lineno)
+        self.assertEqual(bad, [], f'这些行返回了自定义报错文字，会被当回复发出去: {bad}')
+
+
 if __name__ == '__main__':
     unittest.main()

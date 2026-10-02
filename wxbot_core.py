@@ -1688,7 +1688,7 @@ class OpenAIAPI:
             if response.status_code != 200:
                 error_detail = response.text[:500]
                 log(level="ERROR", message=f"备用接口 HTTP 错误 {response.status_code}: {error_detail}")
-                return f"备用接口请求失败: {response.status_code}"
+                return API_ERROR_REPLY  # 别返回自定义报错文字：is_failure/备用接口只认固定串，否则会被当回复发出去
 
             data = response.json()
             if 'choices' in data and len(data['choices']) > 0:
@@ -1704,10 +1704,10 @@ class OpenAIAPI:
                     return content.strip()
 
             log(level="ERROR", message=f"备用接口返回数据结构异常: {str(data)[:500]}")
-            return "备用接口返回数据格式错误"
+            return API_ERROR_REPLY
         except Exception as e:
             log(level="ERROR", message=f"备用接口调用异常: {str(e)}")
-            return f"备用接口调用异常: {str(e)}"
+            return API_ERROR_REPLY
 
 
 class DifyAPI:
