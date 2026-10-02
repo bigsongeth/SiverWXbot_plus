@@ -87,7 +87,7 @@ netstat -ano | findstr LISTEN | findstr :100
 | `gh_trending_note` | 每日 GitHub 趋势笔记（跟在日报后面） | 定时任务注册处 ×1（紧邻 ai_news_note） | 插件内 `selftest.py` / `test_follow.py` |
 | `ui_watchdog` | 卡死/日志异常 → 整进程重启 | 主循环 `heartbeat()` / `disarm()`、`web_server` 消费标记 ×3 | `test_ui_watchdog.py` |
 | `listen_health` | 监听窗口丢失探针 + 自愈 | `MainWindowChat` 等 ×5（见 3.18） | `test_listen_health.py` / `test_main_window_chat.py` |
-| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/）+ 并发回复 | `_resolve_group_api` / `_resolve_chat_api` ×2、`process_message` 开头 ×1（见 3.21） | `test_dsh_brain.py` / `_dispatch` |
+| `dsh_brain` | 指定群/私聊的 AI 回复交给肥肉大脑（brain/）+ 并发回复 | `_resolve_group_api` / `_resolve_chat_api` ×2、`process_message` 开头 ×1、4 个文字调用点的 `api=self._get_*_api(...)`（见 3.19、3.21） | `test_dsh_brain.py` / `_dispatch` |
 
 另有不成插件的核心内改动：3.1 面板监听地址、3.10 时间戳清洗与接话闸门（`test_reply_gate.py`）、
 3.12 绕开系统代理的 `HTTP` 会话、3.14 `SEARCH_CHAT_TIMEOUT`。
@@ -753,6 +753,20 @@ Windows 下默认 GBK，编不了 emoji 直接抛异常。40.1.15 不打这句�
   整体挪进 `_resolve_group_api` / `_resolve_chat_api`，入口函数只剩一行 `_with_fallback(...)`。
   这么拆是为了让上游改接口选择逻辑时，冲突落在函数体内部、diff 上下文一致，merge 能自动过。
   **合并上游后确认这两个入口和 `_with_fallback` 还在。**
+- ★★ **上游 v4.7.33 自己也做了「备用接口」，而且差点把整条钩子绕开（2026-10-03 合并时拦下）**：
+  上游给每个接口加了 `fallback_api_index`（面板 API 卡片里的「备用接口」下拉框），调用改成
+  `self._call_api_with_fallback(group_api_index, ...)` —— **只传下标、按下标重建接口实例，根本不调
+  `_get_group_api` / `_get_chat_api`**。git 自动合并、不报冲突，原样收下就是生产上所有会话
+  静默不走大脑、不走本插件，退回直连老接口。现在 4 个文字调用点都传
+  `api=self._get_group_api(chat.who)` / `api=self._get_chat_api(chat.who)`：主调用走我们的钩子版实例，
+  上游的单接口备用作为外面一层兜底（`fallback_api_index` 默认 -1 = 不生效）。
+  `tests/test_api_routing.py` 用 ast 守着这 4 处，少一个 `api=` 就失败。
+  - 两套备用现在**并存**：我们的 `fallback_switch`/`fallback_chain`（全局有序链，面板勾「备用」）+ 上游的
+    每接口「备用接口」下拉框。正常只用我们那套；上游那个下拉框别配，配了等于在全链失败后再多试一次。
+  - 图片识别那 4 处（`chat/group_image_recognition_api`）照收上游：现在也走 `_call_api_with_fallback`，
+    给图片接口配了「备用接口」就能兜底 —— 下面那条「图片消息是盲区」从此有了解法，但仍不经大脑。
+  - 同版上游把 `OpenAIAPI` 超时 30→180 秒（`max_retries=2` 没变，最坏 9 分钟）、DusAPI 600→180。
+    我们只收了数值，`HTTP.post`（3.12）一个没让它改回 `requests.post`。
 - **失败判定**：底层四个 API 类把异常吞成固定串 `"API返回错误，请稍后再试"`（7 个 return 点），
   **状态码根本没往上传**，所以第一版不分 500/403/529，凡失败就切下一个。代价是 403（key 废了）
   也会白试一次备用。要精确分流就得改那 7 个 return 点，冲突面变大，暂不值当。
@@ -1076,6 +1090,27 @@ Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直�
 - 单测：`PYTHONPATH=. python3 tests/test_dsh_brain_dispatch.py`（12 个）、
   `tests/test_brain_server.py`（30 个，含 7 个并发专项，用 Event 精确控时序、不靠 sleep）。
 
+### 3.22 散落在核心文件里、之前没记过的定制（2026-10-03 合 v4.7.33 时逐 hunk 查漏补记）
+拿「合并后版本 vs 上游」的 86 个 hunk 逐个对照本文件，下面这些对不上任何小节。合并上游后一样要确认还在：
+
+| 位置 | 改了什么 | 引入 | 丢了会怎样 |
+|------|---------|------|-----------|
+| `wxbot_core.py` `_is_already_listening` / `_close_orphan_chat_window` / `_purge_stale_listener` + 初始化重试、动态监听两处调用 | wxautox 说「已在监听」但子窗口其实没了：先清它的注册表、关掉残留的最小化窗口，再重新 AddListenChat | a92be1b | ★ 高：08-15 那种几个群整晚收不到消息会再现 |
+| `wxbot_core.py` `OpenAIAPI._try_responses_api` 的三个失败 return | 一律返回固定串 `API_ERROR_REPLY`（2026-10-03 才修对，之前返回「备用接口调用异常: …」被当回复发给了用户） | 3836d24 | ★ 高：报错文字直接发到群里，备用链接不住；`test_api_routing.py` 守着 |
+| `wxbot_core.py` `OpenAIAPI.__init__` 显式存 `self.api_key` / `self.base_url` | 直连分支（3.12）和 model_fallback 的 `api_identity` 去重都靠它 | 66c746d | 中：缺了直连分支 AttributeError（记忆里就有一条「'OpenAIAPI' object has no attribute 'api_key'」） |
+| `wxbot_core.py` 全局监听主循环的 except | 异常一律记日志带堆栈（上游只在 `run_flag=False` 时记，运行中被吞） | 9facfe9 | 中：丢消息又变成无声无息 |
+| `wxbot_core.py` `MemoryManager._get_lock` 的 `_locks_guard` | 防两个线程同时给新会话建锁、写坏记忆文件 | 5575688 | 中：只在 `async_reply`（3.21 并发）开着时有影响 |
+| `logger.py` 开头 | 进程内把 stdout/stderr 改成 UTF-8 —— 3.14 那条 `PYTHONIOENCODING` 的进程内兜底 | 3f093a5 | 中：漏设变量的启动脚本会因为🐶起不来 |
+| `web_server.py` 启动处的看门狗备用自启 | 自启动标记没读到时看 `ui_watchdog/data/restart_history.json`，120 秒内重启过就 10 秒后拉起机器人 | 779876f | 中：配合 3.13，标记丢了机器人就停着 |
+| `web_server.py` `find_free_port` | 探端口也绑 0.0.0.0（3.1 那一行之外的另一半） | 15f0361 | 中 |
+| `web_server.py` `/ncc_community/task` | 面板体检任务轮询（3.6 说的「三条薄路由」现在是四条） | 37127ad | 低 |
+| `web_server.py` `log_server` 的 `flush=True`、`webhook_send.py` 的 `CONFIG_PATH` 按 `__file__` 定位 | 小修 | 779876f / ec07955 | 低（webhook 那处上游用 `_base_dir()` 兼容打包，冲突时可以直接收上游的） |
+
+另外两条合并残留（不是我们的定制，是以前解冲突时把上游的东西冲掉了）：
+- 上游 V4.7.24 的「测试可用性」按钮 + `getApiConfigFromItem()` 被冲掉过，2026-10-03 照原文补回（44a3eee）。
+  **这类丢失的特征是"处理代码还在、入口没了"**，不报错只是功能消失，按行核对时要连"上游有、我们没有"的一起看。
+- 上游 V4.7.26 记忆提示里「记忆依托对话名称区分，请做好微信备注」那句我方面板没有，无关紧要，没补。
+
 ### 3.20 GitHub 趋势笔记插件 `plugins/gh_trending_note/`（未在本文档记录过，2026-08-15 补）
 
 和 `ai_news_note` **平行的第二条笔记管线**：每天把 GitHub 趋势榜（今日/本周/本月 Top5）
@@ -1116,7 +1151,24 @@ Qt 是按进程维护鼠标按钮状态的，交错之后它认为按钮一直�
 4. 合并后按第 3 节逐项确认定制点还在，特别是：
    - `web_server.py` 的 `app.run(host='0.0.0.0', ...)` 没被改回 `127.0.0.1`（见 3.1）；
    - `wxbot_core.py` 的 wechat_checkin hook 还在（见 3.2）；
-   - DusAPI 定制按 `AI_COLLABORATION_GUIDE.md` 第 4.5 节清单逐项过，删掉重新冒出来的 DusAPI 广告（见 3.5）。
+   - DusAPI 定制按 `AI_COLLABORATION_GUIDE.md` 第 4.5 节清单逐项过，删掉重新冒出来的 DusAPI 广告（见 3.5）；
+   - 群聊/私聊文字调用点都还经过 `_get_group_api` / `_get_chat_api`（`tests/test_api_routing.py` 守着，见 3.19）。
+   ★ **"自动合并没冲突"不等于"没冲突"**：上游改的是调用路径时，我们的钩子一行没删、只是再也没人调它，
+   行级 diff 和冲突标记都看不出来（v4.7.33 就是）。除了逐行核对「合并删掉了我们哪些行」，
+   还要核对每个钩子函数的**调用方**合并前后是否都还在：
+   ```bash
+   for f in _get_group_api _get_chat_api _get_group_prompt _get_chat_prompt _guard_prompt attach_quote_text apply_no_reply_gate _clean_reply_for_send _build_split_prompt _parse_split_reply; do echo "$f 前=$(git show HEAD^1:wxbot_core.py | grep -c "$f(") 后=$(grep -c "$f(" wxbot_core.py)"; done
+   ```
+   合并删掉了我们哪些行（上游没动过的行被删 = 我们的东西被冲掉了）：
+   ```bash
+   B=$(git merge-base HEAD^1 HEAD^2); for f in $(git diff --name-only HEAD^1 HEAD); do python3 - "$f" "$B" <<'PY'
+   import subprocess,sys; f,b=sys.argv[1:]; r=lambda *a: subprocess.run(a,capture_output=True,text=True).stdout
+   up={l[1:].strip() for l in r('git','diff',b,'HEAD^2','--',f).splitlines() if l[:1]=='-'}
+   bad=[l for l in r('git','diff','HEAD^1','HEAD','--',f).splitlines() if l[:1]=='-' and not l.startswith('---') and l[1:].strip() and l[1:].strip() not in up]
+   print(f, len(bad)); [print('  !!',l[:140]) for l in bad]
+   PY
+   done
+   ```
 5. 若上游要求 `wxautox4` 升级（历史上 40.1.14 → 40.1.15、40.1.15 → 41.1.1.post1），
    **先读 3.14 那一节再动手** —— 旧版从 PyPI 下架回滚不了、必须先手工备份 zip、
    必须先停机器人再升级、升完要确认 `PYTHONIOENCODING=utf-8`。别直接 `pip install -U`。

@@ -63,11 +63,19 @@ else:
 *   **我们的版本**：新增标准 Chat Completions 流式格式解析（`choices[0].delta.content`），兼容绝大多数 API 代理（NewAPI / One-API 等）。
 
 ```python
-# 我们新增的解析分支：
+# 我们新增的解析分支（只有 content 进正文；reasoning_content 是思考过程，单独收集）：
 elif event_type is None and 'choices' in data:
-    delta = data['choices'][0].get('delta') or {}
-    text = delta.get('content') or delta.get('reasoning_content') or ''
+    delta = choices[0].get("delta") or {}
+    piece = delta.get("content") or ""
+    if piece:
+        result_parts.append(piece)
+    elif delta.get("reasoning_content"):
+        reasoning_parts.append(delta["reasoning_content"])
+# 循环结束后：整轮完全没有 content 才拿 reasoning_parts 兜底
 ```
+
+⚠️ 别写成 `delta.get('content') or delta.get('reasoning_content')` 逐块二选一 —— 思考过程会混进回复发出去
+（2026-10-03 核对时发现本文档旧示例就是这么写的，代码是对的、文档错了）。
 
 ### 4.4 OpenAIAPI 类的同步修改
 
