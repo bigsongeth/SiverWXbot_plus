@@ -2,8 +2,8 @@
 # Siver微信机器人 siver_wxbot - 面向对象版本 - wxautox4版本
 # 作者：https://www.siver.top
 
-version = "V4.7.31"
-version_log = "V4.7.31 - 修复@回复易丢失@的bug、优化初始化提示、修复 onefile 打包后临时目录被清理导致证书错误、优化OpenAI API 格式兼容接口的兼容性、适配新版本"
+version = "v4.7.33"
+version_log = "v4.7.33 - AI接口配置可设置备用接口"
 
 # ============================================================
 # 标准库导入
@@ -96,12 +96,39 @@ WxParam.SEARCH_CHAT_TIMEOUT = 5
 # 交错，Qt 进程级的鼠标状态被搞乱，此后所有假双击都当成"按着不放的移动"，独立窗口再也开不出来。
 # 独立进程实测：挂 5 个监听，4 线程 1/8 成功，1 线程 8/8。串行化后不再交错。
 WxParam.LISTENER_EXCUTOR_WORKERS = 1
+_CONFIG_SPECIAL_SESSION_NAMES = set()
 
 # ============================================================
 # SDK 名称常量（面板显示名，兼容旧名 "OpenAI SDK"）
 # ============================================================
 OPENAI_SDK_NAME    = "OpenAI API 格式兼容接口"
 OPENAI_SDK_ALIASES = ("OpenAI SDK", OPENAI_SDK_NAME)
+API_ERROR_REPLY    = "API返回错误，请稍后再试"
+
+
+def _normalize_api_configs(api_configs):
+    """规范化接口列表，并将非法备用接口索引统一为 -1。"""
+    if not isinstance(api_configs, list):
+        return []
+
+    normalized = []
+    for cfg in api_configs:
+        normalized.append(cfg if isinstance(cfg, dict) else {})
+
+    total = len(normalized)
+    for index, cfg in enumerate(normalized):
+        try:
+            fallback_index = int(cfg.get("fallback_api_index", -1))
+        except (TypeError, ValueError):
+            fallback_index = -1
+        if (
+            fallback_index < 0
+            or fallback_index >= total
+            or fallback_index == index
+        ):
+            fallback_index = -1
+        cfg["fallback_api_index"] = fallback_index
+    return normalized
 
 # ============================================================
 # 拆分多条回复常量
@@ -323,10 +350,11 @@ class WXBotConfig:
 
         # ---------- 用户与权限 ----------
         self.listen_list = []           # 白名单/黑名单用户列表
+        self.special_session_name = []  # 全局监听特殊会话过滤名单（用户附加项）
         self.cmd = ""                   # 管理员账号（命令接收者）
 
         # ---------- AI 接口配置 ----------
-        self.api_configs = []           # 接口配置列表，每项含 sdk/key/url/model
+        self.api_configs = []           # 接口配置列表，每项含 sdk/key/url/model/fallback_api_index
         self.api_index = 0              # 当前使用的接口索引
         self.api_sdk  = ""             # 当前接口 SDK（派生）
         self.api_key  = ""             # 当前接口 Key（派生）
@@ -433,8 +461,8 @@ class WXBotConfig:
             if not os.path.exists(self.CONFIG_FILE):
                 base_config = {
                     "api_configs": [
-                        {"sdk": "", "key": "", "url": "", "model": ""},
-                        {"sdk": "", "key": "", "url": "", "model": ""},
+                        {"sdk": "", "key": "", "url": "", "model": "", "fallback_api_index": -1},
+                        {"sdk": "", "key": "", "url": "", "model": "", "fallback_api_index": -1},
                     ],
                     "api_index": 0,
                     "fallback_switch": False,   # 接口失败自动换下一个模型（plugins/model_fallback）
@@ -445,6 +473,7 @@ class WXBotConfig:
                     "AllListen_filter_mute": True,
                     "chat_listen_only": False,
                     "listen_list": [],
+                    "special_session_name": [],
                     "group": [],
                     "group_api_map": {},
                     "group_switch": False,
@@ -617,12 +646,14 @@ class WXBotConfig:
                     'key':   self.config.get('api_key', ''),
                     'url':   self.config.get('base_url', ''),
                     'model': self.config.get('model1', ''),
+                    'fallback_api_index': -1,
                 },
                 {
                     'sdk':   self.config.get('api_sdk', ''),
                     'key':   self.config.get('api_key', ''),
                     'url':   self.config.get('base_url', ''),
                     'model': self.config.get('model2', ''),
+                    'fallback_api_index': -1,
                 },
             ]
             self.config['api_index'] = 0
@@ -631,12 +662,22 @@ class WXBotConfig:
             self.save_config()
             log(message="旧 API 配置已自动迁移为新格式并保存")
 
-        self.api_configs = self.config.get('api_configs', [
-            {"sdk": "", "key": "", "url": "", "model": ""},
-            {"sdk": "", "key": "", "url": "", "model": ""},
+        _api_configs = self.config.get('api_configs', [
+            {"sdk": "", "key": "", "url": "", "model": "", "fallback_api_index": -1},
+            {"sdk": "", "key": "", "url": "", "model": "", "fallback_api_index": -1},
         ])
-        self.api_index = self.config.get('api_index', 0)
-        if self.api_index >= len(self.api_configs):
+        if not isinstance(_api_configs, list):
+            _api_configs = [
+                {"sdk": "", "key": "", "url": "", "model": "", "fallback_api_index": -1},
+                {"sdk": "", "key": "", "url": "", "model": "", "fallback_api_index": -1},
+            ]
+        self.api_configs = _normalize_api_configs(_api_configs)
+        self.config['api_configs'] = self.api_configs
+        try:
+            self.api_index = int(self.config.get('api_index', 0))
+        except (TypeError, ValueError):
+            self.api_index = 0
+        if self.api_index < 0 or self.api_index >= len(self.api_configs):
             self.api_index = 0
 
         # 接口名称迁移：OpenAI SDK → OpenAI API 格式兼容接口（兼容旧配置）
@@ -663,6 +704,27 @@ class WXBotConfig:
         self.AllListen_switch     = self.config.get('AllListen_switch')
         self.AllListen_filter_mute = bool(self.config.get('AllListen_filter_mute', True))
         self.chat_listen_only     = bool(self.config.get('chat_listen_only', False))
+
+        # 配置中只保存用户附加项，保留 wxautox 内置的特殊会话名单。
+        _special_session_names = self.config.get('special_session_name', [])
+        if not isinstance(_special_session_names, list):
+            _special_session_names = []
+        self.special_session_name = []
+        for _session_name in _special_session_names:
+            _session_name = str(_session_name).strip()
+            if _session_name and _session_name not in self.special_session_name:
+                self.special_session_name.append(_session_name)
+
+        # 面板进程内重启机器人时，先移除上次由配置追加的项，使删除操作也能生效。
+        global _CONFIG_SPECIAL_SESSION_NAMES
+        for _session_name in _CONFIG_SPECIAL_SESSION_NAMES:
+            if _session_name in WxParam.SPECIAL_SESSION_NAME:
+                WxParam.SPECIAL_SESSION_NAME.remove(_session_name)
+        _CONFIG_SPECIAL_SESSION_NAMES.clear()
+        for _session_name in self.special_session_name:
+            if _session_name not in WxParam.SPECIAL_SESSION_NAME:
+                WxParam.SPECIAL_SESSION_NAME.append(_session_name)
+                _CONFIG_SPECIAL_SESSION_NAMES.add(_session_name)
 
         # 群聊配置
         self.group                = self.config.get('group', [])
@@ -770,9 +832,19 @@ class WXBotConfig:
 
         # 图片识别配置
         self.chat_image_recognition_switch  = bool(self.config.get('chat_image_recognition_switch', False))
-        self.chat_image_recognition_api     = int(self.config.get('chat_image_recognition_api', 0))
+        try:
+            self.chat_image_recognition_api = int(self.config.get('chat_image_recognition_api', 0))
+        except (TypeError, ValueError):
+            self.chat_image_recognition_api = 0
+        if self.chat_image_recognition_api < 0 or self.chat_image_recognition_api >= len(self.api_configs):
+            self.chat_image_recognition_api = 0
         self.group_image_recognition_switch = bool(self.config.get('group_image_recognition_switch', False))
-        self.group_image_recognition_api    = int(self.config.get('group_image_recognition_api', 0))
+        try:
+            self.group_image_recognition_api = int(self.config.get('group_image_recognition_api', 0))
+        except (TypeError, ValueError):
+            self.group_image_recognition_api = 0
+        if self.group_image_recognition_api < 0 or self.group_image_recognition_api >= len(self.api_configs):
+            self.group_image_recognition_api = 0
 
         # 自定义转发配置
         self.custom_forward_switch = bool(self.config.get('custom_forward_switch', False))
@@ -1378,7 +1450,7 @@ class OpenAIAPI:
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=30.0,  # 设置超时时间
+            timeout=180.0,  # 设置超时时间
             max_retries=2,  # 设置重试次数
             default_headers={
                 "User-Agent": "Mozilla/5.0",
@@ -1744,7 +1816,7 @@ class DifyAPI:
             payload["files"] = files
 
         try:
-            response = HTTP.post(url, headers=headers, json=payload)
+            response = HTTP.post(url, headers=headers, json=payload, timeout=180)
             response.raise_for_status()  # 非 2xx 状态码时抛出异常
             if response_mode == "blocking":
                 return response.json()
@@ -1924,7 +1996,7 @@ class DusAPI:
             api_endpoint,
             headers=headers,
             json=payload,
-            timeout=600,
+            timeout=180,
             stream=True
         )
         response.raise_for_status()
@@ -1963,7 +2035,7 @@ class DusAPI:
             api_endpoint,
             headers=headers,
             json=payload,
-            timeout=600,
+            timeout=180,
             stream=True
         )
         response.encoding = 'utf-8'
@@ -2094,7 +2166,7 @@ class DusAPI:
 
             payload = {
                 "model": model,
-                "max_tokens": 200000,
+                "max_tokens": 65535,
                 "system": prompt,
                 "messages": messages,
             }
@@ -2130,7 +2202,7 @@ class DusAPI:
 
             for attempt in range(max_retries + 1):
                 try:
-                    response = HTTP.post(api_endpoint, headers=headers, json=payload, timeout=600)
+                    response = HTTP.post(api_endpoint, headers=headers, json=payload, timeout=180)
                     response.raise_for_status()
                     response.encoding = 'utf-8'
                     response_data = response.json()
@@ -2241,7 +2313,7 @@ class DusAPI:
 
             for attempt in range(max_retries + 1):
                 try:
-                    response = HTTP.post(api_endpoint, headers=headers, json=payload, timeout=600)
+                    response = HTTP.post(api_endpoint, headers=headers, json=payload, timeout=180)
                     response.raise_for_status()
                     response.encoding = 'utf-8'
                     response_data = response.json()
@@ -2395,6 +2467,103 @@ class WXBot:
         except Exception as _fb_err:
             log(level="ERROR", message=f"model_fallback api hook error: {_fb_err}")
             return api
+
+    def _normalize_api_index(self, idx):
+        """将接口索引规范化为有效索引；无效值回退到当前默认接口。"""
+        configs = getattr(self.config, 'api_configs', [])
+        if not isinstance(configs, list) or not configs:
+            return 0
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            idx = -1
+        if 0 <= idx < len(configs):
+            return idx
+        try:
+            default_idx = int(getattr(self.config, 'api_index', 0))
+        except (TypeError, ValueError):
+            default_idx = 0
+        return default_idx if 0 <= default_idx < len(configs) else 0
+
+    def _get_api_instance_by_index(self, idx):
+        """获取指定接口实例，默认接口复用 self.api，其余接口使用缓存。"""
+        idx = self._normalize_api_index(idx)
+        default_idx = self._normalize_api_index(getattr(self.config, 'api_index', 0))
+        if idx == default_idx:
+            return self.api
+        if idx not in self.api_cache:
+            self.api_cache[idx] = self._init_api_by_index(idx)
+        return self.api_cache[idx]
+
+    def _get_group_api_index(self, group_name):
+        """获取群聊实际使用的接口下标；未配置专属接口时返回默认接口。"""
+        raw = getattr(self.config, 'group_api_map', {}).get(group_name)
+        try:
+            idx = int(raw)
+        except (TypeError, ValueError):
+            return self._normalize_api_index(getattr(self.config, 'api_index', 0))
+        if idx < 0:
+            return self._normalize_api_index(getattr(self.config, 'api_index', 0))
+        return self._normalize_api_index(idx)
+
+    def _get_chat_api_index(self, user_name):
+        """获取私聊实际使用的接口下标；未配置专属接口时返回默认接口。"""
+        if not getattr(self.config, 'AllListen_switch', False):
+            raw = getattr(self.config, 'chat_api_map', {}).get(user_name)
+            try:
+                idx = int(raw)
+            except (TypeError, ValueError):
+                idx = -1
+            if idx >= 0:
+                return self._normalize_api_index(idx)
+        return self._normalize_api_index(getattr(self.config, 'api_index', 0))
+
+    def _call_api_with_fallback(self, api_index, message, api=None, **kwargs):
+        """
+        调用一次主接口，失败后最多调用一次其配置的备用接口。
+        备用接口自身的 fallback 配置不会继续展开，避免形成循环。
+        """
+        configs = getattr(self.config, 'api_configs', [])
+        if not isinstance(configs, list) or not configs:
+            configs = []
+        primary_index = self._normalize_api_index(api_index)
+        attempts = [(primary_index, api)]
+
+        if configs and primary_index < len(configs):
+            primary_config = configs[primary_index]
+            if isinstance(primary_config, dict):
+                try:
+                    fallback_index = int(primary_config.get('fallback_api_index', -1))
+                except (TypeError, ValueError):
+                    fallback_index = -1
+                if (
+                    0 <= fallback_index < len(configs)
+                    and fallback_index != primary_index
+                ):
+                    attempts.append((fallback_index, None))
+
+        for attempt_number, (index, current_api) in enumerate(attempts):
+            try:
+                if current_api is None:
+                    current_api = self._get_api_instance_by_index(index)
+                reply = current_api.chat(message, **kwargs)
+                if reply and reply != API_ERROR_REPLY:
+                    if attempt_number > 0:
+                        log(message=f"备用接口 {index + 1} 调用成功")
+                    return reply
+                log(
+                    level="WARNING",
+                    message=f"接口 {index + 1} 返回失败标记，"
+                            f"{'准备切换备用接口' if attempt_number == 0 and len(attempts) > 1 else '本次调用结束'}",
+                )
+            except Exception as exc:
+                log(
+                    level="WARNING",
+                    message=f"接口 {index + 1} 调用异常：{_shorten_log_text(exc)}"
+                            f"{'，准备切换备用接口' if attempt_number == 0 and len(attempts) > 1 else ''}",
+                )
+
+        return API_ERROR_REPLY
 
     def _get_group_api(self, group_name):
         """群聊 AI 接口入口：按原逻辑选出接口后，套一层故障转移。"""
@@ -3648,8 +3817,9 @@ class WXBot:
                     if self.config.group_image_recognition_switch:
                         if message.type == 'image':
                             # 直接图片消息：content 已被替换为本地路径
-                            rec_api = self._init_api_by_index(self.config.group_image_recognition_api)
-                            reply = rec_api.chat(
+                            rec_index = self.config.group_image_recognition_api
+                            reply = self._call_api_with_fallback(
+                                rec_index,
                                 f"{message.sender}: [这是 {message.sender} 单独发送的一条图片消息，请根据上下文语境分析这张图片和发送者发送的意图进行回复]",
                                 prompt=_effective_group_prompt,
                                 history=history,
@@ -3658,8 +3828,9 @@ class WXBot:
                         elif '+引用的图片:' in content_without_at:
                             # 引用图片消息：拆分文字部分和图片路径
                             text_part, img_path = content_without_at.split('+引用的图片:', 1)
-                            rec_api = self._init_api_by_index(self.config.group_image_recognition_api)
-                            reply = rec_api.chat(
+                            rec_index = self.config.group_image_recognition_api
+                            reply = self._call_api_with_fallback(
+                                rec_index,
                                 f"{message.sender}: {text_part.strip()}" if text_part.strip() else f"{message.sender}: [这是 {message.sender} 单独发送的一条图片消息，请根据上下文语境分析这张图片和发送者发送的意图进行回复]",
                                 prompt=_effective_group_prompt,
                                 history=history,
@@ -3667,14 +3838,28 @@ class WXBot:
                             )
                         else:
                             # 普通文字消息，走原有群组逻辑
-                            group_api = self._get_group_api(chat.who)
-                            reply = group_api.chat(content_with_sender, prompt=_effective_group_prompt, history=history)
+                            # 定制：传入 _get_group_api 的实例，大脑(dsh_brain)/备用链(model_fallback)钩子都在它里面；
+                            # 只传下标的话上游会按下标重建接口，整条绕开钩子（合 v4.7.33 时拦下的）。
+                            group_api_index = self._get_group_api_index(chat.who)
+                            reply = self._call_api_with_fallback(
+                                group_api_index,
+                                content_with_sender,
+                                api=self._get_group_api(chat.who),
+                                prompt=_effective_group_prompt,
+                                history=history,
+                            )
                     else:
                         # 识别关闭：图片消息静默跳过，文字正常
                         # if message.type == 'image' or '+引用的图片:' in content_without_at:
                             # return result
-                        group_api = self._get_group_api(chat.who)
-                        reply = group_api.chat(content_with_sender, prompt=_effective_group_prompt, history=history)
+                        group_api_index = self._get_group_api_index(chat.who)
+                        reply = self._call_api_with_fallback(
+                            group_api_index,
+                            content_with_sender,
+                            api=self._get_group_api(chat.who),
+                            prompt=_effective_group_prompt,
+                            history=history,
+                        )
                 except Exception as e:
                     print(traceback.format_exc())
                     log(level="ERROR", message=str(e) + "\n群组中调用AI回复错误！！")
@@ -4022,8 +4207,9 @@ class WXBot:
                 if self.config.chat_image_recognition_switch:
                     if message.type == 'image':
                         # 直接图片消息：content 已被替换为本地路径（图片识别优先使用图片识别接口）
-                        rec_api = self._init_api_by_index(self.config.chat_image_recognition_api)
-                        reply = rec_api.chat(
+                        rec_index = self.config.chat_image_recognition_api
+                        reply = self._call_api_with_fallback(
+                            rec_index,
                             "[这是单独发送的一条图片消息，请根据上下文语境分析这张图片和发送者发送的意图进行回复]",
                             prompt=_effective_prompt,
                             history=history,
@@ -4032,8 +4218,9 @@ class WXBot:
                     elif '+引用的图片:' in message.content:
                         # 引用图片消息：拆分文字部分和图片路径
                         text_part, img_path = message.content.split('+引用的图片:', 1)
-                        rec_api = self._init_api_by_index(self.config.chat_image_recognition_api)
-                        reply = rec_api.chat(
+                        rec_index = self.config.chat_image_recognition_api
+                        reply = self._call_api_with_fallback(
+                            rec_index,
                             text_part.strip() or "[这是单独发送的一条图片消息，请根据上下文语境分析这张图片和发送者发送的意图进行回复]",
                             prompt=_effective_prompt,
                             history=history,
@@ -4041,12 +4228,26 @@ class WXBot:
                         )
                     else:
                         # 普通文字消息：使用用户专属接口和 prompt
-                        reply = self._get_chat_api(chat.who).chat(message.content, prompt=_effective_prompt, history=history)
+                        chat_api_index = self._get_chat_api_index(chat.who)
+                        reply = self._call_api_with_fallback(
+                            chat_api_index,
+                            message.content,
+                            api=self._get_chat_api(chat.who),
+                            prompt=_effective_prompt,
+                            history=history,
+                        )
                 else:
                     # 识别关闭：图片消息静默跳过，文字消息正常
                     # if message.type == 'image' or '+引用的图片:' in message.content:
                         # return True
-                    reply = self._get_chat_api(chat.who).chat(message.content, prompt=_effective_prompt, history=history)
+                    chat_api_index = self._get_chat_api_index(chat.who)
+                    reply = self._call_api_with_fallback(
+                        chat_api_index,
+                        message.content,
+                        api=self._get_chat_api(chat.who),
+                        prompt=_effective_prompt,
+                        history=history,
+                    )
         except Exception as e:
             print(traceback.format_exc())
             log(level="ERROR", message=str(e) + "\nAPI返回错误，请稍后再试")
@@ -5369,7 +5570,7 @@ class WXBot:
             print(traceback.format_exc())
             log(level="ERROR", message=str(e) + "\n 初始化微信监听器失败，请检查微信是否启动登录正确，微信主窗口是否开着")
             log(level="ERROR", message=str(e) + "\n 请尝试退出wx再重新登录后再启动")
-            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.9 ~ 4.1.12.55")
+            log(level="ERROR", message=str(e) + "\n 若重启wx还是不行，就请重启整个面板程序，面板和wx都重启了还不行就请进入面板右上角文档检查环境要求，wx版本是否匹配,4.1.9 ~ 4.1.15.13")
             log(level="ERROR", message=str(e) + "\n 若是wx 4.1.9.35往后版本有初始化问题，请到wx群内@Siver")
             log(level="ERROR", message=str(e) + "\n 若以上情况都检查完没有问题，那大概率为wx本身或者windows系统不稳定导致的，重启程序即可，若是一直这样，如果您是虚拟机就请分配更多性能，若是实体机可以联系作者询问")
             self.run_flag = False
